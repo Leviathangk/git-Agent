@@ -9,6 +9,7 @@ with optional AI assistance for three-way merges.
 [Download](https://github.com/adoin/git-Agent/releases/latest) ·
 [Changelog](CHANGELOG.md) ·
 [Getting started](#getting-started) ·
+[Plugins](#plugins) ·
 [Build from source](#build-from-source) ·
 [Contribute](CONTRIBUTING.md) ·
 [Support](#support) ·
@@ -52,6 +53,51 @@ differ; check the release you are using before relying on a newly added feature.
 - Use custom Git actions and repository performance diagnostics.
 - Choose English or Simplified Chinese, light or dark mode, accent colors, and UI/code fonts.
 - Extend syntax highlighting with [data-only language plugins](docs/syntax-plugins.md).
+
+## Plugins
+
+Native plugins are available in Git Agent 2.0.0-beta.3 and later. Use a plugin-capable version from [GitHub Releases](https://github.com/adoin/git-Agent/releases); prereleases require manual installation and are excluded from stable update prompts. The 2.0.0-beta.3 installer includes GitHub plugin 0.1.0.
+
+### Plugin list
+
+Plugins developed by the maintainer and contributed by the community share this list. Each entry contains only a plugin name and its repository address. Features, supported platforms, dependencies and release packages are documented in the plugin's own repository.
+
+<!-- plugin-list:start -->
+| Plugin | Repository |
+| --- | --- |
+| GitHub | https://github.com/adoin/git-agent-plugin-template |
+<!-- plugin-list:end -->
+
+The [website plugin list](https://git-agent.emssion.com/#plugins) is generated from this table.
+
+### Use a listed plugin
+
+1. Open its repository and read the installation instructions, supported Git Agent version and dependencies.
+2. Download the `.gaplugin` release package for your operating system and architecture. Follow the repository's checksum instructions when a `.sha256` file is provided.
+3. In Git Agent, open **Options → Plugins → Install / update plugin package** and import the package. Updates activate after restarting the application.
+4. Manage the global switch in **Options → Plugins**, or override it for a repository in **Repository Settings → Plugins**. Repository matching conditions and plugin dependencies still apply.
+
+The bundled GitHub plugin requires GitHub CLI (`gh`) and `gh auth login`. You can disable or uninstall it; an uninstalled bundled plugin is not forced back on subsequent launches. See the [installation guide](docs/plugin-installation.en.md) for details.
+
+### Develop your own plugin
+
+Create your repository with **Use this template** in [git-agent-plugin-template](https://github.com/adoin/git-agent-plugin-template), then clone your new repository locally. The default project is the full GitHub plugin; initialize the minimal example inside the repository to start an independent plugin:
+
+```powershell
+pwsh.exe -NoLogo -NoProfile -File scripts/init.ps1 -Id my-plugin -Name "My plugin" -Example minimal
+```
+
+On Linux or macOS, use `python3 scripts/plugin.py init my-plugin --name "My plugin" --example minimal`. Implement business logic and declarative UI in `src`, register pages, commands and hooks in `plugin.json`, and provide dictionaries and icons in `locales` and `assets`. Run the template's tests and development script, then build `.gaplugin` packages with `scripts/package.ps1` or `python3 scripts/plugin.py package`. Publish those packages in your own repository and document installation there. The [template guide](https://github.com/adoin/git-agent-plugin-template/blob/main/README.en.md) and [host SDK guide](docs/plugin-development.md) explain development, testing and packaging.
+
+### Share your plugin
+
+Open a PR against this repository's `main` branch and add one row to the **Plugin list** table in `README.md`. Only the plugin name and an HTTPS repository address are needed:
+
+```markdown
+| My plugin | https://github.com/you/my-plugin |
+```
+
+You do not need to submit plugin code or binaries here, or edit the Chinese README or website. After merging the PR, the maintainer runs `python website/build_plugins.py` and deploys the website to synchronize both lists. Plugin releases and updates remain in their own repositories; listing a plugin does not automatically bundle or install it.
 
 ## Download and install
 

@@ -6,7 +6,23 @@
   const english = {
     "skip": "Skip to content",
     "nav.changelog": "Changelog",
-    "nav.features": "Features", "nav.ai": "AI merge", "nav.download": "Download", "nav.docs": "Docs ↗",
+    "nav.features": "Features", "nav.ai": "AI merge", "nav.plugins": "Plugins", "nav.download": "Download", "nav.docs": "Docs ↗",
+    "plugins.title": "Plugins", "plugins.description": "Find plugins built by the maintainer and the community. Open a repository for features and dependencies, then install its release package.",
+    "plugins.version": "Plugins require Git Agent 2.0.0-beta.3 or later. Beta.3 bundles the GitHub plugin. Prereleases need manual installation and do not trigger stable update prompts.",
+    "plugins.versions": "Choose a plugin-capable version ↗",
+    "plugins.use.title": "Use a plugin", "plugins.use.step1": "Open a repository above and check its platforms, required version and dependencies.",
+    "plugins.use.step2": "Download the .gaplugin release package for your operating system and architecture. Follow the repository's checksum instructions.",
+    "plugins.use.step3": "Import it in Options → Plugins → Install / update plugin package. Restart after an update.",
+    "plugins.use.step4": "Manage global switches in Options → Plugins and repository overrides in Repository Settings → Plugins.",
+    "plugins.use.github": "The GitHub plugin needs gh and gh auth login. Bundled plugins can be disabled or uninstalled; removed plugins are not forced back.",
+    "plugins.use.link": "Installation and management guide ↗",
+    "plugins.develop.title": "Develop a plugin", "plugins.develop.body": "Create a repository with Use this template, clone it and initialize the minimal example. The default template contains the full GitHub plugin, which you can also keep extending.",
+    "plugins.develop.next": "Implement business logic and declarative UI, provide dictionaries and icons, test with the host, then package a .gaplugin and publish it in your own repository.",
+    "plugins.develop.link": "Template and development guide ↗",
+    "plugins.share.title": "Share a plugin", "plugins.share.body": "Open a PR against the host repository's main branch. Edit only the Plugin list table in README.md, adding a plugin name and repository URL:",
+    "plugins.share.next": "No plugin code, binaries or website edits are needed. After merging, the maintainer generates and deploys the catalog. Keep features, dependencies and packages in your own repository.",
+    "plugins.share.link": "Edit the README and open a PR ↗",
+    "plugins.listNote": "The list contains only names and repository URLs, synchronized with the README. Listing a plugin does not automatically bundle or install it.",
     "hero.release": "Ready for your next great commit",
     "hero.title1": "Every change.", "hero.title2": "Clearly in control.",
     "hero.description": "Changes, history, branches, and conflicts. Finally, in one clear view. A native Git client that keeps your attention on the code, not the tooling.",
@@ -99,6 +115,9 @@
     document.body.classList.toggle("language-en", language === "en");
     document.querySelectorAll("[data-changelog-link]").forEach(link => {
       link.href = `changelog.html?lang=${language}`;
+    });
+    document.querySelectorAll("[data-plugin-installation-link]").forEach(link => {
+      link.href = `${REPOSITORY}/blob/main/docs/plugin-installation${language === "en" ? ".en" : ""}.md`;
     });
     languageToggle.innerHTML = language === "en" ? "中文 <span aria-hidden=\"true\">↗</span>" : "EN <span aria-hidden=\"true\">↗</span>";
     languageToggle.setAttribute("aria-label", language === "en" ? "切换到简体中文" : "Switch to English");

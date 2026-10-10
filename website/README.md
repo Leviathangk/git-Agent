@@ -54,6 +54,12 @@ belong to those actual test runs and do not promise identical future model outpu
 ## Deployment
 
 Before publishing, run `python website/build_changelog.py` from the repository root.
+Also run `python website/build_plugins.py`: the Plugin list table in the English
+`README.md` is the only catalog source. Each row contains a plugin name and an HTTPS
+repository URL. The script updates the Chinese README table and the static homepage
+list; contributors only edit `README.md`, not generated website output. After merging
+a listing PR, regenerate and deploy `public/` to publish the updated catalog. Plugin
+features, dependencies and release artifacts remain in the listed repositories.
 Edit `CHANGELOG.md` and `CHANGELOG.zh-CN.md` together; the generated
 `public/changelog.html` is committed with the site so deployments need no Markdown
 renderer. Use explicit version numbers and dates, not an Unreleased section or placeholder.
@@ -86,6 +92,7 @@ from one network proves reachability for all visitors.
 
 ```sh
 python website/build_changelog.py --check
+python website/build_plugins.py --check
 node --check website/public/app.js
 node --check website/public/changelog.js
 python website/check.py
@@ -101,3 +108,10 @@ and mobile navigation, download destinations, and Ko-fi links. Confirm there are
 reconstructed product interfaces or simulated AI interactions. Keep live model calls out
 of these checks. Also verify all four images, theme switching, original-image destinations,
 dialog opening and closing, Escape/focus restoration, translated captions, and mobile overflow.
+
+The Plugins section provides the catalog and installation, development and sharing
+instructions in both languages. It needs no additional network request or JavaScript
+to expose repository links. The catalog is generated as escaped static HTML; long
+repository addresses wrap on narrow screens. Stable download links continue to use
+the stable Release endpoint; the plugin section links to all releases so visitors can
+choose a plugin-capable prerelease manually.

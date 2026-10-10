@@ -8,6 +8,7 @@
 [下载](https://github.com/adoin/git-Agent/releases/latest) ·
 [更新日志](CHANGELOG.zh-CN.md) ·
 [快速开始](#快速开始) ·
+[插件](#插件) ·
 [从源码构建](#从源码构建) ·
 [参与贡献](CONTRIBUTING.md) ·
 [支持项目](#支持项目) ·
@@ -48,6 +49,51 @@ Git Agent 正在持续开发中。发布的安装包与开发分支可能存在�
 - 使用自定义 Git 操作和仓库性能诊断工具。
 - 切换简体中文或英文、浅色或深色模式，并调整强调色、界面字体和代码字体。
 - 通过[纯数据语言插件](docs/syntax-plugins.md)扩展语法高亮。
+
+## 插件
+
+动态库插件功能从 Git Agent 2.0.0-beta.3 开始提供。请在 [GitHub Releases](https://github.com/adoin/git-Agent/releases) 中选择支持插件的版本；预发布需要手动安装，不会通过正式版更新提示推送。2.0.0-beta.3 安装包已内置 GitHub 插件 0.1.0。
+
+### 插件列表
+
+维护者开发的插件与社区通过 PR 分享的插件统一展示在这里。每项只记录插件名称和仓库地址，功能、支持的平台、依赖及发布包由插件自己的仓库说明。
+
+<!-- plugin-list:start -->
+| 插件 | 仓库 |
+| --- | --- |
+| GitHub | https://github.com/adoin/git-agent-plugin-template |
+<!-- plugin-list:end -->
+
+[官网插件列表](https://git-agent.emssion.com/#plugins)与这里使用同一份名单，名单的维护入口是英文 README.md 中的表格。
+
+### 使用列表中的插件
+
+1. 打开插件仓库，查看安装说明、所需 Git Agent 版本和外部依赖。
+2. 在该仓库的发布页下载适合当前系统和架构的 `.gaplugin` 包；提供 `.sha256` 时，按仓库说明核验校验值。
+3. 在 Git Agent 中打开“选项 → 插件 → 安装 / 更新插件包”并导入。更新插件后重启程序生效。
+4. 在“选项 → 插件”管理全局开关，或在“仓库设置 → 插件”设置单个仓库的覆盖开关。仓库匹配条件和外部依赖仍需满足。
+
+内置的 GitHub 插件需要安装 GitHub CLI（`gh`）并执行 `gh auth login`。它可以关闭或卸载；卸载后不会在后续启动时强制重装。详细说明见[插件安装与管理](docs/plugin-installation.md)。
+
+### 开发自己的插件
+
+在 [git-agent-plugin-template](https://github.com/adoin/git-agent-plugin-template) 中选择 **Use this template** 创建自己的仓库，再克隆到本地。模板默认是完整的 GitHub 插件，在仓库目录内用最小示例初始化自己的独立插件：
+
+```powershell
+pwsh.exe -NoLogo -NoProfile -File scripts/init.ps1 -Id my-plugin -Name "我的插件" -Example minimal
+```
+
+Linux、macOS 可使用 `python3 scripts/plugin.py init my-plugin --name "我的插件" --example minimal`。在 `src` 实现业务与配置式界面，在 `plugin.json` 注册页面、命令和钩子，在 `locales`、`assets` 提供字典与图标。运行模板的测试和开发脚本，再通过 `scripts/package.ps1` 或 `python3 scripts/plugin.py package` 生成 `.gaplugin` 包，发布到自己的仓库，并在仓库中写明安装方法。[模板指南](https://github.com/adoin/git-agent-plugin-template#readme)与[宿主 SDK 开发指南](docs/plugin-development.md)提供接口、测试和打包说明。
+
+### 分享自己的插件
+
+向本仓库 `main` 分支提交 PR，只需在 **README.md 的 Plugin list 表格**增加一行插件名称和 HTTPS 仓库地址：
+
+```markdown
+| 我的插件 | https://github.com/you/my-plugin |
+```
+
+无需向主仓库提交插件代码或二进制，也无需修改中文 README 和官网。PR 合并后，由维护者运行 `python website/build_plugins.py` 并部署官网，同步中文 README 和官网名单。插件的发布与更新仍在自己的仓库维护；收录到列表不代表自动内置或安装。
 
 ## 下载与安装
 

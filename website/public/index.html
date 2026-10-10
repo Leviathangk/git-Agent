@@ -17,7 +17,8 @@
   <link rel="stylesheet" href="styles.css?v=real-ui-2">
   <link rel="stylesheet" href="captures.css?v=real-ui-2">
   <title>Git Agent — 让每一次提交，都心中有数。</title>
-  <script src="app.js?v=changelog-1" defer></script>
+  <link rel="stylesheet" href="plugins.css?v=1">
+  <script src="app.js?v=plugins-1" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main" data-i18n="skip">跳转到主要内容</a>
@@ -27,6 +28,7 @@
       <nav class="main-nav" aria-label="Main navigation" id="main-nav">
         <a href="#features" data-i18n="nav.features">功能</a>
         <a href="#ai" data-i18n="nav.ai">AI 合并</a>
+        <a href="#plugins" data-i18n="nav.plugins">插件</a>
         <a href="#download" data-i18n="nav.download">下载</a>
         <a href="changelog.html?lang=zh" data-changelog-link data-i18n="nav.changelog">更新日志</a>
         <a href="https://github.com/adoin/git-Agent#readme" target="_blank" rel="noopener noreferrer" data-i18n="nav.docs">文档 ↗</a>
@@ -89,6 +91,23 @@
         <noscript><p><a href="assets/merge-light.png" target="_blank" rel="noopener noreferrer">查看浅色原图 / View the light screenshot ↗</a></p></noscript>
       </figure>
     </div></section>
+
+    <section class="section container plugins-section" id="plugins" aria-labelledby="plugins-title">
+      <div class="section-heading"><div><h2 id="plugins-title" data-i18n="plugins.title">插件</h2></div><p data-i18n="plugins.description">维护者与社区开发的插件，都从这里找到。打开仓库了解功能与依赖，下载发布包后安装。</p></div>
+      <p class="plugins-version" data-i18n="plugins.version">插件功能需要 Git Agent 2.0.0-beta.3 或更新版本。beta.3 已内置 GitHub 插件；预发布需要手动安装，不会通过正式版更新提示推送。</p>
+      <div class="plugin-version-links"><a href="https://github.com/adoin/git-Agent/releases" target="_blank" rel="noopener noreferrer" data-i18n="plugins.versions">选择支持插件的版本 ↗</a></div>
+<!-- plugin-list:start -->
+      <ul class="plugin-catalog">
+        <li><a href="https://github.com/adoin/git-agent-plugin-template" target="_blank" rel="noopener noreferrer"><strong class="plugin-name">GitHub</strong><span class="plugin-repository">github.com/adoin/git-agent-plugin-template <span aria-hidden="true">↗</span></span></a></li>
+      </ul>
+<!-- plugin-list:end -->
+      <div class="plugin-guide-grid">
+        <article class="plugin-guide"><h3 data-i18n="plugins.use.title">使用插件</h3><ol><li data-i18n="plugins.use.step1">打开上方仓库，查看支持的平台、所需版本与依赖。</li><li data-i18n="plugins.use.step2">从插件发布页下载对应系统和架构的 .gaplugin 包，按仓库说明校验下载。</li><li data-i18n="plugins.use.step3">在“选项 → 插件 → 安装 / 更新插件包”导入；更新后重启生效。</li><li data-i18n="plugins.use.step4">在“选项 → 插件”管理全局开关，在“仓库设置 → 插件”设置单仓库开关。</li></ol><p data-i18n="plugins.use.github">GitHub 插件需要安装 gh 并执行 gh auth login。内置插件可以关闭或卸载，卸载后不会强制重装。</p><a class="plugin-doc-link" href="https://github.com/adoin/git-Agent/blob/main/docs/plugin-installation.md" data-plugin-installation-link target="_blank" rel="noopener noreferrer" data-i18n="plugins.use.link">安装与管理指南 ↗</a></article>
+        <article class="plugin-guide"><h3 data-i18n="plugins.develop.title">开发插件</h3><p data-i18n="plugins.develop.body">从模板的 Use this template 创建仓库，克隆后用最小示例初始化。模板默认包含完整 GitHub 插件，也可以保留它继续开发。</p><pre><code>pwsh.exe -NoLogo -NoProfile -File scripts/init.ps1 -Id my-plugin -Name "My plugin" -Example minimal</code></pre><p data-i18n="plugins.develop.next">实现业务与配置式界面，提供字典和图标，完成联调测试，再打包为 .gaplugin 并发布到自己的仓库。</p><a class="plugin-doc-link" href="https://github.com/adoin/git-agent-plugin-template#readme" target="_blank" rel="noopener noreferrer" data-i18n="plugins.develop.link">模板与开发指南 ↗</a></article>
+        <article class="plugin-guide"><h3 data-i18n="plugins.share.title">分享插件</h3><p data-i18n="plugins.share.body">向主仓库的 main 分支提交 PR，只修改 README.md 的 Plugin list 表格，添加插件名称和仓库地址：</p><pre><code>| My plugin | https://github.com/you/my-plugin |</code></pre><p data-i18n="plugins.share.next">无需提交插件代码、二进制或修改官网。PR 合并后由维护者生成并部署名单。插件的功能说明、依赖和发布包继续在自己的仓库维护。</p><a class="plugin-doc-link" href="https://github.com/adoin/git-Agent/blob/main/README.md#plugin-list" target="_blank" rel="noopener noreferrer" data-i18n="plugins.share.link">编辑 README 并提交 PR ↗</a></article>
+      </div>
+      <p class="plugins-list-note" data-i18n="plugins.listNote">列表只记录插件名称和仓库地址，与 README 同步；收录不代表自动内置或安装。</p>
+    </section>
 
     <section class="section container download-section" id="download"><div class="center-heading"><span class="eyebrow">READY WHEN YOU ARE.</span><h2 data-i18n="download.title">你的系统，你的 Git Agent。</h2><p data-i18n="download.description">选择平台，开始下一次顺畅的提交。</p><a id="release-version" class="version-label" href="https://github.com/adoin/git-Agent/releases/latest" target="_blank" rel="noopener noreferrer"><span class="status-dot"></span><span data-i18n="download.latest">GitHub 最新稳定版</span><span aria-hidden="true">↗</span></a></div>
       <div class="download-grid">

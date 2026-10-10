@@ -1,0 +1,37 @@
+name: Website and plugin catalog
+
+on:
+  push:
+    branches: [main]
+    paths: ['README*.md', 'CHANGELOG*.md', 'website/**', '.github/workflows/website.yml']
+  pull_request:
+    paths: ['README*.md', 'CHANGELOG*.md', 'website/**', '.github/workflows/website.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Generate lists and changelog
+        run: |
+          python website/build_plugins.py
+          python website/build_changelog.py
+      - name: Validate website
+        run: |
+          python website/build_plugins.py --check
+          python website/build_changelog.py --check
+          python website/check.py
+          node --check website/public/app.js
+          node --check website/public/changelog.js
+      - uses: actions/upload-artifact@v6
+        with:
+          name: git-agent-website
+          path: website/public/
+          if-no-files-found: error

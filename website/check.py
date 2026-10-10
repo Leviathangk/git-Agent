@@ -7,6 +7,7 @@ import hashlib
 import re
 import struct
 from build_changelog import build
+from build_plugins import generated_documents, parse_plugins
 
 ROOT = Path(__file__).resolve().parent / "public"
 
@@ -64,6 +65,12 @@ for key in page.translations:
 assert "https://ko-fi.com/adoin" in page.urls
 assert "https://github.com/adoin/git-Agent/releases/latest" in page.urls
 assert "changelog.html?lang=zh" in page.urls, "Homepage needs a changelog entry."
+assert "#plugins" in page.urls, "Homepage needs a plugin catalog entry."
+plugins = parse_plugins((ROOT.parent.parent / "README.md").read_text(encoding="utf-8"))
+for name, repository in plugins:
+    assert repository in page.urls, f"Missing plugin repository: {name}"
+for path, expected in generated_documents().items():
+    assert path.read_text(encoding="utf-8") == expected, "Run website/build_plugins.py"
 changelog_html = (ROOT / "changelog.html").read_text(encoding="utf-8")
 assert changelog_html == build(), "Rebuild the website changelog after editing Markdown."
 changelog = Page()

@@ -5,6 +5,20 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.0.0-beta.5 — 2026-10-10
+
+### Added
+
+- Added a plugin guide covering installation, package retention, global and repository switches, updates, removal, matching rules, permissions, pages and synchronization. It previews the relevant plugin settings and uses the real panel position for highlighting.
+- Introduced a registry of feature guides with stable IDs and revisions. First-time users receive the basic guide followed by the plugin guide; existing users keep their basic-guide status and receive only unseen feature guides. Completing or skipping a guide persists its revision, and Help offers explicit replay.
+- Save guide progress independently of AI credentials, asynchronously with coalesced writes and an exit flush. Opening font settings at the end of the basic guide pauses the queue, then resumes the plugin guide when settings close. Background shortcuts and keyboard focus are blocked while a guide is active.
+
+### Changed
+
+- Replaced the website's large plugin instruction cards with compact, keyboard-accessible expandable sections. Plugin repository links remain directly visible, and instructions open on demand in Chinese and English.
+
+This is a prerelease for manual installation. It is excluded from stable update prompts and continues to bundle GitHub plugin 0.1.0.
+
 ## 2.0.0-beta.3 — 2026-10-10
 
 ### Added

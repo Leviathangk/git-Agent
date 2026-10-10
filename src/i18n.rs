@@ -43,6 +43,35 @@ pub fn t(language: Language, key: &'static str) -> &'static str {
 }
 
 const ZH_SOURCE: &[(&str, &str)] = &[
+    ("tutorial.basics", "基础指引"),
+    ("tutorial.plugins", "插件功能指引"),
+    ("tutorial.feature_menu", "功能指引"),
+    ("tutorial.skip", "跳过本段"),
+    ("tutorial.next_guide", "下一段指引"),
+    (
+        "tutorial.save_failed",
+        "引导状态保存失败，下次启动可能再次显示。",
+    ),
+    ("tutorial.plugins.install.title", "安装插件"),
+    (
+        "tutorial.plugins.install.body",
+        "在“选项 → 插件”导入 .gaplugin 包。安装成功后，下载目录中的原文件可以删除。GitHub 插件已内置；其他插件可从官网插件列表进入其仓库下载。",
+    ),
+    ("tutorial.plugins.manage.title", "开关、更新与卸载"),
+    (
+        "tutorial.plugins.manage.body",
+        "这里可以查看依赖和加载状态，控制全局开关。关闭后会隐藏入口并停止新任务。安装更高版本可更新插件；更新和卸载在重启后完成。",
+    ),
+    ("tutorial.plugins.repository.title", "仓库中的插件"),
+    (
+        "tutorial.plugins.repository.body",
+        "选中仓库后，在“仓库设置 → 插件”选择继承全局、在此仓库启用或关闭。仓库开关不能越过全局关闭；插件也只在满足远端域名等匹配条件的仓库中生效。没有打开仓库时，可先查看全局插件列表。",
+    ),
+    ("tutorial.plugins.pages.title", "页面与同步"),
+    (
+        "tutorial.plugins.pages.body",
+        "匹配的仓库会在工具栏和菜单显示插件功能，点击进入独立页面。GitHub 提供 PR、议题和工作流等入口，需要安装并登录 gh；管理操作按账户权限开放。插件数据随“获取”和定时远端同步刷新。以后可从“帮助 → 功能指引”重新查看。",
+    ),
     (
         "status.hash_copied",
         "\u{5df2}\u{590d}\u{5236}\u{5b8c}\u{6574} hash",
@@ -1893,6 +1922,41 @@ const ZH_SOURCE: &[(&str, &str)] = &[
 ];
 
 const EN: &[(&str, &str)] = &[
+    ("tutorial.basics", "Basic guide"),
+    ("tutorial.plugins", "Plugin guide"),
+    ("tutorial.feature_menu", "Feature guides"),
+    ("tutorial.skip", "Skip guide"),
+    ("tutorial.next_guide", "Next guide"),
+    (
+        "tutorial.save_failed",
+        "Guide progress could not be saved. It may appear again next time.",
+    ),
+    ("tutorial.plugins.install.title", "Install plugins"),
+    (
+        "tutorial.plugins.install.body",
+        "Import a .gaplugin package in Options > Plugins. After installation succeeds, you can delete the downloaded file. GitHub is bundled; find other plugin repositories in the website catalog and download their release packages.",
+    ),
+    (
+        "tutorial.plugins.manage.title",
+        "Switches, updates and removal",
+    ),
+    (
+        "tutorial.plugins.manage.body",
+        "Check dependencies and load status here, and control the global switch. Disabling hides contributions and stops new tasks. Import a higher version to update. Updates and removal finish after restarting the application.",
+    ),
+    (
+        "tutorial.plugins.repository.title",
+        "Plugins in a repository",
+    ),
+    (
+        "tutorial.plugins.repository.body",
+        "After opening a repository, use Repository Settings > Plugins to inherit the global switch or enable/disable locally. Local overrides cannot bypass global disable or remote-domain matching. Without a repository, inspect the global plugin list first.",
+    ),
+    ("tutorial.plugins.pages.title", "Pages and synchronization"),
+    (
+        "tutorial.plugins.pages.body",
+        "Matching repositories show plugin toolbar and menu entries for separate pages. GitHub adds PRs, issues and workflow runs; install gh and sign in. Management actions follow account permissions. Fetch and scheduled remote synchronization refresh plugin data. Replay this guide in Help > Feature guides.",
+    ),
     ("app.title", "Git Agent"),
     ("app.subtitle", "fast visual Git client"),
     ("action.clone_new", "Clone/New"),

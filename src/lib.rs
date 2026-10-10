@@ -14,4 +14,5 @@ pub mod plugin_manager;
 pub mod plugins;
 pub mod syntax;
 pub mod theme;
+mod tutorials;
 mod updater;

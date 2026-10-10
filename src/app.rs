@@ -46,10 +46,13 @@ use crate::{
     },
     syntax::{HighlightedDocument, HighlightedLine},
     theme,
+    tutorials::{self, Target as BeginnerTutorialTarget},
     updater::{self, InstallOutcome, UpdateRelease},
 };
 
 const KOFI_SUPPORT_URL: &str = "https://ko-fi.com/adoin";
+#[allow(unused_imports)]
+use crate::tutorials::BASIC_STEPS as BEGINNER_TUTORIAL_STEPS;
 
 struct CommitAiTask {
     root: PathBuf,
@@ -430,6 +433,20 @@ fn beginner_tutorial_target_rect(
                 screen.top() + TITLE_BAR_HEIGHT + TOP_BAR_ROW_HEIGHT,
             ),
         ),
+        BeginnerTutorialTarget::PluginManagement
+        | BeginnerTutorialTarget::RepositoryPluginManagement => {
+            let dialog = dialog::top_anchored_rect(
+                screen,
+                Vec2::new(
+                    SETTINGS_DIALOG_WIDTH.min(screen.width() * 0.92),
+                    SETTINGS_DIALOG_HEIGHT.min(screen.height() * 0.9),
+                ),
+            );
+            Rect::from_min_max(
+                dialog.min + Vec2::new(18.0, 90.0),
+                Pos2::new(dialog.right() - 18.0, dialog.top() + 210.0),
+            )
+        }
     };
     rect.expand(4.0).intersect(screen.shrink(3.0))
 }
@@ -1000,7 +1017,10 @@ pub struct GitAgentApp {
     settings_open: bool,
     settings_tab: SettingsTab,
     beginner_tutorial_seen: bool,
-    beginner_tutorial_step: Option<usize>,
+    tutorial: tutorials::Session,
+    tutorial_persistence: tutorials::Persistence,
+    tutorial_plugin_anchor: Option<Rect>,
+    tutorial_restore: Option<(bool, SettingsTab, bool, SettingsTab)>,
     about_open: bool,
     update_dialog_open: bool,
     update_release: Option<UpdateRelease>,
@@ -1794,78 +1814,6 @@ enum TopMenu {
     Tools,
     Help,
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BeginnerTutorialTarget {
-    MainMenus,
-    RepositoryTabs,
-    RepositoryToolbar,
-    SidebarNavigation,
-    RepositoryResources,
-    WorkspaceChanges,
-    CommitArea,
-    GlobalTools,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BeginnerTutorialStep {
-    target: BeginnerTutorialTarget,
-    title_key: &'static str,
-    body_key: &'static str,
-}
-
-const BEGINNER_TUTORIAL_STEPS: [BeginnerTutorialStep; 10] = [
-    BeginnerTutorialStep {
-        target: BeginnerTutorialTarget::MainMenus,
-        title_key: "tutorial.menus.title",
-        body_key: "tutorial.menus.body",
-    },
-    BeginnerTutorialStep {
-        target: BeginnerTutorialTarget::RepositoryTabs,
-        title_key: "tutorial.repositories.title",
-        body_key: "tutorial.repositories.body",
-    },
-    BeginnerTutorialStep {
-        target: BeginnerTutorialTarget::RepositoryToolbar,
-        title_key: "tutorial.git_actions.title",
-        body_key: "tutorial.git_actions.body",
-    },
-    BeginnerTutorialStep {
-        target: BeginnerTutorialTarget::SidebarNavigation,
-        title_key: "tutorial.navigation.title",
-        body_key: "tutorial.navigation.body",
-    },
-    BeginnerTutorialStep {
-        target: BeginnerTutorialTarget::RepositoryResources,
-        title_key: "tutorial.resources.title",
-        body_key: "tutorial.resources.body",
-    },
-    BeginnerTutorialStep {
-        target: BeginnerTutorialTarget::WorkspaceChanges,
-        title_key: "tutorial.changes.title",
-        body_key: "tutorial.changes.body",
-    },
-    BeginnerTutorialStep {
-        target: BeginnerTutorialTarget::WorkspaceChanges,
-        title_key: "tutorial.worktree_shortcuts.title",
-        body_key: "tutorial.worktree_shortcuts.body",
-    },
-    BeginnerTutorialStep {
-        target: BeginnerTutorialTarget::CommitArea,
-        title_key: "tutorial.commit.title",
-        body_key: "tutorial.commit.body",
-    },
-    BeginnerTutorialStep {
-        target: BeginnerTutorialTarget::CommitArea,
-        title_key: "tutorial.commit_shortcuts.title",
-        body_key: "tutorial.commit_shortcuts.body",
-    },
-    BeginnerTutorialStep {
-        target: BeginnerTutorialTarget::GlobalTools,
-        title_key: "tutorial.tools.title",
-        body_key: "tutorial.tools.body",
-    },
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SshToolAction {
@@ -4516,7 +4464,16 @@ impl GitAgentApp {
         thread::spawn(move || {
             let _ = font_catalog_sender.send(theme::scan_system_fonts());
         });
-        let show_beginner_tutorial_on_start = !app_settings.beginner_tutorial_seen;
+        let tutorial_progress_path = app_data_dir()
+            .unwrap_or_else(|| std::env::temp_dir().join("git-agent-data"))
+            .join("tutorial-progress.json");
+        let tutorial_progress = tutorials::load(&tutorial_progress_path).unwrap_or_else(|error| {
+            diagnostics::app_error("tutorial.progress.load_failed", &error);
+            tutorials::Progress::default()
+        });
+        let tutorial =
+            tutorials::Session::automatic(tutorial_progress, app_settings.beginner_tutorial_seen);
+        let beginner_tutorial_seen = tutorial.seen_basics();
         BACKGROUND_PATTERN_ENABLED
             .store(app_settings.background_pattern_enabled, Ordering::Relaxed);
         if app_settings.background_pattern_enabled {
@@ -4719,8 +4676,11 @@ impl GitAgentApp {
             settings_open: env::var("GIT_AGENT_OPEN_SETTINGS_ON_START").ok().as_deref()
                 == Some("1"),
             settings_tab: SettingsTab::General,
-            beginner_tutorial_seen: true,
-            beginner_tutorial_step: show_beginner_tutorial_on_start.then_some(0),
+            beginner_tutorial_seen,
+            tutorial,
+            tutorial_persistence: tutorials::Persistence::new(tutorial_progress_path),
+            tutorial_plugin_anchor: None,
+            tutorial_restore: None,
             about_open: false,
             update_dialog_open: false,
             update_release: None,
@@ -4810,6 +4770,8 @@ impl GitAgentApp {
             }
             app.save_repo_tabs();
         }
+        app.prepare_tutorial_step();
+        app.persist_tutorial_progress();
         app.save_app_settings();
 
         app
@@ -8549,6 +8511,9 @@ impl GitAgentApp {
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.tutorial.current().is_some() || self.tutorial.paused() {
+            return;
+        }
         if let Some(menu) = top_menu_accelerator_pressed(ctx) {
             self.requested_top_menu = Some(menu);
             return;
@@ -10154,9 +10119,77 @@ impl GitAgentApp {
     }
 
     fn start_beginner_tutorial(&mut self) {
-        self.beginner_tutorial_step = Some(0);
+        if !self.can_start_tutorial() {
+            return;
+        }
+        self.tutorial.replay(None);
+        self.prepare_tutorial_step();
+    }
+
+    fn start_feature_tutorial(&mut self, id: &'static str) {
+        if !self.can_start_tutorial() {
+            return;
+        }
+        self.tutorial.replay(Some(id));
+        self.prepare_tutorial_step();
+    }
+
+    fn can_start_tutorial(&self) -> bool {
+        self.repo_gitignore_save_task.is_none()
+            && !self
+                .repo_gitignore_editor
+                .as_ref()
+                .is_some_and(|editor| editor.dirty())
+    }
+
+    fn prepare_tutorial_step(&mut self) {
+        let Some((_, _, step)) = self.tutorial.current() else {
+            if let Some((settings_open, settings_tab, repo_open, repo_tab)) =
+                self.tutorial_restore.take()
+            {
+                self.settings_open = settings_open;
+                self.settings_tab = settings_tab;
+                self.repo_settings_open = repo_open;
+                self.repo_settings_tab = repo_tab;
+            }
+            return;
+        };
+        self.tutorial_restore.get_or_insert((
+            self.settings_open,
+            self.settings_tab,
+            self.repo_settings_open,
+            self.repo_settings_tab,
+        ));
         self.active_view = MainView::Workspace;
         self.show_workspace_repositories = false;
+        self.tutorial_plugin_anchor = None;
+        self.settings_open = false;
+        self.repo_settings_open = false;
+        match step.target {
+            BeginnerTutorialTarget::PluginManagement => {
+                self.settings_open = true;
+                self.settings_tab = SettingsTab::Plugins;
+            }
+            BeginnerTutorialTarget::RepositoryPluginManagement
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| self.active_repo_root_matches(&snapshot.root)) =>
+            {
+                self.repo_settings_open = true;
+                self.repo_settings_tab = SettingsTab::RepoPlugins;
+            }
+            BeginnerTutorialTarget::RepositoryPluginManagement => {
+                self.settings_open = true;
+                self.settings_tab = SettingsTab::Plugins;
+            }
+            _ => {}
+        }
+    }
+
+    fn persist_tutorial_progress(&mut self) {
+        self.beginner_tutorial_seen = self.tutorial.seen_basics();
+        self.tutorial_persistence.request(&self.tutorial.progress);
     }
 
     fn set_theme_mode(&mut self, mode: theme::ThemeMode) {
@@ -10871,20 +10904,19 @@ impl GitAgentApp {
     }
 
     fn beginner_tutorial_overlay(&mut self, ctx: &egui::Context) {
-        let Some(step_index) = self.beginner_tutorial_step else {
+        let Some((guide, step_index, step)) = self.tutorial.current() else {
             return;
         };
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-            self.beginner_tutorial_step = None;
+            self.tutorial.skip();
+            self.persist_tutorial_progress();
+            self.prepare_tutorial_step();
+            ctx.request_repaint();
             return;
         }
-        let Some(step) = BEGINNER_TUTORIAL_STEPS.get(step_index).copied() else {
-            self.beginner_tutorial_step = None;
-            return;
-        };
 
         let screen = ctx.screen_rect();
-        let target = beginner_tutorial_target_rect(
+        let mut target = beginner_tutorial_target_rect(
             step.target,
             screen,
             self.top_bar_height(),
@@ -10892,11 +10924,30 @@ impl GitAgentApp {
             self.layout_prefs.details_pct,
             view_uses_side_details(self.active_view),
         );
-        let final_step = step_index + 1 == BEGINNER_TUTORIAL_STEPS.len();
+        if matches!(
+            step.target,
+            BeginnerTutorialTarget::PluginManagement
+                | BeginnerTutorialTarget::RepositoryPluginManagement
+        ) {
+            if let Some(anchor) = self
+                .tutorial_plugin_anchor
+                .filter(|anchor| anchor.width() > 0.0 && anchor.height() > 0.0)
+            {
+                target = anchor.expand(4.0).intersect(screen.shrink(3.0));
+            }
+        }
+        let final_step = step_index + 1 == guide.steps.len();
+        let show_font_choice = final_step && guide.id == tutorials::BASIC_ID;
         let card = beginner_tutorial_card_rect_with_height(
             screen,
             target,
-            if final_step { 236.0 } else { 206.0 },
+            if guide.id != tutorials::BASIC_ID {
+                300.0
+            } else if final_step {
+                236.0
+            } else {
+                206.0
+            },
         );
         let origin = screen.min.to_vec2();
         let local_full = Rect::from_min_size(Pos2::ZERO, screen.size());
@@ -10907,14 +10958,21 @@ impl GitAgentApp {
         let body = i18n::t(language, step.body_key);
         let font_recommendation = i18n::t(language, "tutorial.font_recommendation");
         let font_settings_label = i18n::t(language, "tutorial.font_settings");
-        let close_label = i18n::t(language, "tutorial.close");
+        let close_label = i18n::t(language, "tutorial.skip");
         let previous_label = i18n::t(language, "tutorial.previous");
-        let next_label = if final_step {
+        let next_label = if final_step && self.tutorial.has_next_guide() {
+            i18n::t(language, "tutorial.next_guide")
+        } else if final_step {
             i18n::t(language, "tutorial.finish")
         } else {
             i18n::t(language, "tutorial.next")
         };
-        let progress = format!("{} / {}", step_index + 1, BEGINNER_TUTORIAL_STEPS.len());
+        let progress = format!(
+            "{} · {} / {}",
+            i18n::t(language, guide.title_key),
+            step_index + 1,
+            guide.steps.len()
+        );
         let mut close_requested = false;
         let mut previous_requested = false;
         let mut next_requested = false;
@@ -10969,7 +11027,7 @@ impl GitAgentApp {
                             );
                             ui.add_space(7.0);
                             ui.label(RichText::new(body).size(13.0).color(theme::muted()));
-                            if final_step {
+                            if show_font_choice {
                                 ui.add_space(7.0);
                                 ui.label(
                                     RichText::new(font_recommendation)
@@ -10989,7 +11047,11 @@ impl GitAgentApp {
                                     {
                                         previous_requested = true;
                                     }
-                                    if final_step
+                                    if dialog_action_button(ui, close_label, true, false).clicked()
+                                    {
+                                        close_requested = true;
+                                    }
+                                    if show_font_choice
                                         && dialog_action_button(
                                             ui,
                                             font_settings_label,
@@ -11010,16 +11072,26 @@ impl GitAgentApp {
             });
 
         if font_settings_requested {
-            self.beginner_tutorial_step = None;
+            self.tutorial.next();
+            self.persist_tutorial_progress();
+            self.tutorial.pause();
             self.settings_tab = SettingsTab::General;
             self.settings_open = true;
         } else if close_requested {
-            self.beginner_tutorial_step = None;
+            self.tutorial.skip();
+            self.persist_tutorial_progress();
+            self.prepare_tutorial_step();
         } else if previous_requested {
-            self.beginner_tutorial_step = step_index.checked_sub(1);
+            self.tutorial.previous();
+            self.prepare_tutorial_step();
         } else if next_requested {
-            self.beginner_tutorial_step =
-                (step_index + 1 < BEGINNER_TUTORIAL_STEPS.len()).then_some(step_index + 1);
+            if self.tutorial.next() {
+                self.persist_tutorial_progress();
+            }
+            self.prepare_tutorial_step();
+        }
+        if font_settings_requested || close_requested || previous_requested || next_requested {
+            ctx.request_repaint();
         }
     }
 }
@@ -11032,11 +11104,31 @@ impl App for GitAgentApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let primary_down = ctx.input(|input| input.pointer.primary_down());
         if !self.request_native_window_resize_on_pointer_down(ctx, frame)
-            && self.beginner_tutorial_step.is_none()
+            && self.tutorial.current().is_none()
         {
             self.request_native_title_drag_on_pointer_down(ctx, frame);
         }
         self.remember_window_size(ctx, primary_down);
+        if self.tutorial.current().is_some() {
+            ctx.memory_mut(|memory| {
+                memory.set_modal_layer(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("beginner_tutorial_overlay"),
+                ))
+            });
+        }
+        self.tutorial_plugin_anchor = None;
+        if self.tutorial.paused() && !self.settings_open {
+            self.tutorial.resume();
+            self.prepare_tutorial_step();
+        }
+        if let Some(Err(error)) = self.tutorial_persistence.poll() {
+            diagnostics::app_error("tutorial.progress.save_failed", &error);
+            self.show_toast(self.tr("tutorial.save_failed"));
+        }
+        if self.tutorial_persistence.busy() {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
         if !primary_down {
             let outer_min = ctx
                 .input(|input| input.viewport().outer_rect.map(|rect| rect.min))
@@ -11122,6 +11214,12 @@ impl App for GitAgentApp {
         self.error_modal(ctx);
         self.toast_overlay(ctx);
         self.beginner_tutorial_overlay(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Err(error) = self.tutorial_persistence.finish(&self.tutorial.progress) {
+            diagnostics::app_error("tutorial.progress.save_failed", &error);
+        }
     }
 }
 
@@ -13003,10 +13101,29 @@ impl GitAgentApp {
                 menu_label(self.language, "help"),
                 requested_top_menu == Some(TopMenu::Help),
                 |ui| {
-                    if menu_text_button(ui, true, self.tr("tutorial.menu")).clicked() {
+                    if menu_text_button(ui, self.can_start_tutorial(), self.tr("tutorial.menu"))
+                        .clicked()
+                    {
                         self.start_beginner_tutorial();
                         ui.close_menu();
                     }
+                    ui.menu_button(self.tr("tutorial.feature_menu"), |ui| {
+                        for guide in tutorials::GUIDES
+                            .iter()
+                            .filter(|guide| guide.id != tutorials::BASIC_ID)
+                        {
+                            if menu_text_button(
+                                ui,
+                                self.can_start_tutorial(),
+                                self.tr(guide.title_key),
+                            )
+                            .clicked()
+                            {
+                                self.start_feature_tutorial(guide.id);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     if menu_text_button(ui, true, menu_label(self.language, "about")).clicked() {
                         self.update_dialog_open = false;
                         self.about_open = true;
@@ -21894,14 +22011,18 @@ impl GitAgentApp {
     }
 
     fn global_plugin_settings(&mut self, ui: &mut Ui) {
+        let anchor_min = ui.cursor().min;
         let language = if self.language == Language::Chinese {
             "zh"
         } else {
             "en"
         };
         self.plugins.settings_ui(ui, language, None);
+        self.tutorial_plugin_anchor =
+            Some(Rect::from_min_max(anchor_min, ui.min_rect().max).intersect(ui.clip_rect()));
     }
     fn repo_plugin_settings_page(&mut self, ui: &mut Ui) {
+        let anchor_min = ui.cursor().min;
         let context = self
             .snapshot
             .as_ref()
@@ -21912,6 +22033,8 @@ impl GitAgentApp {
             "en"
         };
         self.plugins.settings_ui(ui, language, context.as_ref());
+        self.tutorial_plugin_anchor =
+            Some(Rect::from_min_max(anchor_min, ui.min_rect().max).intersect(ui.clip_rect()));
     }
 
     fn global_general_settings(&mut self, ui: &mut Ui) {
@@ -54111,7 +54234,7 @@ diff --git a/file.txt b/file.txt
             .find("impl GitAgentApp")
             .unwrap();
         let update = &implementation[update_start..update_start + update_end];
-        assert!(update.contains("self.beginner_tutorial_step.is_none()"));
+        assert!(update.contains("self.tutorial.current().is_none()"));
         assert!(update.contains("self.beginner_tutorial_overlay(ctx);"));
     }
 
@@ -54178,16 +54301,66 @@ diff --git a/file.txt b/file.txt
 
         let source = include_str!("app.rs");
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
-        assert!(implementation.contains(
-            "let show_beginner_tutorial_on_start = !app_settings.beginner_tutorial_seen;"
-        ));
-        assert!(implementation.contains("beginner_tutorial_seen: true,"));
-        assert!(
-            implementation
-                .contains("beginner_tutorial_step: show_beginner_tutorial_on_start.then_some(0)")
-        );
+        let first = tutorials::Session::automatic(tutorials::Progress::default(), false);
+        assert_eq!(first.current().unwrap().0.id, tutorials::BASIC_ID);
+        let upgraded = tutorials::Session::automatic(tutorials::Progress::default(), true);
+        assert_eq!(upgraded.current().unwrap().0.id, tutorials::PLUGINS_ID);
+        assert!(implementation.contains("tutorials::Session::automatic"));
+        assert!(implementation.contains("app.persist_tutorial_progress();"));
         assert!(implementation.contains("beginner_tutorial_seen: self.beginner_tutorial_seen,"));
         assert!(implementation.contains("app.save_app_settings();"));
+    }
+
+    #[test]
+    fn feature_tutorial_gates_background_shortcuts_and_prepares_real_plugin_settings() {
+        let source = include_str!("app.rs");
+        let handler = source
+            .split("fn handle_global_shortcuts(")
+            .nth(1)
+            .unwrap()
+            .split("fn ")
+            .next()
+            .unwrap();
+        assert!(
+            handler.find("self.tutorial.current().is_some()").unwrap()
+                < handler.find("stage_toggle_shortcut_pressed").unwrap()
+        );
+        let prepare = source
+            .split("fn prepare_tutorial_step(")
+            .nth(1)
+            .unwrap()
+            .split("fn persist_tutorial_progress")
+            .next()
+            .unwrap();
+        assert!(prepare.contains("self.settings_tab = SettingsTab::Plugins"));
+        assert!(prepare.contains("self.repo_settings_tab = SettingsTab::RepoPlugins"));
+        assert!(prepare.contains("self.active_repo_root_matches"));
+        let update = source
+            .split("fn update(&mut self")
+            .nth(1)
+            .unwrap()
+            .split("fn on_exit")
+            .next()
+            .unwrap();
+        assert!(update.contains("set_modal_layer"));
+        assert!(update.contains("self.tutorial_persistence.poll()"));
+        assert!(update.contains("self.tutorial.resume()"));
+        for guide in &tutorials::GUIDES {
+            for step in guide.steps {
+                let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1160.0, 652.0));
+                let target = beginner_tutorial_target_rect(
+                    step.target,
+                    screen,
+                    TOP_BAR_HEIGHT,
+                    0.24,
+                    0.34,
+                    false,
+                );
+                let card = beginner_tutorial_card_rect_with_height(screen, target, 300.0);
+                assert!(target.width().is_finite() && target.height().is_finite());
+                assert!(screen.contains_rect(card));
+            }
+        }
     }
 
     #[test]

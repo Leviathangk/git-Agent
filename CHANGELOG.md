@@ -5,6 +5,28 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.0.0 — 2026-10-10
+
+### Added
+
+- Released native dynamic-library plugins with a versioned SDK. Plugins provide declarative pages, bilingual dictionaries, functional SVG icons, optional repository-domain matching, synchronization hooks and isolated stores, with store-based permissions for buttons, layouts and actions.
+- Install, update, enable, disable or remove plugins through Options → Plugins, with repository overrides in Repository Settings → Plugins. Imported packages are copied into application-managed storage, so the original download can be deleted after installation. Updates and removal finish after restarting.
+- Bundled the independently released GitHub plugin 0.1.0 for PRs, issues, workflows, releases and repository summaries. It requires gh and gh auth login; management actions follow the current account's permissions.
+- PR details include changed-file navigation, file diffs, AI review drafts and actions for creation, review, merging, closing and reopening. Lists use fixed-bottom pagination with 10, 20, 30 or 50 items per page and internal scrolling. Workflow status and results use distinct badges.
+- Plugin remote synchronization runs alongside fetch, pull, push and scheduled background synchronization, refreshing PR counts and repository stars. Unmatched repositories do not show the plugin's buttons or pages.
+- Added extensible feature guides. First-time users receive the basic guide followed by the plugin guide; existing users see only unseen features. Completion or skipping persists each guide's revision, and Help supports replay.
+- Added bilingual development and installation guides, an independent plugin template and development scripts. The README and website list plugin names and repositories, and developers can share plugins through README pull requests.
+
+### Fixed
+
+- Correctly stage deleted files when resolving modify/delete merge conflicts, including non-ASCII paths, while preserving unrelated worktree changes.
+- Share Claude-compatible request handling across commit generation and merge assistance without forcing unsupported thinking or tool-choice settings.
+- Save guide progress asynchronously and independently of AI credentials, flushing on exit and blocking background shortcuts and keyboard-focus mistakes while a guide is active.
+
+### Release
+
+- This is a stable release and participates in existing users' update checks. Build and website workflows each retain their latest three runs without affecting published installers.
+
 ## 2.0.0-beta.5 — 2026-10-10
 
 ### Added

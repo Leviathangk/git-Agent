@@ -26,6 +26,27 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
+<h2>2.0.0 — 2026-10-10</h2>
+<h3>新增</h3>
+<ul>
+<li>正式提供动态库插件体系和带版本的 SDK。插件可提供配置式页面、双语字典、SVG 功能图标、可选仓库域名匹配、同步钩子和独立 store，并通过 store 中的权限控制按钮、布局及操作。</li>
+<li>在“选项 → 插件”中安装、更新、启停或卸载插件，在“仓库设置 → 插件”中设置单仓库开关。导入的插件包会复制到应用管理目录，安装后可删除原始下载文件；更新和卸载在重启后完成。</li>
+<li>内置独立发布的 GitHub 插件 0.1.0，提供 PR、议题、工作流、发布和仓库概览。GitHub 插件需要安装 gh 并执行 gh auth login，管理功能按当前账号权限开放。</li>
+<li>PR 详情支持改动文件列表、文件差异、AI 审核草稿，以及创建、审核、合并、关闭和重开等操作。列表分页器固定在内容区域底部，支持每页 10、20、30、50 条，表格内部滚动；工作流状态与结果使用醒目标记。</li>
+<li>插件远端同步与获取、拉取、推送及后台定时同步并行执行，刷新 PR 数量和仓库 star。仓库不符合插件匹配条件时，不展示该插件的按钮和页面。</li>
+<li>新增可扩展的功能指引。新用户先看基础指引，再连续进入插件指引；已有用户只看尚未体验的新功能。完成或跳过按段落和修订号保存，帮助菜单支持重新播放。</li>
+<li>提供双语插件开发与安装指南、独立模板仓库及联调脚本。README 和官网展示插件名称与仓库地址，开发者可通过 README 的 PR 分享插件。</li>
+</ul>
+<h3>修复</h3>
+<ul>
+<li>处理修改与删除冲突时，正确暂存选定的删除结果，兼容非 ASCII 路径，并保留无关工作区改动。</li>
+<li>提交生成与 AI 合并共用 Claude 兼容请求处理，不再强制发送服务不支持的 thinking 或工具选择设置。</li>
+<li>引导进度独立于 AI 凭据异步保存，退出时完成写入，指引期间阻止后台快捷键和键盘焦点误操作。</li>
+</ul>
+<h3>发布</h3>
+<ul>
+<li>本版本是正式版，进入现有用户的更新检测。构建与官网检查各保留最近 3 条运行记录，已发布的安装包不受清理影响。</li>
+</ul>
 <h2>2.0.0-beta.5 — 2026-10-10</h2>
 <h3>新增</h3>
 <ul>
@@ -152,6 +173,27 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
+<h2>2.0.0 — 2026-10-10</h2>
+<h3>Added</h3>
+<ul>
+<li>Released native dynamic-library plugins with a versioned SDK. Plugins provide declarative pages, bilingual dictionaries, functional SVG icons, optional repository-domain matching, synchronization hooks and isolated stores, with store-based permissions for buttons, layouts and actions.</li>
+<li>Install, update, enable, disable or remove plugins through Options → Plugins, with repository overrides in Repository Settings → Plugins. Imported packages are copied into application-managed storage, so the original download can be deleted after installation. Updates and removal finish after restarting.</li>
+<li>Bundled the independently released GitHub plugin 0.1.0 for PRs, issues, workflows, releases and repository summaries. It requires gh and gh auth login; management actions follow the current account&#x27;s permissions.</li>
+<li>PR details include changed-file navigation, file diffs, AI review drafts and actions for creation, review, merging, closing and reopening. Lists use fixed-bottom pagination with 10, 20, 30 or 50 items per page and internal scrolling. Workflow status and results use distinct badges.</li>
+<li>Plugin remote synchronization runs alongside fetch, pull, push and scheduled background synchronization, refreshing PR counts and repository stars. Unmatched repositories do not show the plugin&#x27;s buttons or pages.</li>
+<li>Added extensible feature guides. First-time users receive the basic guide followed by the plugin guide; existing users see only unseen features. Completion or skipping persists each guide&#x27;s revision, and Help supports replay.</li>
+<li>Added bilingual development and installation guides, an independent plugin template and development scripts. The README and website list plugin names and repositories, and developers can share plugins through README pull requests.</li>
+</ul>
+<h3>Fixed</h3>
+<ul>
+<li>Correctly stage deleted files when resolving modify/delete merge conflicts, including non-ASCII paths, while preserving unrelated worktree changes.</li>
+<li>Share Claude-compatible request handling across commit generation and merge assistance without forcing unsupported thinking or tool-choice settings.</li>
+<li>Save guide progress asynchronously and independently of AI credentials, flushing on exit and blocking background shortcuts and keyboard-focus mistakes while a guide is active.</li>
+</ul>
+<h3>Release</h3>
+<ul>
+<li>This is a stable release and participates in existing users&#x27; update checks. Build and website workflows each retain their latest three runs without affecting published installers.</li>
+</ul>
 <h2>2.0.0-beta.5 — 2026-10-10</h2>
 <h3>Added</h3>
 <ul>

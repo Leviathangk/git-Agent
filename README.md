@@ -56,7 +56,7 @@ differ; check the release you are using before relying on a newly added feature.
 
 ## Plugins
 
-Native plugins are available in Git Agent 2.0.0-beta.3 and later. Use a plugin-capable version from [GitHub Releases](https://github.com/adoin/git-Agent/releases); prereleases require manual installation and are excluded from stable update prompts. The 2.0.0-beta.3 installer includes GitHub plugin 0.1.0.
+Plugins require Git Agent 2.0.0 or later. The 2.0.0 installer includes GitHub plugin 0.1.0.
 
 ### Plugin list
 

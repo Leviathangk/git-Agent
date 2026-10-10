@@ -52,7 +52,7 @@ Git Agent 正在持续开发中。发布的安装包与开发分支可能存在�
 
 ## 插件
 
-动态库插件功能从 Git Agent 2.0.0-beta.3 开始提供。请在 [GitHub Releases](https://github.com/adoin/git-Agent/releases) 中选择支持插件的版本；预发布需要手动安装，不会通过正式版更新提示推送。2.0.0-beta.3 安装包已内置 GitHub 插件 0.1.0。
+插件功能需要 Git Agent 2.0.0 及其以上版本。2.0.0 安装包内置 GitHub 插件 0.1.0。
 
 ### 插件列表
 

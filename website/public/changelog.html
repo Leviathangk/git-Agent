@@ -26,7 +26,7 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
-<h2>2.0.0-beta.2 — 2026-10-10</h2>
+<h2>2.0.0-beta.3 — 2026-10-10</h2>
 <h3>新增</h3>
 <ul>
 <li>新增动态库插件体系和带版本的 SDK。插件可提供配置式布局、双语字典、功能 SVG 图标、仓库匹配条件、共享同步钩子及独立 store，通过权限配置控制界面和操作。</li>
@@ -37,6 +37,7 @@
 </ul>
 <h3>修复</h3>
 <ul>
+<li>转义 Debian 预发布版本的分隔符，并在构建前检查安装包版本格式。beta.2 标签通过测试后因 Linux 打包失败。</li>
 <li>修正 ZIP 重名条目测试夹具，使 Linux 与 Windows、macOS 验证同一个非法插件包。beta.1 标签因该夹具检查失败，没有发布安装包。</li>
 <li>处理修改与删除冲突时，正确暂存选定的删除结果，兼容非 ASCII 路径，并保留无关工作区改动。</li>
 <li>提交生成与 AI 合并共用 Claude 兼容请求处理，不再强制发送服务不支持的 thinking 或工具选择设置。</li>
@@ -139,7 +140,7 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
-<h2>2.0.0-beta.2 — 2026-10-10</h2>
+<h2>2.0.0-beta.3 — 2026-10-10</h2>
 <h3>Added</h3>
 <ul>
 <li>Added native dynamic-library plugins with a versioned SDK. Plugins provide declarative layouts, bilingual dictionaries, functional SVG icons, repository matching rules, shared synchronization hooks and isolated stores for permission-based visibility and actions.</li>
@@ -150,6 +151,7 @@
 </ul>
 <h3>Fixed</h3>
 <ul>
+<li>Escaped the Debian prerelease separator in the packaging script and added early installer-version checks. The beta.2 tag passed tests but failed Linux packaging.</li>
 <li>Corrected the duplicate-entry ZIP test fixture so Linux validates the same malformed package as Windows and macOS. The beta.1 tag failed this fixture check and did not publish installers.</li>
 <li>Correctly stage deleted files when resolving modify/delete merge conflicts, including non-ASCII paths, while preserving unrelated worktree changes.</li>
 <li>Share Claude-compatible request handling across commit generation and merge assistance without forcing unsupported thinking or tool-choice settings.</li>

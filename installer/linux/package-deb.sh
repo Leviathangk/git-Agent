@@ -8,7 +8,7 @@ fi
 
 version="${1#v}"
 deb_version="${version%%+*}"
-deb_version="${deb_version/-/~}"
+deb_version="${deb_version/-/\~}"
 architecture="$2"
 binary_dir="$3"
 output_dir="$4"

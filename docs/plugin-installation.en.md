@@ -1,6 +1,6 @@
 # Plugin installation and management
 
-Starting with Git Agent 2.0.0-beta.2, Options → Plugins imports packages and manages versions, load status and global switches. Repository Settings → Plugins manages repository overrides. Installers bundle GitHub plugin 0.1.0 and install it on first launch. You can disable or uninstall it; subsequent launches do not force an uninstalled plugin back. GitHub features require an installed, authenticated gh and activate only for repositories with matching GitHub remotes.
+Starting with Git Agent 2.0.0-beta.3, Options → Plugins imports packages and manages versions, load status and global switches. Repository Settings → Plugins manages repository overrides. Installers bundle GitHub plugin 0.1.0 and install it on first launch. You can disable or uninstall it; subsequent launches do not force an uninstalled plugin back. GitHub features require an installed, authenticated gh and activate only for repositories with matching GitHub remotes.
 
 Import a .gaplugin or ZIP with plugin.json, package.json, the native library and referenced resources at its root. Validation checks API, drivers, capabilities, semantic version, target architecture, resource/archive paths and size without loading native code. New packages load asynchronously; higher-version updates activate after restart. Actual ABI or dependency failures appear as load errors.
 

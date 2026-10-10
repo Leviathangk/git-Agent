@@ -39,6 +39,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check installer version formats
+        if: runner.os == 'Linux'
+        run: python3 scripts/check-package-versions.py
+
       - name: Verify tag matches application version
         shell: pwsh
         run: |

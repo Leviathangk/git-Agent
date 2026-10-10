@@ -953,10 +953,17 @@ mod tests {
         }
         zip.finish().unwrap();
         let mut bytes = fs::read(&path).unwrap();
-        for offset in 0..bytes.len().saturating_sub(10) {
-            if &bytes[offset..offset + 10] == b"plugiN.json" {
-                bytes[offset..offset + 10].copy_from_slice(b"plugin.json");
+        let duplicate_name = b"plugiN.json";
+        for offset in 0..=bytes.len().saturating_sub(duplicate_name.len()) {
+            if &bytes[offset..offset + duplicate_name.len()] == duplicate_name {
+                bytes[offset..offset + duplicate_name.len()].copy_from_slice(b"plugin.json");
             }
+        }
+        if bytes
+            .windows(duplicate_name.len())
+            .any(|name| name == duplicate_name)
+        {
+            panic!("Duplicate ZIP fixture still contains its temporary filename");
         }
         fs::write(&path, bytes).unwrap();
         path
@@ -1043,6 +1050,23 @@ mod tests {
             let storage = storage();
             let (manifest, info) = package_values("0.1.0");
             let zip = archive(&storage.root, manifest, info, vec![(path, b"bad".to_vec())]);
+            if path == "plugin.json" {
+                let raw = fs::read(&zip).unwrap();
+                let footer = raw
+                    .windows(4)
+                    .rposition(|bytes| bytes == b"PK\x05\x06")
+                    .unwrap();
+                assert_eq!(
+                    u16::from_le_bytes(raw[footer + 10..footer + 12].try_into().unwrap()),
+                    4
+                );
+                let parsed = zip::ZipArchive::new(std::io::Cursor::new(raw)).unwrap();
+                assert_eq!(
+                    parsed.len(),
+                    3,
+                    "Fixture must contain an exact duplicate, not a case variant"
+                );
+            }
             assert!(storage.install(&zip).is_err(), "{path}");
             assert!(storage.load().unwrap().installed.is_empty());
             assert!(fs::read_dir(&storage.root).unwrap().all(|entry| {

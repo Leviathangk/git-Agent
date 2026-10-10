@@ -5,7 +5,7 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
-## 2.0.0-beta.1 — 2026-10-10
+## 2.0.0-beta.2 — 2026-10-10
 
 ### Added
 
@@ -17,6 +17,7 @@ Earlier versions are documented in [GitHub Releases](https://github.com/adoin/gi
 
 ### Fixed
 
+- Corrected the duplicate-entry ZIP test fixture so Linux validates the same malformed package as Windows and macOS. The beta.1 tag failed this fixture check and did not publish installers.
 - Correctly stage deleted files when resolving modify/delete merge conflicts, including non-ASCII paths, while preserving unrelated worktree changes.
 - Share Claude-compatible request handling across commit generation and merge assistance without forcing unsupported thinking or tool-choice settings.
 

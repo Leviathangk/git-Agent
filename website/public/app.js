@@ -8,7 +8,7 @@
     "nav.changelog": "Changelog",
     "nav.features": "Features", "nav.ai": "AI merge", "nav.plugins": "Plugins", "nav.download": "Download", "nav.docs": "Docs ↗",
     "plugins.title": "Plugins", "plugins.description": "Find plugins built by the maintainer and the community. Open a repository for features and dependencies, then install its release package.",
-    "plugins.version": "Plugins require Git Agent 2.0.0-beta.3 or later. Beta.3 bundles the GitHub plugin. Prereleases need manual installation and do not trigger stable update prompts.",
+    "plugins.version": "Plugins require Git Agent 2.0.0 or later.",
     "plugins.versions": "Choose a plugin-capable version ↗",
     "plugins.use.title": "Use a plugin", "plugins.use.step1": "Open a repository above and check its platforms, required version and dependencies.",
     "plugins.use.step2": "Download the .gaplugin release package for your operating system and architecture. Follow the repository's checksum instructions.",

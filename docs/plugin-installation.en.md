@@ -4,6 +4,8 @@ Starting with Git Agent 2.0.0-beta.3, Options → Plugins imports packages and m
 
 Import a .gaplugin or ZIP with plugin.json, package.json, the native library and referenced resources at its root. Validation checks API, drivers, capabilities, semantic version, target architecture, resource/archive paths and size without loading native code. New packages load asynchronously; higher-version updates activate after restart. Actual ABI or dependency failures appear as load errors.
 
+After installation succeeds, you can delete the original .gaplugin or ZIP from your downloads folder. Its contents are saved in the application's plugins/packages/ID/VERSION directory and loaded from there. An installed update awaiting restart also no longer depends on the downloaded file.
+
 Global disable hides all contributions and stops new actions/hooks. Active work is cancelled cooperatively and retains receiver/library ownership until completion. Repository overrides inherit or enable/disable locally and never bypass global disable or domain conditions. Switches persist; the plugin permission store remains session scoped.
 
 Uninstall disables immediately and deletes managed versions on restart, retaining preferences. Development/manual source directories are not removed. Native plugins run with the user's permissions; host-service declarations are not a native sandbox.

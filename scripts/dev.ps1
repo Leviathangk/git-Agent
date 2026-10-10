@@ -124,6 +124,7 @@ function Stop-MainWindow {
     }
 
     Get-Process -Name "git-agent" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $mainExe } |
         ForEach-Object {
             Write-DevLog "stop stray git-agent pid=$($_.Id)"
             Stop-ProcessTree -ProcessId $_.Id
@@ -134,8 +135,10 @@ function Stop-DevBinaries {
     Stop-MainWindow
 
     Get-Process -Name "git-agent-merge" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $mergeExe } |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Get-Process -Name "git-agent-diff" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $diffExe } |
         Stop-Process -Force -ErrorAction SilentlyContinue
 }
 

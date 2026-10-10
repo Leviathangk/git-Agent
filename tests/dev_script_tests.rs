@@ -1,5 +1,71 @@
 use std::fs;
 
+#[cfg(target_os = "windows")]
+#[test]
+fn dev_script_stops_only_this_projects_executables() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let source = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/dev.ps1"),
+    )
+    .unwrap();
+    let start = source.find("function Stop-MainWindow").unwrap();
+    let end = source.find("function Build-Bins").unwrap();
+    let helpers = &source[start..end];
+    let mocks = r#"
+$ErrorActionPreference = 'Stop'
+$mainExe = 'C:/dev/target/debug/git-agent.exe'
+$mergeExe = 'C:/dev/target/debug/git-agent-merge.exe'
+$diffExe = 'C:/dev/target/debug/git-agent-diff.exe'
+$script:mainProcess = $null
+$script:stopped = @()
+function Write-DevLog { param($Line) }
+function Stop-ProcessTree { param($ProcessId) $script:stopped += $ProcessId }
+function Get-Process {
+    param($Name, $ErrorAction)
+    $offset = switch ($Name) { 'git-agent' { 10 }; 'git-agent-merge' { 20 }; 'git-agent-diff' { 30 } }
+    foreach ($location in @('C:/dev/target/debug/', 'C:/installed/', 'C:/other-project/target/debug/')) {
+        $offset++
+        [pscustomobject]@{ Id = $offset; Path = "$location$Name.exe" }
+    }
+}
+function Stop-Process {
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline=$true)]$InputObject, [switch]$Force)
+    process { $script:stopped += $InputObject.Id }
+}
+Stop-DevBinaries
+if (($script:stopped -join ',') -ne '11,21,31') { throw "Stopped unexpected processes: $script:stopped" }
+Write-Output 'PASS scoped dev process shutdown'
+"#;
+    let mut child = Command::new("pwsh.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("PowerShell 7 is required for the development script test");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{helpers}\n{mocks}\n").as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PASS scoped dev process shutdown"));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn dev_script_builds_stages_and_watches_native_plugins() {
     let script = fs::read_to_string(

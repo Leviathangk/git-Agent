@@ -219,7 +219,8 @@ const PUSH_SELECT_COLUMN_WIDTH: f32 = 82.0;
 const PUSH_LOCAL_BRANCH_COLUMN_WIDTH: f32 = 160.0;
 const PUSH_LOCAL_BRANCH_COLUMN_MIN_WIDTH: f32 = 120.0;
 const PUSH_REMOTE_BRANCH_COLUMN_MIN_WIDTH: f32 = 180.0;
-const PUSH_COLUMN_RESIZE_HANDLE_WIDTH: f32 = 10.0;
+const TABLE_COLUMN_RESIZE_HANDLE_WIDTH: f32 = 10.0;
+const PUSH_COLUMN_RESIZE_HANDLE_WIDTH: f32 = TABLE_COLUMN_RESIZE_HANDLE_WIDTH;
 const PUSH_TRACK_COLUMN_WIDTH: f32 = 58.0;
 const PUSH_TABLE_COLUMN_GAP: f32 = 8.0;
 const PUSH_TABLE_ROW_HEIGHT: f32 = 28.0;
@@ -2858,6 +2859,7 @@ struct LayoutPrefs {
     history_date_pct: f32,
     history_author_pct: f32,
     history_hash_pct: f32,
+    search_column_pcts: Option<[f32; 4]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4362,6 +4364,7 @@ impl Default for LayoutPrefs {
             history_date_pct: 0.18,
             history_author_pct: 0.18,
             history_hash_pct: 0.08,
+            search_column_pcts: None,
         }
     }
 }
@@ -4416,6 +4419,14 @@ impl LayoutPrefs {
         self.history_date_pct = sanitize_history_pct(self.history_date_pct, 0.18);
         self.history_author_pct = sanitize_history_pct(self.history_author_pct, 0.18);
         self.history_hash_pct = sanitize_history_pct(self.history_hash_pct, 0.08);
+        if self.search_column_pcts.is_some_and(|weights| {
+            weights
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+                || !weights.iter().sum::<f32>().is_finite()
+        }) {
+            self.search_column_pcts = None;
+        }
     }
 
     fn save(self) {
@@ -14953,7 +14964,9 @@ impl GitAgentApp {
                     return;
                 }
 
-                search_table_header(ui, self.language);
+                if search_table_header(ui, self.language, &mut self.layout_prefs) {
+                    self.layout_prefs.save();
+                }
                 let mut clicked_commit = None;
                 let mut hash_copied = false;
                 ScrollArea::vertical()
@@ -14966,6 +14979,7 @@ impl GitAgentApp {
                                 ui,
                                 commit,
                                 self.search_selected_commit == Some(*commit_index),
+                                &self.layout_prefs,
                             );
                             hash_copied |= copied_hash;
                             if response.clicked() {
@@ -30582,21 +30596,63 @@ struct SearchColumnWidths {
     hash: f32,
 }
 
-fn search_column_widths(width: f32) -> SearchColumnWidths {
-    let hash = 92.0;
-    let date = 132.0;
-    let author = 180.0;
-    let fixed = hash + date + author;
-    let desc = (width - fixed).max(180.0);
+fn search_column_min_widths(width: f32) -> [f32; 4] {
+    let mins = [90.0, 88.0, 64.0, 64.0];
+    let scale = (width.max(1.0) / mins.iter().sum::<f32>()).min(1.0);
+    mins.map(|min| min * scale)
+}
+
+fn search_column_widths(width: f32, prefs: &LayoutPrefs) -> SearchColumnWidths {
+    let width = width.max(1.0);
+    let mins = search_column_min_widths(width);
+    let preferred = prefs
+        .search_column_pcts
+        .filter(|weights| {
+            weights
+                .iter()
+                .all(|weight| weight.is_finite() && *weight > 0.0)
+                && weights.iter().sum::<f32>().is_finite()
+        })
+        .map(|weights| {
+            let total = weights.iter().sum::<f32>();
+            weights.map(|weight| width * (weight / total))
+        })
+        .unwrap_or([(width - 404.0).max(90.0), 132.0, 180.0, 92.0]);
+    let extras = std::array::from_fn::<_, 4, _>(|index| (preferred[index] - mins[index]).max(0.0));
+    let extra_total = extras.iter().sum::<f32>().max(f32::EPSILON);
+    let remaining = (width - mins.iter().sum::<f32>()).max(0.0);
+    let widths = std::array::from_fn::<_, 4, _>(|index| {
+        mins[index] + remaining * extras[index] / extra_total
+    });
     SearchColumnWidths {
-        desc,
-        date,
-        author,
-        hash,
+        desc: widths[0],
+        date: widths[1],
+        author: widths[2],
+        hash: widths[3],
     }
 }
 
-fn search_table_header(ui: &mut Ui, language: Language) {
+fn adjust_search_column_widths(
+    prefs: &mut LayoutPrefs,
+    cols: SearchColumnWidths,
+    boundary: usize,
+    delta: f32,
+) {
+    if boundary >= 3 || !delta.is_finite() {
+        return;
+    }
+    let mut widths = [cols.desc, cols.date, cols.author, cols.hash];
+    let total = widths.iter().sum::<f32>();
+    let mins = search_column_min_widths(total);
+    let lower = mins[boundary] - widths[boundary];
+    let upper = widths[boundary + 1] - mins[boundary + 1];
+    let delta = delta.clamp(lower.min(upper), upper);
+    widths[boundary] += delta;
+    widths[boundary + 1] -= delta;
+    prefs.search_column_pcts = Some(widths.map(|width| width / total));
+}
+
+fn search_table_header(ui: &mut Ui, language: Language, prefs: &mut LayoutPrefs) -> bool {
     let labels = if language == Language::Chinese {
         (
             "\u{63cf}\u{8ff0}",
@@ -30608,7 +30664,49 @@ fn search_table_header(ui: &mut Ui, language: Language) {
         ("Description", "Date", "Author", "Commit")
     };
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
-    let cols = search_column_widths(rect.width());
+    let cols = search_column_widths(rect.width(), prefs);
+    let mut finished = false;
+    for (boundary, x) in [
+        rect.left() + cols.desc,
+        rect.left() + cols.desc + cols.date,
+        rect.right() - cols.hash,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let handle = Rect::from_center_size(
+            Pos2::new(x, rect.center().y),
+            Vec2::new(TABLE_COLUMN_RESIZE_HANDLE_WIDTH, rect.height()),
+        );
+        let response = ui
+            .interact(
+                handle,
+                ui.id().with(("search_column_resize", boundary)),
+                Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        // The press frame may contain pointer movement made before the button
+        // went down. Capture immediately, but resize only subsequent movement.
+        if response.dragged() && !response.drag_started() {
+            adjust_search_column_widths(prefs, cols, boundary, response.drag_delta().x);
+            ui.ctx().request_repaint();
+        }
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            let current = search_column_widths(rect.width(), prefs);
+            let widths = [current.desc, current.date, current.author];
+            let divider_x = rect.left() + widths[..=boundary].iter().sum::<f32>();
+            ui.painter().line_segment(
+                [
+                    Pos2::new(divider_x, rect.top()),
+                    Pos2::new(divider_x, rect.bottom()),
+                ],
+                Stroke::new(2.0, theme::accent()),
+            );
+        }
+        finished |= response.drag_stopped();
+    }
+    let cols = search_column_widths(rect.width(), prefs);
     let mut x = rect.left();
     let y = rect.center().y;
     draw_clipped_cell(
@@ -30650,15 +30748,45 @@ fn search_table_header(ui: &mut Ui, language: Language) {
         theme::muted(),
         false,
     );
+    finished
 }
 
-fn search_commit_row(ui: &mut Ui, commit: &Commit, selected: bool) -> (egui::Response, bool) {
-    let response = ui.allocate_response(
+fn search_commit_row(
+    ui: &mut Ui,
+    commit: &Commit,
+    selected: bool,
+    prefs: &LayoutPrefs,
+) -> (egui::Response, bool) {
+    let row_response = ui.allocate_response(
         Vec2::new(ui.available_width(), HISTORY_TABLE_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    let rect = row_response.rect;
+    let cols = search_column_widths(rect.width(), prefs);
+    let hash_rect = Rect::from_min_max(
+        Pos2::new(rect.right() - cols.hash, rect.top()),
+        rect.right_bottom(),
+    );
+    let details_rect =
+        Rect::from_min_max(rect.left_top(), Pos2::new(hash_rect.left(), rect.bottom()));
+    let response = ui.interact(
+        details_rect,
+        row_response.id.with("search_details"),
         Sense::click(),
     );
-    let rect = response.rect;
-    if selected || response.hovered() {
+    let copy_response = ui
+        .interact(
+            hash_rect,
+            ui.id().with(("search_hash", &commit.hash)),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(commit.hash.as_str());
+    let hash_copied = copy_response.clicked();
+    if hash_copied {
+        ui.ctx().copy_text(commit.hash.clone());
+    }
+    if selected || response.hovered() || copy_response.hovered() {
         ui.painter().rect_filled(
             rect,
             CornerRadius::ZERO,
@@ -30670,7 +30798,6 @@ fn search_commit_row(ui: &mut Ui, commit: &Commit, selected: bool) -> (egui::Res
         );
     }
 
-    let cols = search_column_widths(rect.width());
     let text_color = if selected {
         Color32::WHITE
     } else {
@@ -30683,21 +30810,6 @@ fn search_commit_row(ui: &mut Ui, commit: &Commit, selected: bool) -> (egui::Res
     };
     let mut x = rect.left();
     let y = rect.center().y;
-    let hash_rect = Rect::from_min_size(
-        Pos2::new(x, rect.top()),
-        Vec2::new(cols.hash, rect.height()),
-    );
-    let copy_response = ui
-        .interact(
-            hash_rect,
-            ui.id().with(("search_hash", &commit.hash)),
-            Sense::click(),
-        )
-        .on_hover_text(commit.hash.as_str());
-    let hash_copied = copy_response.clicked();
-    if hash_copied {
-        ui.ctx().copy_text(commit.hash.clone());
-    }
     draw_clipped_cell(
         ui,
         x + 6.0,
@@ -48804,6 +48916,323 @@ diff --git a/file.txt b/file.txt
 
         assert!(after.desc > before.desc + 48.0);
         assert!(after.date < before.date - 48.0);
+    }
+
+    #[test]
+    fn search_table_resize_preserves_widths_and_minimums() {
+        for width in [1.0, 120.0, 306.0, 700.0, 1400.0] {
+            let mut prefs = LayoutPrefs::default();
+            for boundary in 0..3 {
+                for delta in [60.0, 10000.0, -10000.0, -60.0] {
+                    let cols = search_column_widths(width, &prefs);
+                    adjust_search_column_widths(&mut prefs, cols, boundary, delta);
+                    let resized = search_column_widths(width, &prefs);
+                    let values = [resized.desc, resized.date, resized.author, resized.hash];
+                    assert!((values.iter().sum::<f32>() - width).abs() < 0.01);
+                    for (value, min) in values.into_iter().zip(search_column_min_widths(width)) {
+                        assert!(value.is_finite() && value >= min - 0.001);
+                    }
+                }
+            }
+            assert_eq!(
+                prefs.history_desc_pct,
+                LayoutPrefs::default().history_desc_pct
+            );
+        }
+        let mut prefs = LayoutPrefs::default();
+        let cols = search_column_widths(1000.0, &prefs);
+        adjust_search_column_widths(&mut prefs, cols, 0, 40.0);
+        let after = search_column_widths(1000.0, &prefs);
+        assert!((after.desc - cols.desc - 40.0).abs() < 0.01);
+        assert!((after.date - cols.date + 40.0).abs() < 0.01);
+        assert!((after.author - cols.author).abs() < 0.01);
+        let restored: LayoutPrefs =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(restored.search_column_pcts, prefs.search_column_pcts);
+        assert!(
+            serde_json::from_str::<LayoutPrefs>("{}")
+                .unwrap()
+                .search_column_pcts
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn search_table_invalid_preferences_use_safe_defaults() {
+        for values in [[f32::NAN, 1.0, 1.0, 1.0], [0.0; 4], [f32::MAX; 4]] {
+            let mut prefs = LayoutPrefs {
+                search_column_pcts: Some(values),
+                ..Default::default()
+            };
+            let cols = search_column_widths(900.0, &prefs);
+            assert!(cols.desc.is_finite() && cols.desc > 0.0);
+            prefs.clamp();
+            assert!(prefs.search_column_pcts.is_none());
+        }
+    }
+
+    #[test]
+    fn search_table_clicks_copy_only_the_hash_and_select_every_other_column() {
+        for resized in [false, true] {
+            for column in 0..4 {
+                let ctx = egui::Context::default();
+                let commit = Commit {
+                    hash: "abc123456789abcdef".into(),
+                    short_hash: "abc12345".into(),
+                    subject: "A commit".into(),
+                    author: "Author".into(),
+                    ..Default::default()
+                };
+                let mut prefs = LayoutPrefs::default();
+                if resized {
+                    adjust_search_column_widths(
+                        &mut prefs,
+                        search_column_widths(884.0, &LayoutPrefs::default()),
+                        2,
+                        -70.0,
+                    );
+                }
+                let screen = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 200.0)));
+                let mut rect = Rect::NOTHING;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: screen,
+                        time: Some(0.0),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            rect = Rect::from_min_size(
+                                ui.next_widget_position(),
+                                Vec2::new(ui.available_width(), HISTORY_TABLE_ROW_HEIGHT),
+                            );
+                            search_commit_row(ui, &commit, false, &prefs);
+                        });
+                    },
+                );
+                let cols = search_column_widths(rect.width(), &prefs);
+                let widths = [cols.desc, cols.date, cols.author, cols.hash];
+                let position = Pos2::new(
+                    rect.left() + widths[..column].iter().sum::<f32>() + widths[column] * 0.5,
+                    rect.center().y,
+                );
+                let mut selected = false;
+                let mut copied = false;
+                let mut clipboard = Vec::new();
+                for (frame, pressed) in [true, false].into_iter().enumerate() {
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: screen,
+                            time: Some(0.05 + frame as f64 * 0.05),
+                            events: vec![
+                                egui::Event::PointerMoved(position),
+                                egui::Event::PointerButton {
+                                    pos: position,
+                                    button: egui::PointerButton::Primary,
+                                    pressed,
+                                    modifiers: Default::default(),
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                let (response, hash_copied) =
+                                    search_commit_row(ui, &commit, false, &prefs);
+                                selected |= response.clicked();
+                                copied |= hash_copied;
+                            });
+                        },
+                    );
+                    for command in output.platform_output.commands {
+                        if let egui::OutputCommand::CopyText(text) = command {
+                            clipboard.push(text);
+                        }
+                    }
+                }
+                assert_eq!(selected, column != 3, "resized={resized}, column={column}");
+                assert_eq!(copied, column == 3);
+                assert_eq!(
+                    clipboard,
+                    if column == 3 {
+                        vec![commit.hash.clone()]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_table_header_drag_saves_only_after_release() {
+        let ctx = egui::Context::default();
+        let mut prefs = LayoutPrefs::default();
+        let screen = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 200.0)));
+        let mut table_rect = Rect::NOTHING;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: screen,
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    table_rect = Rect::from_min_size(
+                        ui.next_widget_position(),
+                        Vec2::new(ui.available_width(), 24.0),
+                    );
+                    assert!(!search_table_header(ui, Language::English, &mut prefs));
+                });
+            },
+        );
+        let before = search_column_widths(table_rect.width(), &prefs);
+        let start = Pos2::new(table_rect.left() + before.desc, table_rect.center().y);
+        let end = start + Vec2::new(40.0, 0.0);
+        let frames = [
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            vec![egui::Event::PointerMoved(end)],
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        ];
+        for (frame, events) in frames.into_iter().enumerate() {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: screen,
+                    time: Some(0.05 + frame as f64 * 0.05),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert_eq!(
+                            search_table_header(ui, Language::English, &mut prefs),
+                            frame == 2
+                        );
+                    });
+                },
+            );
+        }
+        let after = search_column_widths(table_rect.width(), &prefs);
+        assert!((after.desc - before.desc - 40.0).abs() < 0.01);
+        assert!((after.date - before.date + 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn search_table_header_slow_offset_drags_keep_the_pointer_captured() {
+        for boundary in 0..3 {
+            for grab_offset in [-4.0, 0.0, 4.0] {
+                let ctx = egui::Context::default();
+                let mut prefs = LayoutPrefs::default();
+                let screen = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 240.0)));
+                let mut table_rect = Rect::NOTHING;
+                let mut finished = false;
+                let mut row_clicked = false;
+                let mut hash_copied = false;
+                let commit = Commit {
+                    hash: "abc123".into(),
+                    short_hash: "abc123".into(),
+                    ..Default::default()
+                };
+                let mut render = |input: egui::RawInput, prefs: &mut LayoutPrefs| {
+                    let _ = ctx.run(input, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            table_rect = Rect::from_min_size(
+                                ui.next_widget_position(),
+                                Vec2::new(ui.available_width(), 24.0),
+                            );
+                            finished |= search_table_header(ui, Language::English, prefs);
+                            ScrollArea::vertical().show(ui, |ui| {
+                                let (row, copied) = search_commit_row(ui, &commit, false, prefs);
+                                row_clicked |= row.clicked();
+                                hash_copied |= copied;
+                            });
+                        });
+                    });
+                    table_rect
+                };
+                let rect = render(
+                    egui::RawInput {
+                        screen_rect: screen,
+                        time: Some(0.0),
+                        ..Default::default()
+                    },
+                    &mut prefs,
+                );
+                let before = search_column_widths(rect.width(), &prefs);
+                let widths = [before.desc, before.date, before.author, before.hash];
+                let start = Pos2::new(
+                    rect.left() + widths[..=boundary].iter().sum::<f32>() + grab_offset,
+                    rect.center().y,
+                );
+                render(
+                    egui::RawInput {
+                        screen_rect: screen,
+                        time: Some(0.01),
+                        events: vec![
+                            egui::Event::PointerMoved(start),
+                            egui::Event::PointerButton {
+                                pos: start,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    &mut prefs,
+                );
+                for pixel in 1..=16 {
+                    let position =
+                        start + Vec2::new(pixel as f32, if pixel > 8 { 30.0 } else { 0.0 });
+                    render(
+                        egui::RawInput {
+                            screen_rect: screen,
+                            time: Some(0.01 + pixel as f64 * 0.01),
+                            events: vec![egui::Event::PointerMoved(position)],
+                            ..Default::default()
+                        },
+                        &mut prefs,
+                    );
+                    let current = search_column_widths(rect.width(), &prefs);
+                    let current_widths = [current.desc, current.date, current.author, current.hash];
+                    assert!(
+                        (current_widths[boundary] - widths[boundary] - pixel as f32).abs() < 0.02,
+                        "boundary={boundary}, offset={grab_offset}, pixel={pixel}"
+                    );
+                }
+                let end = start + Vec2::new(16.0, 30.0);
+                render(
+                    egui::RawInput {
+                        screen_rect: screen,
+                        time: Some(0.20),
+                        events: vec![egui::Event::PointerButton {
+                            pos: end,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        }],
+                        ..Default::default()
+                    },
+                    &mut prefs,
+                );
+                drop(render);
+                assert!(finished);
+                assert!(!row_clicked && !hash_copied);
+            }
+        }
     }
 
     #[test]

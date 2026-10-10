@@ -47,6 +47,11 @@ fn every_native_package_carries_license_and_notice() {
         assert!(macos.contains(&install));
         assert!(macos.find(&install).unwrap() < macos.find("codesign --force").unwrap());
     }
-    assert!(linux.contains("install -m 644 LICENSE \"$package_root/usr/share/doc/git-agent/copyright\""));
-    assert!(linux.contains("install -m 644 NOTICE \"$package_root/usr/share/doc/git-agent/NOTICE\""));
+    assert!(
+        linux
+            .contains("install -m 644 LICENSE \"$package_root/usr/share/doc/git-agent/copyright\"")
+    );
+    assert!(
+        linux.contains("install -m 644 NOTICE \"$package_root/usr/share/doc/git-agent/NOTICE\"")
+    );
 }

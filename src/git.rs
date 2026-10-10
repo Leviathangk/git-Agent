@@ -561,7 +561,9 @@ fn parse_repository_refresh_fingerprint(output: &str) -> RepositoryRefreshFinger
 }
 
 fn parse_repository_refresh_fingerprint_z(output: &[u8]) -> RepositoryRefreshFingerprint {
-    let mut fields = output.split(|byte| *byte == 0).filter(|field| !field.is_empty());
+    let mut fields = output
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty());
     let first = fields.next();
     let (header, status_fields) = match first {
         Some(first) if first.starts_with(b"## ") => (Some(first), fields.collect::<Vec<_>>()),
@@ -821,9 +823,7 @@ where
             .split('\0')
             .filter(|path| !path.is_empty())
             .count()
-            .max(
-                parse_porcelain_v1_z(status_output.as_bytes()).len(),
-            ),
+            .max(parse_porcelain_v1_z(status_output.as_bytes()).len()),
         hardware_stats,
         source_tree_version: format!("Git Agent {}", env!("CARGO_PKG_VERSION")),
         git_version,
@@ -1044,7 +1044,9 @@ pub fn load_commit_details(root: impl AsRef<Path>, hash: &str) -> Result<CommitD
 }
 
 pub fn search_commits_by_changed_file(
-    root: impl AsRef<Path>, query: &str, cancelled: &AtomicBool,
+    root: impl AsRef<Path>,
+    query: &str,
+    cancelled: &AtomicBool,
     mut on_paths: impl FnMut(Vec<String>),
 ) -> Result<Vec<String>> {
     let raw_query = query.trim();
@@ -1062,7 +1064,8 @@ pub fn search_commits_by_changed_file(
             "--name-only",
             "-z",
             "--format=%x1e%H",
-        ], cancelled,
+        ],
+        cancelled,
     )?;
     let mut hashes = parse_changed_file_search_log_z(&path_output, raw_query);
     on_paths(hashes.clone());
@@ -1077,7 +1080,8 @@ pub fn search_commits_by_changed_file(
             "-G",
             &content_regex,
             "--format=%H",
-        ], cancelled,
+        ],
+        cancelled,
     )?;
 
     let mut seen: HashSet<String> = hashes.iter().cloned().collect();
@@ -1090,7 +1094,9 @@ pub fn search_commits_by_changed_file(
 }
 
 pub fn commits_for_file_path(
-    root: impl AsRef<Path>, path: &str, cancelled: &AtomicBool,
+    root: impl AsRef<Path>,
+    path: &str,
+    cancelled: &AtomicBool,
 ) -> Result<Vec<String>> {
     let path = path.trim().replace('\\', "/");
     if path.is_empty() {
@@ -1118,15 +1124,29 @@ fn search_git_output(root: &Path, args: &[&str], cancelled: &AtomicBool) -> Resu
 }
 
 fn search_git_output_bytes(root: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>> {
-    if cancelled.load(AtomicOrdering::Relaxed) { return Err(anyhow!("Search cancelled")); }
-    let mut child = git_command().arg("-C").arg(root).args(args)
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        return Err(anyhow!("Search cancelled"));
+    }
+    let mut child = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
     // Drain both pipes while waiting, so large filename output cannot block Git.
     std::thread::scope(|scope| -> Result<Vec<u8>> {
-        let output = scope.spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).map(|_| bytes) });
-        let errors = scope.spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).map(|_| bytes) });
+        let output = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let errors = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
         let status = loop {
             if cancelled.load(AtomicOrdering::Relaxed) {
                 terminate_search_process(&mut child);
@@ -1136,12 +1156,22 @@ fn search_git_output_bytes(root: &Path, args: &[&str], cancelled: &AtomicBool) -
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(40)),
-                Err(error) => { terminate_search_process(&mut child); let _ = child.wait(); return Err(error.into()); }
+                Err(error) => {
+                    terminate_search_process(&mut child);
+                    let _ = child.wait();
+                    return Err(error.into());
+                }
             }
         };
-        let stdout = output.join().map_err(|_| anyhow!("Search output reader stopped"))??;
-        let stderr = errors.join().map_err(|_| anyhow!("Search diagnostic reader stopped"))??;
-        if !status.success() { return Err(anyhow!("{}", String::from_utf8_lossy(&stderr))); }
+        let stdout = output
+            .join()
+            .map_err(|_| anyhow!("Search output reader stopped"))??;
+        let stderr = errors
+            .join()
+            .map_err(|_| anyhow!("Search diagnostic reader stopped"))??;
+        if !status.success() {
+            return Err(anyhow!("{}", String::from_utf8_lossy(&stderr)));
+        }
         Ok(stdout)
     })
 }
@@ -1154,7 +1184,9 @@ fn terminate_search_process(child: &mut std::process::Child) {
         let _ = Command::new("taskkill")
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .creation_flags(CREATE_NO_WINDOW)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
     let _ = child.kill();
 }
@@ -1204,7 +1236,9 @@ fn parse_changed_file_search_log_z(output: &[u8], query: &str) -> Vec<String> {
                     } else {
                         path
                     };
-                    String::from_utf8_lossy(path).to_lowercase().contains(&query)
+                    String::from_utf8_lossy(path)
+                        .to_lowercase()
+                        .contains(&query)
                 })
                 .then_some(hash)
         })
@@ -3433,12 +3467,28 @@ pub enum ConflictSide {
 
 pub fn accept_conflict_side(root: impl AsRef<Path>, path: &str, side: ConflictSide) -> Result<()> {
     let root = root.as_ref();
+    if path.is_empty() {
+        return Err(anyhow!("Missing conflict path"));
+    }
+    let literal_path = format!(":(literal){path}");
     let selector = match side {
         ConflictSide::Ours => "--ours",
         ConflictSide::Theirs => "--theirs",
     };
-    git_output(root, &["checkout", selector, "--", path])?;
-    git_output(root, &["add", "--", path]).map(|_| ())
+    let records = git_output(root, &["ls-files", "--unmerged", "--", &literal_path])?;
+    if records.trim().is_empty() {
+        return Err(anyhow!("File is no longer conflicted: {path}"));
+    }
+    let stage = if side == ConflictSide::Ours { "2" } else { "3" };
+    if !records
+        .lines()
+        .any(|line| line.split_whitespace().nth(2) == Some(stage))
+    {
+        // A missing selected stage is a deletion decision, not an unavailable checkout.
+        return git_output(root, &["rm", "--force", "--", &literal_path]).map(|_| ());
+    }
+    git_output(root, &["checkout", selector, "--", &literal_path])?;
+    git_output(root, &["add", "--", &literal_path]).map(|_| ())
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3963,10 +4013,7 @@ fn parse_status_entry(line: &str) -> Option<WorktreeFile> {
     }
 
     let (path, display_path) = if let Some((destination, source)) = raw_path.split_once('\0') {
-        (
-            destination.to_owned(),
-            format!("{source} -> {destination}"),
-        )
+        (destination.to_owned(), format!("{source} -> {destination}"))
     } else {
         let path = raw_path
             .split(" -> ")
@@ -4696,23 +4743,36 @@ mod tests {
     #[test]
     fn file_search_reports_filename_matches_before_content_and_honors_cancel() -> Result<()> {
         let root = init_patch_test_repo("file-search-progress")?;
-        fs::write(root.join("usePinService.ts"), "export const enabled = true;\n")?;
+        fs::write(
+            root.join("usePinService.ts"),
+            "export const enabled = true;\n",
+        )?;
         git_output(&root, &["add", "."])?;
         git_output(&root, &["commit", "-m", "file name match"])?;
-        let path_hash = git_output(&root, &["rev-parse", "HEAD"] )?.trim().to_owned();
+        let path_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
         fs::write(root.join("consumer.ts"), "usePinService();\n")?;
         git_output(&root, &["add", "."])?;
         git_output(&root, &["commit", "-m", "content match"])?;
-        let content_hash = git_output(&root, &["rev-parse", "HEAD"] )?.trim().to_owned();
+        let content_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
         let cancelled = AtomicBool::new(false);
         let mut partial = Vec::new();
-        let hashes = search_commits_by_changed_file(&root, "usePinService", &cancelled, |paths| partial = paths)?;
+        let hashes = search_commits_by_changed_file(&root, "usePinService", &cancelled, |paths| {
+            partial = paths
+        })?;
         assert_eq!(partial, vec![path_hash.clone()]);
         assert_eq!(hashes, vec![path_hash, content_hash]);
-        assert!(search_commits_by_changed_file(&root, "usePinService", &cancelled, |_| {
-            cancelled.store(true, AtomicOrdering::Relaxed);
-        }).is_err());
-        assert!(search_git_output(&root, &["not-a-command"], &cancelled).unwrap_err().to_string().contains("cancelled"));
+        assert!(
+            search_commits_by_changed_file(&root, "usePinService", &cancelled, |_| {
+                cancelled.store(true, AtomicOrdering::Relaxed);
+            })
+            .is_err()
+        );
+        assert!(
+            search_git_output(&root, &["not-a-command"], &cancelled)
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -4731,11 +4791,7 @@ mod tests {
         let edit_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
 
         let cancelled = AtomicBool::new(false);
-        let hashes = commits_for_file_path(
-            &root,
-            "src\\nested\\renamed.txt",
-            &cancelled,
-        )?;
+        let hashes = commits_for_file_path(&root, "src\\nested\\renamed.txt", &cancelled)?;
         assert_eq!(hashes, vec![edit_hash, rename_hash, original_hash]);
         fs::remove_dir_all(root)?;
         Ok(())
@@ -4748,12 +4804,26 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         let started = Instant::now();
         let hashes = search_commits_by_changed_file(&root, "usePinService", &cancelled, |paths| {
-            eprintln!("filename phase: {:?}, {} matches", started.elapsed(), paths.len());
+            eprintln!(
+                "filename phase: {:?}, {} matches",
+                started.elapsed(),
+                paths.len()
+            );
         })?;
-        eprintln!("full search: {:?}, {} matches", started.elapsed(), hashes.len());
+        eprintln!(
+            "full search: {:?}, {} matches",
+            started.elapsed(),
+            hashes.len()
+        );
         let started = Instant::now();
         std::thread::scope(|scope| -> Result<()> {
-            let worker = scope.spawn(|| search_git_output(&root, &["log", "-G", "usePinService", "--format=%H"], &cancelled));
+            let worker = scope.spawn(|| {
+                search_git_output(
+                    &root,
+                    &["log", "-G", "usePinService", "--format=%H"],
+                    &cancelled,
+                )
+            });
             std::thread::sleep(std::time::Duration::from_millis(100));
             cancelled.store(true, AtomicOrdering::Relaxed);
             assert!(worker.join().unwrap().is_err());
@@ -4945,6 +5015,228 @@ mod tests {
             ),
             vec!["stash", "push", "--staged", "--keep-index", "--all"]
         );
+    }
+
+    /// Explicit local lab only: use the real application Git operations on prepared test-repo worktrees.
+    #[test]
+    #[ignore = "requires scripts/test_merge_lab.py prepare and GIT_AGENT_MERGE_LAB_MANIFEST"]
+    fn live_merge_matrix_in_test_repository() -> Result<()> {
+        let path = PathBuf::from(std::env::var("GIT_AGENT_MERGE_LAB_MANIFEST")?);
+        let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        assert_eq!(
+            manifest["source"].as_str(),
+            Some("D:\\workspace\\test-repo")
+        );
+        let lab = path.parent().unwrap().canonicalize()?;
+        let folder = manifest["folder"].as_str().unwrap();
+        let reference = |name: &str| manifest["refs"][name].as_str().unwrap();
+        let case = |name: &str| -> PathBuf {
+            let root = PathBuf::from(manifest["cases"][name].as_str().unwrap())
+                .canonicalize()
+                .unwrap();
+            assert!(
+                root.starts_with(&lab) && root != lab,
+                "lab operations must stay inside the prepared directory"
+            );
+            root
+        };
+        let parents = |root: &Path| {
+            git_output(root, &["show", "-s", "--format=%P", "HEAD"])
+                .unwrap()
+                .split_whitespace()
+                .count()
+        };
+        let mut results = Vec::new();
+        let mut passed = |name: &str, root: &Path| {
+            println!("MERGE_LAB_PASS\tcase={name}");
+            results.push(serde_json::json!({"case":name,"passed":true,"head":git_output(root,&["rev-parse","HEAD"]).unwrap().trim()}));
+        };
+        let root = case("ff");
+        merge_branch(&root, reference("clean-right"))?;
+        assert_eq!(
+            git_output(&root, &["rev-parse", "HEAD"])?,
+            git_output(&root, &["rev-parse", reference("clean-right")])?
+        );
+        passed("fast-forward", &root);
+        let root = case("no-ff");
+        merge_commit(
+            &root,
+            reference("clean-right"),
+            MergeOptions {
+                force_merge_commit: true,
+                include_messages: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(parents(&root), 2);
+        passed("forced-merge-commit", &root);
+        let root = case("clean");
+        merge_commit(&root, reference("clean-right"), MergeOptions::default())?;
+        assert_eq!(parents(&root), 2);
+        assert!(
+            root.join(folder).join("left.txt").exists()
+                && root.join(folder).join("right.txt").exists()
+        );
+        passed("independent-changes", &root);
+        let root = case("no-commit");
+        let head = git_output(&root, &["rev-parse", "HEAD"])?;
+        merge_commit(
+            &root,
+            reference("clean-right"),
+            MergeOptions {
+                commit_merge: false,
+                ..Default::default()
+            },
+        )?;
+        assert!(repository_merge_in_progress(&root));
+        assert_eq!(head, git_output(&root, &["rev-parse", "HEAD"])?);
+        commit_with_options(
+            &root,
+            "test: finish pending merge",
+            CommitOptions::default(),
+        )?;
+        assert!(!repository_merge_in_progress(&root));
+        assert_eq!(parents(&root), 2);
+        passed("no-commit-then-commit", &root);
+        let root = case("rename");
+        merge_commit(
+            &root,
+            reference("rename-right"),
+            MergeOptions {
+                detect_renames: true,
+                rename_threshold: 50,
+                ..Default::default()
+            },
+        )?;
+        assert!(!has_unmerged_paths(&root));
+        assert_eq!(
+            fs::read_to_string(root.join(folder).join("renamed.txt"))?.replace("\r\n", "\n"),
+            "one\ntwo\nTHREE\nfour\nfive\n"
+        );
+        assert!(!root.join(folder).join("重命名.txt").exists());
+        passed("unicode-rename-and-edit", &root);
+        let resolve = |root: &Path| -> Result<()> {
+            for (name, text) in [
+                ("story.txt", "left + right\n"),
+                ("added.mjs", "export const features = ['left', 'right'];\n"),
+            ] {
+                let args = crate::merge_tool::MergeArgs {
+                    base: PathBuf::new(),
+                    local: PathBuf::new(),
+                    remote: PathBuf::new(),
+                    output: root.join(folder).join(name),
+                    repo_root: Some(root.into()),
+                    stage: true,
+                    theme: crate::merge_tool::MergeTheme::Light,
+                    language: crate::merge_tool::MergeLanguage::Chinese,
+                    ai_model_name: None,
+                };
+                crate::merge_tool::write_merge_output(&args, text)?;
+            }
+            let path = format!("{folder}/retired.mjs");
+            let records = git_output(root, &["ls-files", "--unmerged", "--", &path])?;
+            let deleted_side = if records
+                .lines()
+                .any(|line| line.split_whitespace().nth(2) == Some("2"))
+            {
+                ConflictSide::Theirs
+            } else {
+                ConflictSide::Ours
+            };
+            accept_conflict_side(root, &path, deleted_side)?;
+            assert!(!has_unmerged_paths(root));
+            Ok(())
+        };
+        let root = case("conflict");
+        let before = git_output(&root, &["rev-parse", "HEAD"])?;
+        merge_branch(&root, reference("conflict-right"))?;
+        assert!(repository_merge_in_progress(&root));
+        assert!(has_unmerged_paths(&root));
+        assert!(git_output(&root, &["status", "--porcelain"])?.contains("DU"));
+        git_output(&root, &["merge", "--abort"])?;
+        assert_eq!(before, git_output(&root, &["rev-parse", "HEAD"])?);
+        assert!(!has_unmerged_paths(&root));
+        passed("conflict-abort-restores-head", &root);
+        merge_branch(&root, reference("conflict-right"))?;
+        resolve(&root)?;
+        commit_with_options(
+            &root,
+            "test: manually resolve modify/delete and add/add",
+            CommitOptions::default(),
+        )?;
+        assert_eq!(parents(&root), 2);
+        passed("manual-resolve-and-stage", &root);
+        let root = case("rebase-abort");
+        let before = git_output(&root, &["rev-parse", "HEAD"])?;
+        assert!(rebase_current_onto(&root, reference("conflict-right")).is_err());
+        assert!(repository_rebase_in_progress(&root));
+        rebase_abort(&root)?;
+        assert_eq!(before, git_output(&root, &["rev-parse", "HEAD"])?);
+        assert!(!repository_rebase_in_progress(&root));
+        passed("rebase-abort", &root);
+        let root = case("rebase-continue");
+        assert!(rebase_current_onto(&root, reference("conflict-right")).is_err());
+        resolve(&root)?;
+        rebase_continue(&root)?;
+        assert!(!repository_rebase_in_progress(&root));
+        assert_eq!(parents(&root), 1);
+        passed("rebase-resolve-and-continue", &root);
+        let root = case("cherry-pick");
+        assert!(cherry_pick_commit(&root, reference("conflict-right")).is_err());
+        assert!(has_unmerged_paths(&root));
+        resolve(&root)?;
+        git_output(
+            &root,
+            &["-c", "core.editor=true", "cherry-pick", "--continue"],
+        )?;
+        assert!(!has_unmerged_paths(&root));
+        assert_eq!(parents(&root), 1);
+        passed("cherry-pick-resolve-and-continue", &root);
+        fs::write(
+            lab.join("native-results.json"),
+            serde_json::to_vec_pretty(&results)?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn accepting_deleted_conflict_side_handles_ours_and_theirs_without_losing_unrelated_edits()
+    -> Result<()> {
+        for side in [ConflictSide::Ours, ConflictSide::Theirs] {
+            let root = init_patch_test_repo(&format!("delete-side-{side:?}"))?;
+            let path = "删除冲突[1].txt";
+            fs::write(root.join(path), "base\n")?;
+            git_output(&root, &["add", "--", path])?;
+            git_output(&root, &["commit", "-m", "base deletion case"])?;
+            let branch = git_output(&root, &["branch", "--show-current"])?;
+            git_output(&root, &["checkout", "-b", "incoming-deletion"])?;
+            if side == ConflictSide::Theirs {
+                git_output(&root, &["rm", "--", path])?;
+            } else {
+                fs::write(root.join(path), "incoming\n")?;
+                git_output(&root, &["add", "--", path])?;
+            }
+            git_output(&root, &["commit", "-m", "incoming"])?;
+            git_output(&root, &["checkout", branch.trim()])?;
+            if side == ConflictSide::Ours {
+                git_output(&root, &["rm", "--", path])?;
+            } else {
+                fs::write(root.join(path), "local\n")?;
+                git_output(&root, &["add", "--", path])?;
+            }
+            git_output(&root, &["commit", "-m", "local"])?;
+            assert!(git_output(&root, &["merge", "incoming-deletion"]).is_err());
+            fs::write(root.join("unrelated-draft.txt"), "keep me\n")?;
+            accept_conflict_side(&root, path, side)?;
+            assert!(!root.join(path).exists());
+            assert!(!has_unmerged_paths(&root));
+            assert_eq!(
+                fs::read_to_string(root.join("unrelated-draft.txt"))?,
+                "keep me\n"
+            );
+            assert!(accept_conflict_side(&root, path, side).is_err());
+        }
+        Ok(())
     }
 
     #[test]
@@ -5839,8 +6131,7 @@ mod tests {
         let hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
         assert_eq!(load_commit_details(&root, &hash)?.files[0].diff_path, path);
         let cancelled = AtomicBool::new(false);
-        assert!(search_commits_by_changed_file(&root, "测试", &cancelled, |_| {})?
-            .contains(&hash));
+        assert!(search_commits_by_changed_file(&root, "测试", &cancelled, |_| {})?.contains(&hash));
 
         fs::write(root.join(path), "已修改\n")?;
         unstage_paths(&root, &[path.to_owned()])?;
@@ -5890,7 +6181,10 @@ mod tests {
         let conflicts = collect_worktree_conflicts(&staged, &unstaged);
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].path, path);
-        assert_eq!(conflict_file_versions(&root, path)?, ("base\n".into(), "local\n".into(), "remote\n".into()));
+        assert_eq!(
+            conflict_file_versions(&root, path)?,
+            ("base\n".into(), "local\n".into(), "remote\n".into())
+        );
 
         accept_conflict_side(&root, path, ConflictSide::Theirs)?;
         assert_eq!(fs::read_to_string(root.join(path))?, "remote\n");
@@ -5909,8 +6203,14 @@ mod tests {
     #[test]
     fn auxiliary_git_readers_share_the_configured_command_without_quotepath_override() {
         let git = include_str!("git.rs").split("#[cfg(test)]").next().unwrap();
-        let commit_ai = include_str!("commit_ai.rs").split("#[cfg(test)]").next().unwrap();
-        let merge_tool = include_str!("merge_tool.rs").split("#[cfg(test)]").next().unwrap();
+        let commit_ai = include_str!("commit_ai.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let merge_tool = include_str!("merge_tool.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
         assert!(!git.contains("core.quotepath=false"));
         assert!(commit_ai.matches("crate::git::git_command()").count() >= 2);
         assert!(merge_tool.matches("crate::git::git_command()").count() >= 2);

@@ -3142,19 +3142,11 @@ fn send_merge_ai_tool_request(
             .set("x-api-key", config.api_key.trim())
             .set("anthropic-version", "2023-06-01")
             .set("Content-Type", "application/json")
-            .send_json(serde_json::json!({
-                "model": config.model_id.trim(),
-                "max_tokens": 4096,
-                "thinking": { "type": "disabled" },
-                "system": merge_ai_system_prompt(),
-                "messages": [{ "role": "user", "content": prompt }],
-                "tools": [{
-                    "name": MERGE_AI_TOOL_NAME,
-                    "description": "Submit one validated recommendation for every merge conflict and deletion decision.",
-                    "input_schema": merge_ai_suggestions_input_schema(),
-                }],
-                "tool_choice": { "type": "tool", "name": MERGE_AI_TOOL_NAME },
-            })),
+            .send_json(crate::ai_provider::claude_tool_body(
+                &config.model_id,merge_ai_system_prompt(),prompt,MERGE_AI_TOOL_NAME,
+                "Submit one validated recommendation for every merge conflict and deletion decision.",
+                merge_ai_suggestions_input_schema(),8192,
+            )),
     }
     .map_err(|error| match error {
         ureq::Error::Status(status, response) => {
@@ -3252,22 +3244,11 @@ fn request_merge_ai_suggestions(
             .set("x-api-key", config.api_key.trim())
             .set("anthropic-version", "2023-06-01")
             .set("Content-Type", "application/json")
-            .send_json(serde_json::json!({
-                "model": config.model_id.trim(),
-                "max_tokens": 4096,
-                // Merge suggestions are a compact machine-readable result. Disabling extended
-                // thinking prevents compatible providers whose thinking defaults to on from
-                // spending the whole output budget before emitting the final text block.
-                "thinking": { "type": "disabled" },
-                "system": merge_ai_system_prompt(),
-                "messages": [{ "role": "user", "content": prompt }],
-                "tools": [{
-                    "name": MERGE_AI_TOOL_NAME,
-                    "description": "Submit one validated recommendation for every merge conflict and deletion decision.",
-                    "input_schema": merge_ai_suggestions_input_schema(),
-                }],
-                "tool_choice": { "type": "tool", "name": MERGE_AI_TOOL_NAME },
-            })),
+            .send_json(crate::ai_provider::claude_tool_body(
+                &config.model_id,merge_ai_system_prompt(),&prompt,MERGE_AI_TOOL_NAME,
+                "Submit one validated recommendation for every merge conflict and deletion decision.",
+                merge_ai_suggestions_input_schema(),8192,
+            )),
     }
     .map_err(|error| match error {
         ureq::Error::Status(status, response) => {
@@ -3568,12 +3549,15 @@ fn merge_ai_openai_tool_arguments(response: &serde_json::Value) -> Option<Result
         .pointer("/choices/0/message/tool_calls")
         .and_then(serde_json::Value::as_array)
         .map(|calls| {
-            calls.iter().filter_map(|call| {
-                let function = call.get("function")?;
-                (function.get("name").and_then(serde_json::Value::as_str)
-                    == Some(MERGE_AI_TOOL_NAME))
-                .then_some(function)
-            }).collect::<Vec<_>>()
+            calls
+                .iter()
+                .filter_map(|call| {
+                    let function = call.get("function")?;
+                    (function.get("name").and_then(serde_json::Value::as_str)
+                        == Some(MERGE_AI_TOOL_NAME))
+                    .then_some(function)
+                })
+                .collect::<Vec<_>>()
         })
         .filter(|functions| !functions.is_empty())
         .or_else(|| {
@@ -3582,7 +3566,9 @@ fn merge_ai_openai_tool_arguments(response: &serde_json::Value) -> Option<Result
                 .then_some(vec![function])
         })?;
     Some(merge_ai_combine_tool_payloads(
-        functions.into_iter().map(|function| function.get("arguments")),
+        functions
+            .into_iter()
+            .map(|function| function.get("arguments")),
     ))
 }
 
@@ -3603,7 +3589,9 @@ fn merge_ai_claude_tool_input(response: &serde_json::Value) -> Option<Result<Str
     (!inputs.is_empty()).then(|| merge_ai_combine_tool_payloads(inputs))
 }
 
-fn merge_ai_tool_payload_value(value: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+fn merge_ai_tool_payload_value(
+    value: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     let value = value.ok_or_else(|| "missing function arguments".to_owned())?;
     if let Some(arguments) = value.as_str() {
         return serde_json::from_str(arguments)
@@ -3618,7 +3606,9 @@ fn merge_ai_combine_tool_payloads<'a>(
     let mut suggestions = Vec::new();
     for value in values {
         let value = merge_ai_tool_payload_value(value)?;
-        let items = value.get("suggestions").and_then(serde_json::Value::as_array)
+        let items = value
+            .get("suggestions")
+            .and_then(serde_json::Value::as_array)
             .or_else(|| value.as_array())
             .ok_or_else(|| "tool arguments did not contain a suggestions array".to_owned())?;
         suggestions.extend(items.iter().cloned());
@@ -10773,6 +10763,20 @@ mod tests {
             .unwrap_or_else(|error| {
                 panic!("unable to read stage {stage} for {relative_path}: {error}")
             });
+        if !output.status.success() {
+            let records =
+                run_context_test_git(repo, &["ls-files", "--unmerged", "--", relative_path]);
+            if !records.is_empty()
+                && !records.lines().any(|line| {
+                    line.split_whitespace()
+                        .nth(2)
+                        .and_then(|v| v.parse::<usize>().ok())
+                        == Some(stage)
+                })
+            {
+                return String::new(); // add/add and modify/delete have deliberately absent stages.
+            }
+        }
         assert!(
             output.status.success(),
             "unable to read stage {stage} for {relative_path}: {}",
@@ -10945,6 +10949,45 @@ mod tests {
                     serde_json::to_string(&middle_edits).expect("encode middle edits"),
                     suggestion.reason_zh.replace(['\r', '\n'], " "),
                     suggestion.reason_en.replace(['\r', '\n'], " "),
+                );
+            }
+            if let Some(directory) = env::var_os("GIT_AGENT_LIVE_AI_RESULT_DIR") {
+                let directory = PathBuf::from(directory);
+                fs::create_dir_all(&directory).expect("create AI evidence directory");
+                let mut app = MergeToolApp::new(args.clone(), document.clone());
+                app.sources = Some(sources.clone());
+                app.ai_suggestions = suggestions
+                    .iter()
+                    .cloned()
+                    .map(|suggestion| (suggestion.target, suggestion))
+                    .collect();
+                let before = app.snapshot();
+                app.apply_all_ai_suggestions();
+                let after = app.snapshot();
+                let changed = before != after;
+                if changed {
+                    assert!(app.undo());
+                    assert_eq!(app.snapshot(), before);
+                    assert!(app.redo());
+                    assert_eq!(app.snapshot(), after);
+                }
+                let choices = suggestions.iter().map(|suggestion|serde_json::json!({
+                    "target":format!("{:?}",suggestion.target),"choice":format!("{:?}",suggestion.choice),
+                    "manual_result":suggestion.manual_result,"reason_zh":suggestion.reason_zh,"reason_en":suggestion.reason_en,
+                    "middle_edits":suggestion.middle_edits.iter().map(|edit|serde_json::json!({"expected_text":edit.expected_text,"replacement_text":edit.replacement_text})).collect::<Vec<_>>()
+                })).collect::<Vec<_>>();
+                let evidence = serde_json::json!({"path":relative_path,"expected_targets":expected_targets,"suggestions":choices,
+                    "result_text":app.result_text,"unresolved":app.unresolved_conflict_count(),"apply_error":app.ai_analysis_error,"undo_redo_checked":changed});
+                fs::write(
+                    directory.join(format!("{file_index}.json")),
+                    serde_json::to_vec_pretty(&evidence).unwrap(),
+                )
+                .expect("write AI evidence");
+                println!(
+                    "LIVE_AI_APPLIED\tfile={}\tunresolved={}\tundo_redo={}",
+                    relative_path,
+                    app.unresolved_conflict_count(),
+                    changed
                 );
             }
             assert_eq!(
@@ -11356,12 +11399,14 @@ export function quote(total: number): number {
 
     #[test]
     fn multiple_merge_tool_calls_are_combined_before_coverage_validation() {
-        let suggestion = |index: usize, choice: &str| serde_json::json!({
-            "suggestions": [{
-                "target_type": "conflict", "target_index": index, "choice": choice,
-                "reason_zh": format!("冲突 {index}"), "reason_en": format!("conflict {index}")
-            }]
-        });
+        let suggestion = |index: usize, choice: &str| {
+            serde_json::json!({
+                "suggestions": [{
+                    "target_type": "conflict", "target_index": index, "choice": choice,
+                    "reason_zh": format!("冲突 {index}"), "reason_en": format!("conflict {index}")
+                }]
+            })
+        };
         let claude = serde_json::json!({
             "stop_reason": "tool_use",
             "content": [
@@ -11377,20 +11422,23 @@ export function quote(total: number): number {
             ]}}]
         });
 
-        let (claude_payload, _) = merge_ai_response_payload(
-            crate::app::MergeAiApiFormat::Claude, &claude,
-        ).unwrap();
-        let (openai_payload, _) = merge_ai_response_payload(
-            crate::app::MergeAiApiFormat::OpenAiCompatible, &openai,
-        ).unwrap();
+        let (claude_payload, _) =
+            merge_ai_response_payload(crate::app::MergeAiApiFormat::Claude, &claude).unwrap();
+        let (openai_payload, _) =
+            merge_ai_response_payload(crate::app::MergeAiApiFormat::OpenAiCompatible, &openai)
+                .unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&claude_payload).unwrap()["suggestions"]
-                .as_array().unwrap().len(),
+                .as_array()
+                .unwrap()
+                .len(),
             3,
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&openai_payload).unwrap()["suggestions"]
-                .as_array().unwrap().len(),
+                .as_array()
+                .unwrap()
+                .len(),
             2,
         );
     }
@@ -11699,7 +11747,7 @@ export function quote(total: number): number {
     }
 
     #[test]
-    fn merge_requests_force_advisory_tool_calls_and_disable_claude_thinking() {
+    fn merge_requests_use_validated_tools_without_disabling_claude_thinking() {
         let source = include_str!("merge_tool.rs");
         let request = source
             .split("fn request_merge_ai_suggestions")
@@ -11707,7 +11755,8 @@ export function quote(total: number): number {
             .and_then(|tail| tail.split("fn merge_ai_url_for_log").next())
             .expect("AI request implementation");
 
-        assert!(request.contains("\"thinking\": { \"type\": \"disabled\" }"));
+        assert!(!request.contains("\"thinking\""));
+        assert!(request.contains("crate::ai_provider::claude_tool_body"));
         assert!(request.contains("\"tools\""));
         assert!(request.contains("MERGE_AI_TOOL_NAME"));
         assert!(request.contains("\"tool_choice\""));

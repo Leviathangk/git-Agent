@@ -26,6 +26,24 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
+<h2>2.0.0-beta.1 — 2026-10-10</h2>
+<h3>新增</h3>
+<ul>
+<li>新增动态库插件体系和带版本的 SDK。插件可提供配置式布局、双语字典、功能 SVG 图标、仓库匹配条件、共享同步钩子及独立 store，通过权限配置控制界面和操作。</li>
+<li>在“选项”和“仓库设置”中提供插件安装、全局及单仓库开关、更新和卸载。插件更新和卸载在重启程序后完成。</li>
+<li>内置独立发布的 GitHub 插件 0.1.0，通过已登录的 GitHub CLI 提供 PR 列表、文件差异、AI 审核草稿和按权限开放的 PR 管理，以及议题、工作流运行、发布和仓库概览。</li>
+<li>列表分页器固定在可用区域底部，可选每页条数，表格内部滚动；统一插件页面样式，并用醒目的标记区分工作流结果。PR 数量和仓库 star 随远端同步刷新。</li>
+<li>提供双语插件开发与安装指南、独立模板仓库，以及自动发现项目内和外部插件项目的开发脚本。</li>
+</ul>
+<h3>修复</h3>
+<ul>
+<li>处理修改与删除冲突时，正确暂存选定的删除结果，兼容非 ASCII 路径，并保留无关工作区改动。</li>
+<li>提交生成与 AI 合并共用 Claude 兼容请求处理，不再强制发送服务不支持的 thinking 或工具选择设置。</li>
+</ul>
+<h3>发布通道</h3>
+<ul>
+<li>本版本是供手动安装测试的预发布版。带 SemVer 预发布后缀的标签自动发布为 GitHub 预发布，不进入主程序正式版更新检测。现有用户仍只收到正式版更新提示。</li>
+</ul>
 <h2>1.4.8 — 2026-09-21</h2>
 <h3>新增</h3>
 <ul>
@@ -120,6 +138,24 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
+<h2>2.0.0-beta.1 — 2026-10-10</h2>
+<h3>Added</h3>
+<ul>
+<li>Added native dynamic-library plugins with a versioned SDK. Plugins provide declarative layouts, bilingual dictionaries, functional SVG icons, repository matching rules, shared synchronization hooks and isolated stores for permission-based visibility and actions.</li>
+<li>Added plugin installation, global and per-repository switches, updates and removal through Options and Repository Settings. Plugin updates and removal finish after restarting the application.</li>
+<li>Bundled the independently released GitHub plugin 0.1.0. It uses an authenticated GitHub CLI to provide PR lists, file diffs, AI review drafts and permission-controlled PR management, plus issues, workflow runs, releases and repository summaries.</li>
+<li>Added fixed-bottom pagination with selectable page sizes and internally scrolling lists, shared plugin page styles and distinct workflow result badges. PR counts and repository stars refresh with remote synchronization.</li>
+<li>Added bilingual plugin development and installation guides, an independent template repository and development-script discovery of local and external plugin projects.</li>
+</ul>
+<h3>Fixed</h3>
+<ul>
+<li>Correctly stage deleted files when resolving modify/delete merge conflicts, including non-ASCII paths, while preserving unrelated worktree changes.</li>
+<li>Share Claude-compatible request handling across commit generation and merge assistance without forcing unsupported thinking or tool-choice settings.</li>
+</ul>
+<h3>Release channel</h3>
+<ul>
+<li>This is a prerelease for manual installation and testing. Tags with a SemVer prerelease suffix are published as GitHub prereleases and are excluded from the application&#x27;s stable update check. Existing users continue to receive stable releases only.</li>
+</ul>
 <h2>1.4.8 — 2026-09-21</h2>
 <h3>Added</h3>
 <ul>

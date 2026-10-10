@@ -1,11 +1,19 @@
 [package]
 name = "git-agent"
-version = "1.4.8"
+version = "2.0.0-beta.1"
 edition = "2024"
 license-file = "LICENSE"
 
+[workspace]
+members = ["crates/plugin-sdk"]
+default-members = ["."]
+resolver = "2"
+
 [dependencies]
 anyhow = "1.0"
+git-agent-plugin-sdk = { path = "crates/plugin-sdk" }
+libloading = "0.8"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 aes-gcm = { version = "0.10", features = ["getrandom"] }
 base64 = "0.22"
 eframe = "0.31"

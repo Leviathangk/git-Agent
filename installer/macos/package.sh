@@ -7,6 +7,7 @@ if [[ $# -ne 3 ]]; then
 fi
 
 version="${1#v}"
+bundle_version="${version%%[-+]*}"
 binary_dir="$2"
 output_dir="$3"
 app_name="Git Agent"
@@ -28,6 +29,11 @@ for executable in git-agent git-agent-merge git-agent-diff; do
   install -m 755 "$binary_dir/$executable" "$macos_dir/$executable"
 done
 
+if [[ -d "$binary_dir/bundled-plugins" ]]; then
+  mkdir -p "$macos_dir/bundled-plugins"
+  cp -R "$binary_dir/bundled-plugins/." "$macos_dir/bundled-plugins/"
+fi
+
 cat > "$contents_dir/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -40,8 +46,8 @@ cat > "$contents_dir/Info.plist" <<PLIST
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Git Agent</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>$version</string>
-  <key>CFBundleVersion</key><string>$version</string>
+  <key>CFBundleShortVersionString</key><string>$bundle_version</string>
+  <key>CFBundleVersion</key><string>$bundle_version</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSMultipleInstancesProhibited</key><true/>
   <key>NSHighResolutionCapable</key><true/>

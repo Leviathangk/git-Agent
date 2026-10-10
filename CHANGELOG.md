@@ -5,6 +5,25 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.0.0-beta.1 — 2026-10-10
+
+### Added
+
+- Added native dynamic-library plugins with a versioned SDK. Plugins provide declarative layouts, bilingual dictionaries, functional SVG icons, repository matching rules, shared synchronization hooks and isolated stores for permission-based visibility and actions.
+- Added plugin installation, global and per-repository switches, updates and removal through Options and Repository Settings. Plugin updates and removal finish after restarting the application.
+- Bundled the independently released GitHub plugin 0.1.0. It uses an authenticated GitHub CLI to provide PR lists, file diffs, AI review drafts and permission-controlled PR management, plus issues, workflow runs, releases and repository summaries.
+- Added fixed-bottom pagination with selectable page sizes and internally scrolling lists, shared plugin page styles and distinct workflow result badges. PR counts and repository stars refresh with remote synchronization.
+- Added bilingual plugin development and installation guides, an independent template repository and development-script discovery of local and external plugin projects.
+
+### Fixed
+
+- Correctly stage deleted files when resolving modify/delete merge conflicts, including non-ASCII paths, while preserving unrelated worktree changes.
+- Share Claude-compatible request handling across commit generation and merge assistance without forcing unsupported thinking or tool-choice settings.
+
+### Release channel
+
+- This is a prerelease for manual installation and testing. Tags with a SemVer prerelease suffix are published as GitHub prereleases and are excluded from the application's stable update check. Existing users continue to receive stable releases only.
+
 ## 1.4.8 — 2026-09-21
 
 ### Added

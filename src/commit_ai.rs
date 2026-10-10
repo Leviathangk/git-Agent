@@ -242,15 +242,28 @@ fn request_with_timeout(
     let response = match config.api_format {
         MergeAiApiFormat::OpenAiCompatible => {
             let endpoint = format!("{base}/chat/completions");
-            agent.post(&endpoint).set("Authorization", &format!("Bearer {}", config.api_key.trim()))
+            agent
+                .post(&endpoint)
+                .set(
+                    "Authorization",
+                    &format!("Bearer {}", config.api_key.trim()),
+                )
                 .send_json(request_payload(config, prompt))
         }
         MergeAiApiFormat::Claude => {
-            let endpoint = if base.ends_with("/v1") {format!("{base}/messages")} else {format!("{base}/v1/messages")};
-            agent.post(&endpoint).set("x-api-key", config.api_key.trim()).set("anthropic-version", "2023-06-01")
+            let endpoint = if base.ends_with("/v1") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            };
+            agent
+                .post(&endpoint)
+                .set("x-api-key", config.api_key.trim())
+                .set("anthropic-version", "2023-06-01")
                 .send_json(request_payload(config, prompt))
         }
-    }.map_err(|error| match error {
+    }
+    .map_err(|error| match error {
         ureq::Error::Status(status, response) => {
             let detail = response.into_string().unwrap_or_default();
             let detail = clipped(detail.trim(), 500);
@@ -283,13 +296,15 @@ fn request_payload(config: &MergeAiModelConfig, prompt: &str) -> Value {
             "tools":[{"type":"function","function":{"name":"commit_analysis","description":"Read context or finish the commit description","parameters":decision_schema()}}],
             "tool_choice":{"type":"function","function":{"name":"commit_analysis"}}
         }),
-        MergeAiApiFormat::Claude => json!({
-            "model": config.model_id.trim(), "max_tokens": 4096,
-            "thinking":{"type":"disabled"}, "system":SYSTEM,
-            "messages":[{"role":"user","content":prompt}],
-            "tools":[{"name":"commit_analysis","description":"Read context or finish the commit description","input_schema":decision_schema()}],
-            "tool_choice":{"type":"tool","name":"commit_analysis"}
-        }),
+        MergeAiApiFormat::Claude => crate::ai_provider::claude_tool_body(
+            &config.model_id,
+            SYSTEM,
+            prompt,
+            "commit_analysis",
+            "Read context or finish the commit description",
+            decision_schema(),
+            8192,
+        ),
     }
 }
 
@@ -300,7 +315,10 @@ pub(crate) fn test_provider(config: &MergeAiModelConfig) -> Result<(), String> {
         Duration::from_secs(15),
     )?;
     if decisions.len() != 1 || decisions[0].action != "finish" {
-        return Err("AI 验证未返回最终提交信息 / AI validation did not return a final commit message".into());
+        return Err(
+            "AI 验证未返回最终提交信息 / AI validation did not return a final commit message"
+                .into(),
+        );
     }
     validate_message(&decisions[0].message).map(|_| ())
 }
@@ -315,7 +333,8 @@ fn parse_decisions(value: &Value) -> Result<Vec<Decision>, String> {
             call.pointer("/function/name").and_then(Value::as_str) == Some("commit_analysis")
         }) {
             decisions.push(parse_decision_value(
-                call.pointer("/function/arguments").ok_or("Missing tool arguments")?,
+                call.pointer("/function/arguments")
+                    .ok_or("Missing tool arguments")?,
                 "Invalid commit tool arguments",
             )?);
         }
@@ -325,10 +344,14 @@ fn parse_decisions(value: &Value) -> Result<Vec<Decision>, String> {
     }
     if let Some(items) = value.get("content").and_then(Value::as_array) {
         let mut decisions = Vec::new();
-        for call in items.iter().filter(|call| {
-            call["type"] == "tool_use" && call["name"] == "commit_analysis"
-        }) {
-            decisions.push(parse_decision_value(&call["input"], "Invalid commit tool input")?);
+        for call in items
+            .iter()
+            .filter(|call| call["type"] == "tool_use" && call["name"] == "commit_analysis")
+        {
+            decisions.push(parse_decision_value(
+                &call["input"],
+                "Invalid commit tool input",
+            )?);
         }
         if !decisions.is_empty() {
             return validate_decision_batch(decisions);
@@ -355,13 +378,18 @@ fn validate_decision_batch(decisions: Vec<Decision>) -> Result<Vec<Decision>, St
             return Err("Unknown AI action".into());
         }
         if !unique.iter().any(|existing: &Decision| {
-            existing.action == decision.action && existing.path == decision.path
-                && existing.query == decision.query && existing.message == decision.message
+            existing.action == decision.action
+                && existing.path == decision.path
+                && existing.query == decision.query
+                && existing.message == decision.message
         }) {
             unique.push(decision);
         }
     }
-    let finish_count = unique.iter().filter(|decision| decision.action == "finish").count();
+    let finish_count = unique
+        .iter()
+        .filter(|decision| decision.action == "finish")
+        .count();
     if finish_count > 1 {
         return Err("AI returned multiple final commit messages".into());
     }
@@ -380,28 +408,63 @@ fn parse_decision_value(value: &Value, error: &str) -> Result<Decision, String> 
 }
 
 fn response_text(value: &Value) -> Option<String> {
-    if let Some(text) = value.pointer("/choices/0/message/content").and_then(Value::as_str) {
+    if let Some(text) = value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+    {
         return Some(text.to_owned());
     }
-    let items = value.pointer("/choices/0/message/content").and_then(Value::as_array)
+    let items = value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_array)
         .or_else(|| value.get("content").and_then(Value::as_array))?;
-    let text = items.iter().filter_map(|item| {
-        item.get("text").and_then(Value::as_str)
-            .or_else(|| item.get("content").and_then(Value::as_str))
-    }).collect::<Vec<_>>().join("\n");
+    let text = items
+        .iter()
+        .filter_map(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("content").and_then(Value::as_str))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     (!text.is_empty()).then_some(text)
 }
 
 fn response_structure(value: &Value) -> String {
-    let stop = value.get("stop_reason").or_else(|| value.pointer("/choices/0/finish_reason"))
-        .and_then(Value::as_str).unwrap_or("missing");
-    let types = value.get("content").and_then(Value::as_array)
-        .or_else(|| value.pointer("/choices/0/message/content").and_then(Value::as_array))
-        .map(|items| items.iter().map(|item| {
-            item.get("type").and_then(Value::as_str).unwrap_or("unknown")
-        }).collect::<Vec<_>>().join(","))
-        .unwrap_or_else(|| if response_text(value).is_some() { "text".into() } else { "none".into() });
-    let tool_calls = value.pointer("/choices/0/message/tool_calls").and_then(Value::as_array)
+    let stop = value
+        .get("stop_reason")
+        .or_else(|| value.pointer("/choices/0/finish_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    let types = value
+        .get("content")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_array)
+        })
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|| {
+            if response_text(value).is_some() {
+                "text".into()
+            } else {
+                "none".into()
+            }
+        });
+    let tool_calls = value
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
         .map_or(0, Vec::len);
     format!("stop={stop}, content={types}, tool_calls={tool_calls}")
 }
@@ -410,16 +473,25 @@ fn parse_text_decision(text: &str) -> Option<Decision> {
     let text = text.trim();
     let unfenced = if text.starts_with("```") && text.ends_with("```") {
         text.split_once('\n')?.1.strip_suffix("```")?.trim()
-    } else { text };
+    } else {
+        text
+    };
     if let Ok(decision) = serde_json::from_str::<Decision>(unfenced) {
         return Some(decision);
     }
-    let object = unfenced.find('{').zip(unfenced.rfind('}'))
+    let object = unfenced
+        .find('{')
+        .zip(unfenced.rfind('}'))
         .filter(|(start, end)| start < end)
         .and_then(|(start, end)| serde_json::from_str::<Decision>(&unfenced[start..=end]).ok());
-    if object.is_some() { return object; }
+    if object.is_some() {
+        return object;
+    }
     validate_message(unfenced).ok().map(|message| Decision {
-        action: "finish".into(), path: String::new(), query: String::new(), message,
+        action: "finish".into(),
+        path: String::new(),
+        query: String::new(),
+        message,
     })
 }
 
@@ -500,9 +572,16 @@ fn generate_with(
         if decisions.is_empty() {
             return Err("AI returned no usable analysis action".into());
         }
-        if let Some(decision) = decisions.iter().find(|decision| decision.action == "finish") {
+        if let Some(decision) = decisions
+            .iter()
+            .find(|decision| decision.action == "finish")
+        {
             let message = validate_message(&decision.message)?;
-            let suggestion = Suggestion { root: root.into(), snapshot, message };
+            let suggestion = Suggestion {
+                root: root.into(),
+                snapshot,
+                message,
+            };
             suggestion.snapshot.validate(&suggestion.root)?;
             return Ok(suggestion);
         }
@@ -562,6 +641,11 @@ fn search(
 
 #[cfg(test)]
 mod tests {
+    // Architecture checks should survive rustfmt; behavioral tests use real data and UI shapes.
+    fn source_token(value: &str) -> String {
+        value.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     use super::*;
     use std::{
         fs,
@@ -633,7 +717,8 @@ mod tests {
             generate_with(&repo.0, chinese, |prompt| {
                 assert!(prompt.starts_with(&format!("Write the message in {expected}.")));
                 Ok(vec![decision("finish", "", "")])
-            }).unwrap();
+            })
+            .unwrap();
         }
     }
 
@@ -682,7 +767,8 @@ mod tests {
         repo.commit();
         repo.file("a.txt", "staged");
         repo.stage();
-        let suggestion = generate_with(&repo.0, false, |_| Ok(vec![decision("finish", "", "")])).unwrap();
+        let suggestion =
+            generate_with(&repo.0, false, |_| Ok(vec![decision("finish", "", "")])).unwrap();
         repo.file("a.txt", "unstaged");
         suggestion.snapshot.validate(&repo.0).unwrap();
         repo.stage();
@@ -776,8 +862,7 @@ mod tests {
         let payload =
             json!({"action":"finish","path":"","query":"","message":"fix: 修复用户类型映射"});
         let openai = json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"commit_analysis","arguments":payload.to_string()}}]}}]});
-        let claude =
-            json!({"content":[{"type":"tool_use","name":"commit_analysis","input":payload.clone()}]});
+        let claude = json!({"content":[{"type":"tool_use","name":"commit_analysis","input":payload.clone()}]});
         let openai_text = json!({"choices":[{"message":{"content":payload.to_string()}}]});
         let openai_object_args = json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"commit_analysis","arguments":payload.clone()}}]}}]});
         let openai_content_parts = json!({"choices":[{"message":{"content":[{"type":"output_text","text":payload.to_string()}]}}],"finish_reason":"stop"});
@@ -785,10 +870,20 @@ mod tests {
         let claude_sparse_input = json!({"content":[{"type":"tool_use","name":"commit_analysis","input":{
             "action":"finish", "message":"fix: 修复用户类型映射"
         }}],"stop_reason":"tool_use"});
-        let claude_fenced = json!({"content":[{"type":"text","text":format!("```json\n{}\n```", payload)}]});
+        let claude_fenced =
+            json!({"content":[{"type":"text","text":format!("```json\n{}\n```", payload)}]});
         let claude_commit = json!({"content":[{"type":"text","text":"fix(user): correct type labels\n\n1. Correct partner label."}]});
-        for value in [openai, openai_object_args, openai_content_parts, claude,
-            claude_string_input, claude_sparse_input, openai_text, claude_fenced, claude_commit] {
+        for value in [
+            openai,
+            openai_object_args,
+            openai_content_parts,
+            claude,
+            claude_string_input,
+            claude_sparse_input,
+            openai_text,
+            claude_fenced,
+            claude_commit,
+        ] {
             assert_eq!(parse_decisions(&value).unwrap()[0].action, "finish");
         }
         let batch = parse_decisions(&json!({"content":[
@@ -799,7 +894,10 @@ mod tests {
         assert_eq!(batch.len(), 3);
         assert_eq!(batch[0].action, "search");
         assert_eq!(batch[1].action, "read_file");
-        let unsupported = parse_decisions(&json!({"content":[{"type":"thinking","thinking":"..."}],"stop_reason":"max_tokens"})).unwrap_err();
+        let unsupported = parse_decisions(
+            &json!({"content":[{"type":"thinking","thinking":"..."}],"stop_reason":"max_tokens"}),
+        )
+        .unwrap_err();
         assert!(unsupported.contains("stop=max_tokens"));
         assert!(unsupported.contains("content=thinking"));
         assert!(validate_message("plain text").is_err());
@@ -812,37 +910,43 @@ mod tests {
     #[test]
     fn claude_commit_request_omits_deprecated_temperature() {
         let config = MergeAiModelConfig {
-            name: "Claude".into(), api_format: MergeAiApiFormat::Claude,
-            base_url: "https://example.invalid/v1".into(), api_key: "test".into(),
+            name: "Claude".into(),
+            api_format: MergeAiApiFormat::Claude,
+            base_url: "https://example.invalid/v1".into(),
+            api_key: "test".into(),
             model_id: "claude-opus".into(),
         };
         let payload = request_payload(&config, "test");
         assert!(payload.get("temperature").is_none());
-        assert_eq!(payload["tool_choice"]["name"], "commit_analysis");
+        assert_eq!(payload["tool_choice"]["type"], "auto");
+        assert_eq!(payload["tools"][0]["name"], "commit_analysis");
+        assert!(payload.get("thinking").is_none());
     }
 
     #[test]
     fn commit_ui_owns_async_task_and_shares_repository_busy_gate() {
-        let source = include_str!("app.rs");
+        let source = source_token(include_str!("app.rs"));
         let start = source
-            .split("fn start_commit_ai(")
+            .split(source_token("fn start_commit_ai(").as_str())
             .nth(1)
             .unwrap()
-            .split("fn poll_commit_ai_task(")
+            .split(source_token("fn poll_commit_ai_task(").as_str())
             .next()
             .unwrap();
         assert!(
-            start.find("self.commit_ai_task = Some").unwrap()
-                < start.find("thread::spawn").unwrap()
+            start
+                .find(source_token("self.commit_ai_task = Some").as_str())
+                .unwrap()
+                < start.find(source_token("thread::spawn").as_str()).unwrap()
         );
-        assert!(start.contains("ctx.request_repaint()"));
-        assert!(start.contains("crate::commit_ai::generate(&root"));
-        assert!(start.contains("load_merge_ai_model_config"));
+        assert!(start.contains(source_token("ctx.request_repaint()").as_str()));
+        assert!(start.contains(source_token("crate::commit_ai::generate(&root").as_str()));
+        assert!(start.contains(source_token("load_merge_ai_model_config").as_str()));
         let poll = source
-            .split("fn poll_commit_ai_task(")
+            .split(source_token("fn poll_commit_ai_task(").as_str())
             .nth(1)
             .unwrap()
-            .split("fn commit_ai_controls(")
+            .split(source_token("fn commit_ai_controls(").as_str())
             .next()
             .unwrap();
         for token in [
@@ -859,65 +963,70 @@ mod tests {
             "suggestion.root == task.root",
             "task.cancelled.load",
         ] {
-            assert!(poll.contains(token), "{token}");
+            assert!(poll.contains(source_token(token).as_str()), "{token}");
         }
         let busy = source
-            .split("fn branch_actions_busy(")
+            .split(source_token("fn branch_actions_busy(").as_str())
             .nth(1)
             .unwrap()
-            .split("fn repo_toolbar_loading_busy(")
+            .split(source_token("fn repo_toolbar_loading_busy(").as_str())
             .next()
             .unwrap();
-        assert!(busy.contains("self.active_commit_ai_busy()"));
+        assert!(busy.contains(source_token("self.active_commit_ai_busy()").as_str()));
         let gate = source
-            .split("fn active_commit_ai_busy(")
+            .split(source_token("fn active_commit_ai_busy(").as_str())
             .nth(1)
             .unwrap()
-            .split("fn branch_actions_busy(")
+            .split(source_token("fn branch_actions_busy(").as_str())
             .next()
             .unwrap();
-        assert!(gate.contains("self.commit_ai_task"));
-        assert!(gate.contains("self.active_repo_root_matches(&task.root)"));
+        assert!(gate.contains(source_token("self.commit_ai_task").as_str()));
+        assert!(gate.contains(source_token("self.active_repo_root_matches(&task.root)").as_str()));
         let mutation = source
-            .split("fn start_remote_git_action_with_status(")
+            .split(source_token("fn start_remote_git_action_with_status(").as_str())
             .nth(1)
             .unwrap()
-            .split("fn start_create_patch_task(")
+            .split(source_token("fn start_create_patch_task(").as_str())
             .next()
             .unwrap();
-        assert!(mutation.contains("self.active_commit_ai_busy()"));
+        assert!(mutation.contains(source_token("self.active_commit_ai_busy()").as_str()));
         let commit = source
-            .split("fn commit_current_message(")
+            .split(source_token("fn commit_current_message(").as_str())
             .nth(1)
             .unwrap()
-            .split("let message")
+            .split(source_token("let message").as_str())
             .next()
             .unwrap();
-        assert!(commit.contains("self.branch_actions_busy()"));
+        assert!(commit.contains(source_token("self.branch_actions_busy()").as_str()));
         let workspace = source
-            .split("fn workspace_view(")
+            .split(source_token("fn workspace_view(").as_str())
             .nth(1)
             .unwrap()
-            .split("fn workspace_main_panel(")
+            .split(source_token("fn workspace_main_panel(").as_str())
             .next()
             .unwrap();
-        assert!(workspace.contains("has_staged && !ai_busy"));
-        assert!(workspace.contains("has_unstaged && !ai_busy"));
+        assert!(workspace.contains(source_token("has_staged && !ai_busy").as_str()));
+        assert!(workspace.contains(source_token("has_unstaged && !ai_busy").as_str()));
         let tables = source
-            .split("fn workspace_main_panel(")
+            .split(source_token("fn workspace_main_panel(").as_str())
             .nth(1)
             .unwrap()
-            .split("fn ")
+            .split(source_token("fn ").as_str())
             .next()
             .unwrap();
-        assert_eq!(tables.matches("if ai_busy { ui.disable(); }").count(), 2);
+        assert_eq!(
+            tables
+                .matches(source_token("if ai_busy { ui.disable(); }").as_str())
+                .count(),
+            2
+        );
         let handler = source
-            .split("fn handle_worktree_action(")
+            .split(source_token("fn handle_worktree_action(").as_str())
             .nth(1)
             .unwrap()
-            .split("match action")
+            .split(source_token("match action").as_str())
             .next()
             .unwrap();
-        assert!(handler.contains("self.active_commit_ai_busy()"));
+        assert!(handler.contains(source_token("self.active_commit_ai_busy()").as_str()));
     }
 }

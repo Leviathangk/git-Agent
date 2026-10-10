@@ -1,3 +1,4 @@
+mod ai_provider;
 pub mod app;
 mod commit_ai;
 pub mod diagnostics;
@@ -9,6 +10,8 @@ mod graph;
 pub mod i18n;
 pub mod merge_tool;
 mod patch;
+pub mod plugin_manager;
+pub mod plugins;
 pub mod syntax;
 pub mod theme;
 mod updater;

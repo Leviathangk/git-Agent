@@ -67,7 +67,9 @@ struct FileSearchTask {
 }
 
 impl Drop for FileSearchTask {
-    fn drop(&mut self) { self.cancelled.store(true, Ordering::Relaxed); }
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
 }
 const TITLE_BAR_HEIGHT: f32 = 32.0;
 const WINDOW_RESIZE_BORDER: f32 = 8.0;
@@ -163,7 +165,7 @@ const WORKSPACE_LIST_COMMIT_GAP: f32 = 7.0;
 const WORKSPACE_TABLE_GAP: f32 = 13.0;
 const WORKSPACE_HEADER_TOP_GAP: f32 = 1.0;
 const WORKSPACE_HEADER_BOTTOM_GAP: f32 = 3.0;
-const WORKSPACE_HEADER_TITLE_SIZE: f32 = 18.0;
+pub(crate) const WORKSPACE_HEADER_TITLE_SIZE: f32 = 18.0;
 const WORKSPACE_CARD_RADIUS: u8 = 6;
 const WORKSPACE_CARD_SHADOW_PAD: f32 = 14.0;
 const WORKSPACE_REPOSITORY_ROW_BODY_HEIGHT: f32 = 44.0;
@@ -823,6 +825,9 @@ fn log_layout_debug_once(flag: &AtomicBool, label: &str, rects: &[(&str, Rect)])
 }
 
 pub struct GitAgentApp {
+    plugins: crate::plugins::PluginRuntime,
+    plugin_repository_events: HashMap<PathBuf, &'static str>,
+    plugin_active_repo_key: Option<String>,
     repo_tabs: Vec<RepoTab>,
     repo_tab_aliases: HashMap<String, String>,
     active_repo_tab: Option<usize>,
@@ -1716,6 +1721,7 @@ enum MainView {
     Branches,
     Tags,
     Stashes,
+    Plugins,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1758,6 +1764,8 @@ enum SettingsTab {
     Verification,
     HostingAccounts,
     CommitAuthors,
+    Plugins,
+    RepoPlugins,
     RepoRemotes,
     RepoIgnoreRules,
     RepoAdvanced,
@@ -3434,7 +3442,9 @@ fn test_ai_provider_settings(
             AiProviderKind::OpenAiCompatible => MergeAiApiFormat::OpenAiCompatible,
             AiProviderKind::Claude => MergeAiApiFormat::Claude,
         },
-        base_url: settings.base_url, api_key: settings.api_key, model_id: settings.model_id,
+        base_url: settings.base_url,
+        api_key: settings.api_key,
+        model_id: settings.model_id,
     })
 }
 
@@ -3853,7 +3863,7 @@ impl From<Language> for SettingsLanguage {
     }
 }
 
-fn app_data_dir() -> Option<PathBuf> {
+pub(crate) fn app_data_dir() -> Option<PathBuf> {
     // Live AI regression tests run from target/debug/deps, not beside the app's data directory.
     // Keep this override test-only so production configuration lookup cannot be redirected by an
     // ambient environment variable.
@@ -4534,6 +4544,9 @@ impl GitAgentApp {
         }
 
         let mut app = Self {
+            plugins: crate::plugins::PluginRuntime::new(),
+            plugin_repository_events: HashMap::new(),
+            plugin_active_repo_key: None,
             repo_tabs,
             repo_tab_aliases: tabs_state.tab_aliases.clone(),
             active_repo_tab,
@@ -5144,6 +5157,13 @@ impl GitAgentApp {
         self.background_remote_git_root = Some(root.clone());
         self.next_background_remote_refresh_at = now + interval;
         self.pending_toolbar_single_click = None;
+        let plugin_context = self.plugin_context_for(snapshot);
+        self.plugins.begin_remote_sync(
+            plugin_context,
+            "fetch",
+            "background",
+            self.selected_ai_model.clone(),
+        );
 
         let scheduler = self.repository_refresh_scheduler.clone();
         let scheduler_key = repo_state_key(&root);
@@ -6018,7 +6038,9 @@ impl GitAgentApp {
     }
 
     fn stage_toggle_current_repository(&mut self) {
-        if self.active_commit_ai_busy() { return; }
+        if self.active_commit_ai_busy() {
+            return;
+        }
         self.pending_toolbar_single_click = None;
         self.active_view = MainView::Workspace;
         self.focus_commit_message = true;
@@ -6603,8 +6625,10 @@ impl GitAgentApp {
     fn maybe_start_automatic_update_check(&mut self, ctx: &egui::Context) {
         // Once per launch (or when enabled), never on the pointer-down drag path.
         if !take_automatic_update_check(
-            self.auto_check_updates, &mut self.auto_update_check_pending,
-            self.update_task.is_some(), ctx.input(|input| input.pointer.primary_down()),
+            self.auto_check_updates,
+            &mut self.auto_update_check_pending,
+            self.update_task.is_some(),
+            ctx.input(|input| input.pointer.primary_down()),
         ) {
             return;
         }
@@ -6936,6 +6960,11 @@ impl GitAgentApp {
             && self.task_root_matches_active_repo(self.remote_git_root.as_deref())
     }
 
+    fn active_remote_sync_busy(&self) -> bool {
+        self.active_repo_root()
+            .is_some_and(|root| self.plugins.remote_sync_busy(&root))
+    }
+
     fn active_background_remote_git_busy(&self) -> bool {
         self.background_remote_git_task.is_some()
             && self.task_root_matches_active_repo(self.background_remote_git_root.as_deref())
@@ -7063,7 +7092,9 @@ impl GitAgentApp {
     }
 
     fn active_commit_ai_busy(&self) -> bool {
-        self.commit_ai_task.as_ref().is_some_and(|task| self.active_repo_root_matches(&task.root))
+        self.commit_ai_task
+            .as_ref()
+            .is_some_and(|task| self.active_repo_root_matches(&task.root))
     }
 
     fn branch_actions_busy(&self) -> bool {
@@ -7073,6 +7104,7 @@ impl GitAgentApp {
             || self.active_branch_checkout_busy()
             || self.active_remote_git_busy()
             || self.active_background_remote_git_busy()
+            || self.active_remote_sync_busy()
             || self.active_credential_login_busy()
             || self.active_repository_undo_busy()
             || self.active_create_patch_busy()
@@ -7142,6 +7174,9 @@ impl GitAgentApp {
         }
         if self.active_background_remote_git_busy() {
             return Some(self.tr("status.fetching"));
+        }
+        if self.active_remote_sync_busy() {
+            return Some(self.tr("status.syncing_remote_plugins"));
         }
         if self.active_create_patch_busy() {
             return Some(self.tr("status.creating_patch"));
@@ -8016,7 +8051,11 @@ impl GitAgentApp {
         status_key: &'static str,
         action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
     ) {
-        if self.remote_git_busy() || self.loading_repo || self.active_commit_ai_busy() {
+        if self.remote_git_busy()
+            || self.loading_repo
+            || self.active_commit_ai_busy()
+            || self.active_remote_sync_busy()
+        {
             return;
         }
         // Git actions reload the repository when complete. Persist the visible
@@ -8035,6 +8074,24 @@ impl GitAgentApp {
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
+        if let Some(operation) = match status_key {
+            "status.fetching" => Some("fetch"),
+            "status.pulling" => Some("pull"),
+            "status.pushing" => Some("push"),
+            _ => None,
+        } {
+            let plugin_context = self.plugin_context_for(
+                self.snapshot
+                    .as_ref()
+                    .expect("remote action has a snapshot"),
+            );
+            self.plugins.begin_remote_sync(
+                plugin_context,
+                operation,
+                "manual",
+                self.selected_ai_model.clone(),
+            );
+        }
         let scheduler = self.repository_refresh_scheduler.clone();
         let scheduler_key = repo_state_key(&root);
         let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
@@ -8557,6 +8614,7 @@ impl GitAgentApp {
     }
 
     fn poll_tasks(&mut self, ctx: &egui::Context) {
+        self.plugins.poll(ctx);
         self.poll_commit_ai_task(ctx);
         let mut repository_load_activity = false;
         if let Some(receiver) = self.workspace_repository_status_task.take() {
@@ -8634,6 +8692,12 @@ impl GitAgentApp {
                         let unchanged_background_snapshot = active_repo
                             && !was_foreground
                             && self.active_snapshot_matches_background_core_refresh(&snapshot);
+                        let plugin_refresh_context = self
+                            .plugin_repository_events
+                            .get(&requested_root)
+                            .copied()
+                            .filter(|_| !stale_checkout_snapshot && queued_reload.is_none())
+                            .map(|event| (event, self.plugin_context_for(&snapshot)));
                         if !stale_checkout_snapshot {
                             self.cache_repository_snapshot(&snapshot);
                         } else {
@@ -8676,11 +8740,24 @@ impl GitAgentApp {
                                 self.branch_checkout_root = None;
                             }
                         }
+                        if let Some((event, context)) = plugin_refresh_context {
+                            self.plugin_repository_events.remove(&requested_root);
+                            self.plugins.notify(
+                                event,
+                                context,
+                                self.selected_ai_model.clone(),
+                                ctx,
+                                true,
+                            );
+                        }
                         // History and graph layout are demand-loaded. A workspace switch only
                         // needs core state; eagerly scanning history makes every open tab compete
                         // for CPU even when its History view is never opened.
                     }
                     Err(error) => {
+                        if !retry_queued {
+                            self.plugin_repository_events.remove(&requested_root);
+                        }
                         diagnostics::trace(
                             "snapshot.error",
                             &format!("root={} error={error:#}", requested_root.display()),
@@ -8720,6 +8797,8 @@ impl GitAgentApp {
             }
 
             for key in disconnected_repo_keys {
+                self.plugin_repository_events
+                    .retain(|root, _| repo_state_key(root) != key);
                 if let Some(path) = self.queued_repo_reloads.remove(&key) {
                     self.spawn_repository_snapshot_load(
                         path,
@@ -9176,6 +9255,10 @@ impl GitAgentApp {
             match receiver.try_recv() {
                 Ok((root, Ok(snapshot))) => {
                     self.background_remote_git_root = None;
+                    let plugin_context = snapshot
+                        .as_ref()
+                        .or_else(|| self.snapshot_cache.get(&repo_state_key(&root)))
+                        .map(|snapshot| self.plugin_context_for(snapshot));
                     if let Some(snapshot) = snapshot {
                         let active_repo = self.active_repo_root_matches(&root);
                         let unchanged = active_repo
@@ -9184,6 +9267,15 @@ impl GitAgentApp {
                         if active_repo && !unchanged {
                             self.apply_repository_snapshot(snapshot);
                         }
+                    }
+                    if let Some(context) = plugin_context {
+                        self.plugins.notify(
+                            "repository.fetch.completed",
+                            context,
+                            self.selected_ai_model.clone(),
+                            ctx,
+                            false,
+                        );
                     }
                     ctx.request_repaint();
                 }
@@ -9213,6 +9305,14 @@ impl GitAgentApp {
         if let Some(receiver) = self.remote_git_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(()))) => {
+                    if let Some(event) = match self.remote_git_status_key {
+                        Some("status.fetching") => Some("repository.fetch.completed"),
+                        Some("status.pulling") => Some("repository.pull.completed"),
+                        Some("status.pushing") => Some("repository.push.completed"),
+                        _ => None,
+                    } {
+                        self.plugin_repository_events.insert(root.clone(), event);
+                    }
                     self.remote_git_status_key = None;
                     self.remote_git_root = None;
                     if self
@@ -9464,11 +9564,15 @@ impl GitAgentApp {
                 match task.receiver.try_recv() {
                     Ok((query, finished, result)) => {
                         if self.search_dimension == SearchDimension::Files
-                            && self.search_view_query.trim().to_lowercase() == query {
+                            && self.search_view_query.trim().to_lowercase() == query
+                        {
                             if task.cancelled.load(Ordering::Relaxed) {
                                 if finished {
-                                    if task.timed_out { self.error = Some(self.tr("search.timeout").into()); }
-                                    else { self.show_toast(self.tr("search.cancelled")); }
+                                    if task.timed_out {
+                                        self.error = Some(self.tr("search.timeout").into());
+                                    } else {
+                                        self.show_toast(self.tr("search.cancelled"));
+                                    }
                                 }
                             } else {
                                 match result {
@@ -9477,7 +9581,10 @@ impl GitAgentApp {
                                         self.file_search_hashes = hashes.into_iter().collect();
                                         self.file_search_complete = finished;
                                         if self.search_selected_commit.is_none() {
-                                            self.search_selected_commit = self.search_filtered_commit_indices().first().copied();
+                                            self.search_selected_commit = self
+                                                .search_filtered_commit_indices()
+                                                .first()
+                                                .copied();
                                             self.search_selected_file_path = None;
                                             self.search_selected_diff_rows.clear();
                                             if !self.select_first_search_changed_file_if_cached() {
@@ -9486,17 +9593,26 @@ impl GitAgentApp {
                                         }
                                     }
                                     Err(error) => {
-                                        self.error = Some(format!("{}\n\n{error}", self.tr("search.failed")));
+                                        self.error = Some(format!(
+                                            "{}\n\n{error}",
+                                            self.tr("search.failed")
+                                        ));
                                     }
                                 }
                             }
                         }
-                        if finished { self.file_search_started_at = None; }
-                        else { self.file_search_task = Some(task); }
+                        if finished {
+                            self.file_search_started_at = None;
+                        } else {
+                            self.file_search_task = Some(task);
+                        }
                         ctx.request_repaint();
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        if self.file_search_started_at.is_some_and(|started| started.elapsed() > FILE_SEARCH_TIMEOUT) {
+                        if self
+                            .file_search_started_at
+                            .is_some_and(|started| started.elapsed() > FILE_SEARCH_TIMEOUT)
+                        {
                             task.timed_out = true;
                             task.cancelled.store(true, Ordering::Relaxed);
                         }
@@ -9921,7 +10037,9 @@ impl GitAgentApp {
     }
 
     fn start_file_change_search(&mut self) {
-        if self.file_search_task.is_some() { return; }
+        if self.file_search_task.is_some() {
+            return;
+        }
         let raw_query = self.search_view_query.trim().to_owned();
         let query = raw_query.to_lowercase();
         if query.is_empty() {
@@ -9940,7 +10058,12 @@ impl GitAgentApp {
         let (sender, receiver) = mpsc::channel();
         let cancelled = std::sync::Arc::new(AtomicBool::new(false));
         let exact_path = self.file_search_exact_path;
-        self.file_search_task = Some(FileSearchTask { root: root.clone(), cancelled: cancelled.clone(), timed_out: false, receiver });
+        self.file_search_task = Some(FileSearchTask {
+            root: root.clone(),
+            cancelled: cancelled.clone(),
+            timed_out: false,
+            receiver,
+        });
         self.file_search_started_at = Some(Instant::now());
         self.file_search_complete = false;
         self.file_search_query = query.clone();
@@ -10934,6 +11057,7 @@ impl App for GitAgentApp {
         }
         self.sync_repository_refresh_scheduler(ctx);
         self.maybe_start_background_remote_refresh(ctx);
+        self.maybe_sync_plugins(ctx);
         self.maybe_start_clone_url_validation(ctx);
         self.handle_global_shortcuts(ctx);
         self.flush_pending_toolbar_single_click(ctx);
@@ -11732,6 +11856,7 @@ impl GitAgentApp {
                 MainView::Branches => self.branches_view(ui),
                 MainView::Tags => self.tags_view(ui),
                 MainView::Stashes => self.stashes_view(ui),
+                MainView::Plugins => self.plugins_view(ui),
             },
         );
         if details_visible {
@@ -12009,11 +12134,13 @@ impl GitAgentApp {
                     if minimize.clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     }
-                    let available_release = self.update_release.as_ref().filter(|release| release.is_newer);
+                    let available_release = self
+                        .update_release
+                        .as_ref()
+                        .filter(|release| release.is_newer);
                     if available_release.is_some() {
-                        let update = update_available_button(
-                            ui, self.language, self.update_task.is_none(),
-                        );
+                        let update =
+                            update_available_button(ui, self.language, self.update_task.is_none());
                         include_rect(&mut window_control_rects, update.rect);
                         if update.clicked() {
                             self.about_open = false;
@@ -12103,6 +12230,7 @@ impl GitAgentApp {
                 menu_label(self.language, "view"),
                 requested_top_menu == Some(TopMenu::View),
                 |ui| {
+                    self.plugin_menu(ui, "view");
                     if menu_shortcut_button(ui, has_repo, self.tr("action.refresh"), "F5").clicked()
                     {
                         self.refresh();
@@ -12193,6 +12321,7 @@ impl GitAgentApp {
                 menu_label(self.language, "repo"),
                 requested_top_menu == Some(TopMenu::Repository),
                 |ui| {
+                    self.plugin_menu(ui, "repository");
                     if menu_shortcut_button(
                         ui,
                         has_repo,
@@ -12551,6 +12680,7 @@ impl GitAgentApp {
                 menu_label(self.language, "actions"),
                 requested_top_menu == Some(TopMenu::Actions),
                 |ui| {
+                    self.plugin_menu(ui, "actions");
                     let selected_worktree_action_state = self.selected_worktree_action_state();
                     let selected_worktree_action_paths = self.selected_worktree_action_paths();
                     let selected_worktree_discard_targets =
@@ -12832,6 +12962,7 @@ impl GitAgentApp {
                 menu_label(self.language, "tools"),
                 requested_top_menu == Some(TopMenu::Tools),
                 |ui| {
+                    self.plugin_menu(ui, "tools");
                     let ssh_tool_enabled = self.ssh_tool_task.is_none();
                     if menu_text_button(
                         ui,
@@ -13010,6 +13141,28 @@ impl GitAgentApp {
             .iter()
             .map(|tab| tab.name.clone())
             .collect::<Vec<_>>();
+        let tab_language = if self.language == Language::Chinese {
+            "zh"
+        } else {
+            "en"
+        };
+        let repo_tab_badges = self
+            .repo_tabs
+            .iter()
+            .map(|tab| {
+                let snapshot = self.workspace_repository_snapshot_for(&tab.root)?;
+                let remotes = snapshot
+                    .remotes
+                    .iter()
+                    .map(|remote| git_agent_plugin_sdk::Remote {
+                        name: remote.name.clone(),
+                        url: remote.fetch_url.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                self.plugins
+                    .repository_tab_badge(&tab.root, &remotes, tab_language)
+            })
+            .collect::<Vec<_>>();
         let active_repo_tab = self.active_repo_tab;
         let source_tab_open = self.source_tab_open;
         let new_tab_label = self.tr("repo.source.new_tab").to_owned();
@@ -13024,7 +13177,10 @@ impl GitAgentApp {
                 ui.add_space(REPO_TAB_STRIP_LEFT_PADDING);
                 let repo_tab_widths = repo_tab_names
                     .iter()
-                    .map(|name| repo_tab_width(ui, name))
+                    .enumerate()
+                    .map(|(index, name)| {
+                        repo_tab_width_with_badge(ui, name, repo_tab_badges[index].as_ref())
+                    })
                     .collect::<Vec<_>>();
                 let source_width = source_tab_open.then(|| repo_tab_width(ui, &new_tab_label));
                 let visibility = repo_tab_visibility(
@@ -13056,7 +13212,7 @@ impl GitAgentApp {
                                 .as_mut()
                                 .filter(|rename| rename.index == index);
                             let tab_id = ui.id().with(("repo_tab", index));
-                            let interaction = repo_tab_with_close(
+                            let interaction = repo_tab_with_badge(
                                 ui,
                                 UiIcon::Folder,
                                 active_repo_tab == Some(index),
@@ -13064,6 +13220,7 @@ impl GitAgentApp {
                                 &close_tab_label,
                                 tab_id,
                                 rename,
+                                repo_tab_badges[index].as_ref(),
                             );
                             if interaction.close_clicked {
                                 close_repo_tab = Some(index);
@@ -13310,6 +13467,18 @@ impl GitAgentApp {
                                     .clicked()
                                 {
                                     self.active_view = MainView::Stashes;
+                                }
+                                if let Some(snapshot) = self.snapshot.as_ref().filter(|snapshot| {
+                                    self.active_repo_root_matches(&snapshot.root)
+                                }) {
+                                    let context = self.plugin_context_for(snapshot);
+                                    if self.plugins.toolbar(
+                                        ui,
+                                        &context,
+                                        self.active_view == MainView::Plugins,
+                                    ) {
+                                        self.active_view = MainView::Plugins;
+                                    }
                                 }
                                 if let Some(notice) = &self.last_notice {
                                     ui.label(RichText::new(notice).color(theme::accent()));
@@ -13797,6 +13966,131 @@ impl GitAgentApp {
             .show(ui, |ui| self.sidebar_content(ui));
     }
 
+    fn plugin_context_for(
+        &self,
+        snapshot: &RepositorySnapshot,
+    ) -> git_agent_plugin_sdk::RepositoryContext {
+        git_agent_plugin_sdk::RepositoryContext {
+            root: snapshot.root.to_string_lossy().into_owned(),
+            branch: snapshot.branch.clone(),
+            head: snapshot
+                .commits
+                .iter()
+                .find(|commit| commit.refs.iter().any(|reference| reference == "HEAD"))
+                .map(|commit| commit.hash.clone())
+                .unwrap_or_default(),
+            language: if self.language == Language::Chinese {
+                "zh"
+            } else {
+                "en"
+            }
+            .into(),
+            remotes: snapshot
+                .remotes
+                .iter()
+                .map(|remote| git_agent_plugin_sdk::Remote {
+                    name: remote.name.clone(),
+                    url: remote.fetch_url.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn plugin_menu(&mut self, ui: &mut Ui, location: &str) {
+        let Some(snapshot) = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| self.active_repo_root_matches(&snapshot.root))
+        else {
+            return;
+        };
+        let context = self.plugin_context_for(snapshot);
+        if self.plugins.menu(ui, location, &context) {
+            self.active_view = MainView::Plugins;
+        }
+    }
+
+    fn maybe_sync_plugins(&mut self, ctx: &egui::Context) {
+        if !self.plugins.is_ready() {
+            return;
+        }
+        let known_contexts = self
+            .repo_tabs
+            .iter()
+            .filter_map(|tab| self.workspace_repository_snapshot_for(&tab.root))
+            .map(|snapshot| self.plugin_context_for(snapshot))
+            .collect::<Vec<_>>();
+        for context in known_contexts {
+            self.plugins.reconcile_repository(&context);
+        }
+        let active = self.active_repo_root().map(|root| repo_state_key(&root));
+        if active != self.plugin_active_repo_key {
+            if let Some(snapshot) = self
+                .snapshot
+                .as_ref()
+                .filter(|snapshot| Some(repo_state_key(&snapshot.root)) == active)
+            {
+                let context = self.plugin_context_for(snapshot);
+                self.plugins.notify(
+                    "repository.activated",
+                    context,
+                    self.selected_ai_model.clone(),
+                    ctx,
+                    false,
+                );
+                self.plugin_active_repo_key = active.clone();
+            } else if active.is_none() {
+                self.plugin_active_repo_key = None;
+            }
+        }
+        if !self.background_remote_refresh_enabled {
+            return;
+        }
+        let initial_contexts = self
+            .repo_tabs
+            .iter()
+            .filter_map(|tab| self.workspace_repository_snapshot_for(&tab.root))
+            .filter(|snapshot| snapshot.config.background_remote_refresh)
+            .map(|snapshot| self.plugin_context_for(snapshot))
+            .filter(|context| {
+                self.plugins.needs_initial_repository_sync(
+                    std::path::Path::new(&context.root),
+                    &context.remotes,
+                )
+            })
+            .collect::<Vec<_>>();
+        for context in initial_contexts {
+            self.plugins.notify(
+                "repository.sync",
+                context,
+                self.selected_ai_model.clone(),
+                ctx,
+                false,
+            );
+        }
+    }
+
+    fn plugins_view(&mut self, ui: &mut Ui) {
+        let Some(snapshot) = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| self.active_repo_root_matches(&snapshot.root))
+        else {
+            self.active_view = MainView::Workspace;
+            self.workspace_view(ui);
+            return;
+        };
+        let context = self.plugin_context_for(snapshot);
+        if !self.plugins.selected_matches(&context) {
+            self.active_view = MainView::Workspace;
+            self.workspace_view(ui);
+            return;
+        }
+        let repository_busy = self.branch_actions_busy();
+        self.plugins
+            .page(ui, context, self.selected_ai_model.clone(), repository_busy);
+    }
+
     fn sidebar_content(&mut self, ui: &mut Ui) {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -14149,7 +14443,9 @@ impl GitAgentApp {
                 self.layout_prefs.save();
             }
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right_rect), |ui| {
-                if ai_busy { ui.disable(); }
+                if ai_busy {
+                    ui.disable();
+                }
                 ui.set_clip_rect(right_rect);
                 safe_set_min_size(ui, right_rect.size());
                 self.worktree_diff_viewer(ui);
@@ -14224,7 +14520,9 @@ impl GitAgentApp {
                 .unwrap_or_default();
             let collapsed_dirs = &mut self.worktree_collapsed_dirs;
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(layout.staged_rect), |ui| {
-                if ai_busy { ui.disable(); }
+                if ai_busy {
+                    ui.disable();
+                }
                 worktree_table(
                     ui,
                     &staged_title,
@@ -14261,7 +14559,9 @@ impl GitAgentApp {
             ui.allocate_new_ui(
                 egui::UiBuilder::new().max_rect(layout.unstaged_rect),
                 |ui| {
-                    if ai_busy { ui.disable(); }
+                    if ai_busy {
+                        ui.disable();
+                    }
                     worktree_table(
                         ui,
                         &unstaged_title,
@@ -14508,18 +14808,30 @@ impl GitAgentApp {
                             !task.cancelled.load(Ordering::Relaxed),
                             TextActionTone::Secondary,
                             Vec2::new(100.0, 26.0),
-                        ).clicked() {
+                        )
+                        .clicked()
+                        {
                             task.cancelled.store(true, Ordering::Relaxed);
                         }
                     });
                     ui.ctx().request_repaint_after(Duration::from_millis(80));
-                } else if is_file_search && !self.file_search_complete && !self.file_search_query.is_empty() {
+                } else if is_file_search
+                    && !self.file_search_complete
+                    && !self.file_search_query.is_empty()
+                {
                     ui.label(self.tr("search.partial"));
                 }
                 if rows.is_empty() {
-                    let label = if file_search_busy { "search.running" }
-                        else if is_file_search && !self.file_search_complete && !self.file_search_query.is_empty() { "search.incomplete_empty" }
-                        else { "commit.no_matches" };
+                    let label = if file_search_busy {
+                        "search.running"
+                    } else if is_file_search
+                        && !self.file_search_complete
+                        && !self.file_search_query.is_empty()
+                    {
+                        "search.incomplete_empty"
+                    } else {
+                        "commit.no_matches"
+                    };
                     empty_list_panel(ui, self.tr(label));
                     return;
                 }
@@ -15043,10 +15355,15 @@ impl GitAgentApp {
                             let selected =
                                 self.selected_file_path.as_deref() == Some(file.diff_path.as_str());
                             if history_file_table_row(
-                                ui, &file.status, &file.path, &file.diff_path, selected, self.language,
+                                ui,
+                                &file.status,
+                                &file.path,
+                                &file.diff_path,
+                                selected,
+                                self.language,
                                 &mut history_request,
                             )
-                                .clicked()
+                            .clicked()
                             {
                                 clicked_file = Some(file.diff_path.clone());
                             }
@@ -15087,10 +15404,15 @@ impl GitAgentApp {
                             let selected = self.search_selected_file_path.as_deref()
                                 == Some(file.diff_path.as_str());
                             if history_file_table_row(
-                                ui, &file.status, &file.path, &file.diff_path, selected, self.language,
+                                ui,
+                                &file.status,
+                                &file.path,
+                                &file.diff_path,
+                                selected,
+                                self.language,
                                 &mut history_request,
                             )
-                                .clicked()
+                            .clicked()
                             {
                                 clicked_file = Some(file.diff_path.clone());
                             }
@@ -15485,7 +15807,9 @@ impl GitAgentApp {
     }
 
     fn handle_worktree_action(&mut self, action: WorktreeMenuAction) {
-        if self.active_commit_ai_busy() { return; }
+        if self.active_commit_ai_busy() {
+            return;
+        }
         match action {
             WorktreeMenuAction::OpenFile { path } => {
                 let Some(root) = self.active_repo_root() else {
@@ -15924,9 +16248,15 @@ impl GitAgentApp {
                                 let selected = self.selected_file_path.as_deref()
                                     == Some(file.diff_path.as_str());
                                 if file_change_row(
-                                    ui, &file.status, &file.path, &file.diff_path, selected, self.language,
+                                    ui,
+                                    &file.status,
+                                    &file.path,
+                                    &file.diff_path,
+                                    selected,
+                                    self.language,
                                     &mut history_request,
-                                ).clicked()
+                                )
+                                .clicked()
                                 {
                                     clicked_file = Some(file.diff_path.clone());
                                 }
@@ -15961,13 +16291,17 @@ impl GitAgentApp {
         if self.branch_actions_busy() || self.commit_ai_task.is_some() || self.commit_state.amend {
             return;
         }
-        let Some(root) = self.active_repo_root() else { return; };
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
         let model_name = self.selected_ai_model.clone();
         let chinese = self.ai_commit_language == Language::Chinese;
         let (sender, receiver) = mpsc::channel();
         let cancelled = std::sync::Arc::new(AtomicBool::new(false));
         self.commit_ai_task = Some(CommitAiTask {
-            root: root.clone(), original_draft: self.commit_message.clone(), receiver,
+            root: root.clone(),
+            original_draft: self.commit_message.clone(),
+            receiver,
             cancelled: cancelled.clone(),
         });
         ctx.request_repaint();
@@ -15981,14 +16315,20 @@ impl GitAgentApp {
     }
 
     fn poll_commit_ai_task(&mut self, ctx: &egui::Context) {
-        let Some(task) = self.commit_ai_task.take() else { return; };
+        let Some(task) = self.commit_ai_task.take() else {
+            return;
+        };
         match task.receiver.try_recv() {
-            Ok(_) if task.cancelled.load(Ordering::Relaxed) => {},
+            Ok(_) if task.cancelled.load(Ordering::Relaxed) => {}
             Ok(Ok(suggestion)) => {
                 if self.active_repo_root_matches(&task.root) && suggestion.root == task.root {
-                    if !self.commit_state.amend && replace_unchanged_commit_draft(
-                        &mut self.commit_message, &task.original_draft, suggestion.message,
-                    ) {
+                    if !self.commit_state.amend
+                        && replace_unchanged_commit_draft(
+                            &mut self.commit_message,
+                            &task.original_draft,
+                            suggestion.message,
+                        )
+                    {
                         self.save_commit_message_draft_for_active_repo();
                         self.focus_commit_message = true;
                     } else {
@@ -15997,7 +16337,9 @@ impl GitAgentApp {
                 }
             }
             Ok(Err(error)) => self.error = Some(error),
-            Err(mpsc::TryRecvError::Disconnected) => self.error = Some(self.tr("commit.ai_disconnected").into()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.error = Some(self.tr("commit.ai_disconnected").into())
+            }
             Err(mpsc::TryRecvError::Empty) => {
                 self.commit_ai_task = Some(task);
                 ctx.request_repaint_after(Duration::from_millis(100));
@@ -16006,7 +16348,11 @@ impl GitAgentApp {
     }
 
     fn commit_ai_controls(&mut self, ui: &mut Ui, staged_count: usize) {
-        if self.commit_ai_task.as_ref().is_some_and(|task| self.active_repo_root_matches(&task.root)) {
+        if self
+            .commit_ai_task
+            .as_ref()
+            .is_some_and(|task| self.active_repo_root_matches(&task.root))
+        {
             ui.spinner();
             let cancelled = self.commit_ai_task.as_ref().unwrap().cancelled.clone();
             if cancelled.load(Ordering::Relaxed) {
@@ -16019,8 +16365,10 @@ impl GitAgentApp {
             }
             return;
         }
-        let enabled = staged_count > 0 && !self.branch_actions_busy()
-            && self.commit_ai_task.is_none() && !self.commit_state.amend;
+        let enabled = staged_count > 0
+            && !self.branch_actions_busy()
+            && self.commit_ai_task.is_none()
+            && !self.commit_state.amend;
         let hint = commit_ai_hover_text(self.language, self.selected_ai_model.as_deref());
         let disabled_hint = format!("{hint}\n\n{}", self.tr("commit.ai_hint"));
         let response = commit_ai_generate_button(ui, self.tr("commit.ai_generate"), enabled)
@@ -16113,10 +16461,11 @@ impl GitAgentApp {
                     && !self.commit_message.trim().is_empty()
                     && !self.branch_actions_busy()
                     && self.pending_commit_identity_warning.is_none();
-                let commit_clicked = ui.allocate_new_ui(
-                    egui::UiBuilder::new().max_rect(action_row_rect),
-                    |ui| self.commit_action_row(ui, can_commit),
-                ).inner;
+                let commit_clicked = ui
+                    .allocate_new_ui(egui::UiBuilder::new().max_rect(action_row_rect), |ui| {
+                        self.commit_action_row(ui, can_commit)
+                    })
+                    .inner;
                 if commit_clicked {
                     self.commit_current_message(staged_count);
                 }
@@ -16161,7 +16510,10 @@ impl GitAgentApp {
                         .small(),
                 );
                 file_history_context_menu(
-                    &response, &file.path, self.language, &mut history_request,
+                    &response,
+                    &file.path,
+                    self.language,
+                    &mut history_request,
                 );
             }
         } else {
@@ -18048,11 +18400,12 @@ impl GitAgentApp {
                                 for file in &worktree_files {
                                     let mut selected =
                                         dialog.selected_worktree_paths.contains(file.path.as_str());
-                                    let response = action_checkbox(
-                                        ui, &mut selected, &file.display_path,
-                                    );
+                                    let response =
+                                        action_checkbox(ui, &mut selected, &file.display_path);
                                     file_history_context_menu(
-                                        &response, &file.path, self.language,
+                                        &response,
+                                        &file.path,
+                                        self.language,
                                         &mut file_history_request,
                                     );
                                     if response.changed() {
@@ -18318,10 +18671,15 @@ impl GitAgentApp {
                                 let selected = dialog.selected_file_path.as_deref()
                                     == Some(file.diff_path.as_str());
                                 if history_file_table_row(
-                                    ui, &file.status, &file.path, &file.diff_path, selected, self.language,
+                                    ui,
+                                    &file.status,
+                                    &file.path,
+                                    &file.diff_path,
+                                    selected,
+                                    self.language,
                                     &mut history_request,
                                 )
-                                    .clicked()
+                                .clicked()
                                 {
                                     clicked_file = Some(file.diff_path.clone());
                                 }
@@ -21452,6 +21810,7 @@ impl GitAgentApp {
                                 ui.set_min_width(content_width);
                                 ui.vertical(|ui| match self.repo_settings_tab {
                                     SettingsTab::RepoRemotes => self.repo_remotes_settings_page(ui),
+                                    SettingsTab::RepoPlugins => self.repo_plugin_settings_page(ui),
                                     SettingsTab::RepoIgnoreRules => {
                                         self.repo_ignore_rules_settings_page(ui)
                                     }
@@ -21529,8 +21888,30 @@ impl GitAgentApp {
                 ),
                 SettingsTab::HostingAccounts => self.global_hosting_accounts_settings(ui),
                 SettingsTab::CommitAuthors => self.global_commit_authors_settings(ui),
+                SettingsTab::Plugins => self.global_plugin_settings(ui),
                 _ => self.global_general_settings(ui),
             });
+    }
+
+    fn global_plugin_settings(&mut self, ui: &mut Ui) {
+        let language = if self.language == Language::Chinese {
+            "zh"
+        } else {
+            "en"
+        };
+        self.plugins.settings_ui(ui, language, None);
+    }
+    fn repo_plugin_settings_page(&mut self, ui: &mut Ui) {
+        let context = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| self.plugin_context_for(snapshot));
+        let language = if self.language == Language::Chinese {
+            "zh"
+        } else {
+            "en"
+        };
+        self.plugins.settings_ui(ui, language, context.as_ref());
     }
 
     fn global_general_settings(&mut self, ui: &mut Ui) {
@@ -21613,9 +21994,16 @@ impl GitAgentApp {
         ui.add_space(8.0);
         settings_group_panel(ui, i18n::t(language, "update.settings_title"), |ui| {
             let changed = action_checkbox(
-                ui, &mut self.auto_check_updates, i18n::t(language, "update.auto_check"),
-            ).changed();
-            ui.label(RichText::new(i18n::t(language, "update.auto_check_hint")).small().color(theme::muted()));
+                ui,
+                &mut self.auto_check_updates,
+                i18n::t(language, "update.auto_check"),
+            )
+            .changed();
+            ui.label(
+                RichText::new(i18n::t(language, "update.auto_check_hint"))
+                    .small()
+                    .color(theme::muted()),
+            );
             if changed {
                 self.auto_update_check_pending = self.auto_check_updates;
                 self.save_app_settings();
@@ -21938,17 +22326,32 @@ impl GitAgentApp {
             }
             ui.add_space(8.0);
             let language_before = self.ai_commit_language;
-            let selected_language_label = i18n::t(language, match self.ai_commit_language {
-                Language::English => "settings.ai_commit_language_english",
-                Language::Chinese => "settings.ai_commit_language_chinese",
-            });
+            let selected_language_label = i18n::t(
+                language,
+                match self.ai_commit_language {
+                    Language::English => "settings.ai_commit_language_english",
+                    Language::Chinese => "settings.ai_commit_language_chinese",
+                },
+            );
             settings_field(ui, i18n::t(language, "settings.ai_commit_language"), |ui| {
-                recessed_combo_box(ui, "settings_ai_commit_language", selected_language_label, Some(250.0), |ui| {
-                    ui.selectable_value(&mut self.ai_commit_language, Language::English,
-                        i18n::t(language, "settings.ai_commit_language_english"));
-                    ui.selectable_value(&mut self.ai_commit_language, Language::Chinese,
-                        i18n::t(language, "settings.ai_commit_language_chinese"));
-                });
+                recessed_combo_box(
+                    ui,
+                    "settings_ai_commit_language",
+                    selected_language_label,
+                    Some(250.0),
+                    |ui| {
+                        ui.selectable_value(
+                            &mut self.ai_commit_language,
+                            Language::English,
+                            i18n::t(language, "settings.ai_commit_language_english"),
+                        );
+                        ui.selectable_value(
+                            &mut self.ai_commit_language,
+                            Language::Chinese,
+                            i18n::t(language, "settings.ai_commit_language_chinese"),
+                        );
+                    },
+                );
             });
             if self.ai_commit_language != language_before {
                 self.save_app_settings();
@@ -24323,16 +24726,26 @@ fn paint_disabled_primary_action(ui: &Ui, rect: Rect, label: &str, icon: Option<
     let icon_space = if icon.is_some() { 21.0 } else { 0.0 };
     let left = rect.center().x - (galley.size().x + icon_space) * 0.5;
     if let Some(icon) = icon {
-        let icon_rect = Rect::from_min_size(Pos2::new(left, rect.center().y - 6.5), Vec2::splat(13.0));
+        let icon_rect =
+            Rect::from_min_size(Pos2::new(left, rect.center().y - 6.5), Vec2::splat(13.0));
         match egui::Image::new(icon_source(icon)).load_for_size(ui.ctx(), icon_rect.size()) {
             Ok(egui::load::TexturePoll::Ready { texture }) => {
-                painter.image(texture.id, icon_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), foreground);
+                painter.image(
+                    texture.id,
+                    icon_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    foreground,
+                );
             }
             Ok(egui::load::TexturePoll::Pending { .. }) => ui.ctx().request_repaint(),
             Err(_) => {}
         }
     }
-    painter.galley(Pos2::new(left + icon_space, rect.center().y - galley.size().y * 0.5), galley, foreground);
+    painter.galley(
+        Pos2::new(left + icon_space, rect.center().y - galley.size().y * 0.5),
+        galley,
+        foreground,
+    );
 }
 
 fn destructive_action_color() -> Color32 {
@@ -24352,17 +24765,22 @@ fn replace_unchanged_commit_draft(draft: &mut String, original: &str, generated:
 }
 
 fn commit_ai_hover_text(language: Language, model: Option<&str>) -> String {
-    format!("{}: {}\n\n{}",
+    format!(
+        "{}: {}\n\n{}",
         i18n::t(language, "commit.ai_model"),
         model.unwrap_or_else(|| i18n::t(language, "settings.ai_model_none")),
         i18n::t(language, "commit.ai_privacy"),
     )
 }
 
-fn commit_header_row<R>(ui: &mut Ui, contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+fn commit_header_row<R>(
+    ui: &mut Ui,
+    contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<R> {
     // Reserve the tallest control before placing any items. Otherwise the final AI
     // button grows a horizontal row after the earlier menu/icon have been positioned.
-    let height = 26.0_f32.max(ui.spacing().interact_size.y)
+    let height = 26.0_f32
+        .max(ui.spacing().interact_size.y)
         .max(ui.text_style_height(&egui::TextStyle::Button) + ui.spacing().button_padding.y * 2.0);
     ui.allocate_ui_with_layout(
         Vec2::new(ui.available_width(), height),
@@ -24383,7 +24801,12 @@ fn commit_ai_generate_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::R
     )
 }
 
-fn take_automatic_update_check(enabled: bool, pending: &mut bool, busy: bool, pointer_down: bool) -> bool {
+fn take_automatic_update_check(
+    enabled: bool,
+    pending: &mut bool,
+    busy: bool,
+    pointer_down: bool,
+) -> bool {
     if !enabled || !*pending || busy || pointer_down {
         return false;
     }
@@ -24418,7 +24841,9 @@ fn text_action_button(
 ) -> egui::Response {
     let enabled = enabled && ui.is_enabled();
     if !enabled && tone == TextActionTone::Primary {
-        let (rect, response) = ui.add_enabled_ui(false, |ui| ui.allocate_exact_size(size, Sense::hover())).inner;
+        let (rect, response) = ui
+            .add_enabled_ui(false, |ui| ui.allocate_exact_size(size, Sense::hover()))
+            .inner;
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, false, label));
         paint_disabled_primary_action(ui, rect, label, icon);
         return response;
@@ -25318,21 +25743,7 @@ impl<'a> AppButton<'a> {
 
         let button = match self.style {
             AppButtonStyle::IconOnly => egui::Button::image(image).min_size(Vec2::splat(height)),
-            AppButtonStyle::Toolbar => egui::Button::image_and_text(
-                image,
-                RichText::new(self.label).size(text_size).color(tint),
-            )
-            .min_size(Vec2::new(
-                inline_button_width(
-                    ui,
-                    self.label,
-                    text_size,
-                    min_width,
-                    max_width,
-                    TOOLBAR_BUTTON_X_PADDING,
-                ),
-                height,
-            )),
+            AppButtonStyle::Toolbar => toolbar_image_button(ui, image, self.label, tint, false),
             AppButtonStyle::RepoTab { .. } => egui::Button::image_and_text(
                 image,
                 RichText::new(self.label)
@@ -25362,20 +25773,7 @@ impl<'a> AppButton<'a> {
         let response = match self.style {
             AppButtonStyle::RepoTab { .. } => ui.add_enabled(self.enabled, button.fill(fill)),
             AppButtonStyle::IconOnly | AppButtonStyle::Toolbar => {
-                ui.scope(|ui| {
-                    ui.spacing_mut().button_padding = Vec2::new(4.0, 0.0);
-                    let widgets = &mut ui.visuals_mut().widgets;
-                    widgets.inactive.bg_fill = toolbar_button_normal_fill();
-                    widgets.inactive.weak_bg_fill = toolbar_button_normal_fill();
-                    widgets.hovered.bg_fill = toolbar_button_hover_fill();
-                    widgets.hovered.weak_bg_fill = toolbar_button_hover_fill();
-                    widgets.active.bg_fill = toolbar_button_hover_fill();
-                    widgets.active.weak_bg_fill = toolbar_button_hover_fill();
-                    widgets.noninteractive.bg_fill = toolbar_button_normal_fill();
-                    widgets.noninteractive.weak_bg_fill = toolbar_button_normal_fill();
-                    ui.add_enabled(self.enabled, button)
-                })
-                .inner
+                with_toolbar_button_style(ui, |ui| ui.add_enabled(self.enabled, button)).inner
             }
         };
         let response = if self.enabled {
@@ -25450,6 +25848,70 @@ impl<'a> AppButton<'a> {
         };
         response.on_hover_text(self.label)
     }
+}
+
+pub(crate) fn toolbar_image_button<'a>(
+    ui: &Ui,
+    image: egui::Image<'a>,
+    label: &str,
+    tint: Color32,
+    selected: bool,
+) -> egui::Button<'a> {
+    let tint = if selected {
+        ui.visuals().selection.stroke.color
+    } else {
+        tint
+    };
+    egui::Button::image_and_text(
+        image
+            .fit_to_exact_size(Vec2::splat(TOOLBAR_BUTTON_ICON))
+            .tint(tint),
+        RichText::new(label).size(TOOLBAR_BUTTON_TEXT).color(tint),
+    )
+    .min_size(Vec2::new(
+        inline_button_width(
+            ui,
+            label,
+            TOOLBAR_BUTTON_TEXT,
+            TOOLBAR_BUTTON_MIN_WIDTH,
+            TOOLBAR_BUTTON_MAX_WIDTH,
+            TOOLBAR_BUTTON_X_PADDING,
+        ),
+        TOOLBAR_BUTTON_HEIGHT,
+    ))
+    .stroke(Stroke::NONE)
+    .corner_radius(CornerRadius::same(4))
+    .selected(selected)
+}
+
+pub(crate) fn toolbar_menu_button<'a>(image: egui::Image<'a>) -> egui::Button<'a> {
+    egui::Button::image(
+        image
+            .fit_to_exact_size(Vec2::splat(TOOLBAR_BUTTON_ICON))
+            .tint(theme::text()),
+    )
+    .min_size(Vec2::splat(TOOLBAR_BUTTON_HEIGHT))
+    .stroke(Stroke::NONE)
+    .corner_radius(CornerRadius::same(4))
+}
+
+pub(crate) fn with_toolbar_button_style<R>(
+    ui: &mut Ui,
+    contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<R> {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = Vec2::new(4.0, 0.0);
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.bg_fill = toolbar_button_normal_fill();
+        widgets.inactive.weak_bg_fill = toolbar_button_normal_fill();
+        widgets.hovered.bg_fill = toolbar_button_hover_fill();
+        widgets.hovered.weak_bg_fill = toolbar_button_hover_fill();
+        widgets.active.bg_fill = toolbar_button_hover_fill();
+        widgets.active.weak_bg_fill = toolbar_button_hover_fill();
+        widgets.noninteractive.bg_fill = toolbar_button_normal_fill();
+        widgets.noninteractive.weak_bg_fill = toolbar_button_normal_fill();
+        contents(ui)
+    })
 }
 
 fn toolbar_button_normal_fill() -> Color32 {
@@ -25630,6 +26092,27 @@ impl RepoTabVisibility {
 
 fn repo_tab_width_from_text_width(text_width: f32) -> f32 {
     (text_width + 70.0).clamp(108.0, 204.0)
+}
+
+fn repo_tab_badge_width(ui: &Ui, badge: &crate::plugins::RepositoryTabBadge) -> f32 {
+    ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(
+                badge.text.clone(),
+                FontId::proportional(11.0),
+                theme::text(),
+            )
+            .size()
+            .x
+    }) + 21.0
+}
+
+fn repo_tab_width_with_badge(
+    ui: &Ui,
+    label: &str,
+    badge: Option<&crate::plugins::RepositoryTabBadge>,
+) -> f32 {
+    repo_tab_width(ui, label) + badge.map_or(0.0, |badge| repo_tab_badge_width(ui, badge))
 }
 
 fn repo_tab_width(ui: &Ui, label: &str) -> f32 {
@@ -26248,7 +26731,8 @@ fn commit_submit_button(ui: &mut Ui, rect: Rect, label: &str, enabled: bool) -> 
         paint_disabled_primary_action(ui, rect, label, None);
         return response;
     }
-    ui.painter().rect_filled(rect, CornerRadius::same(4), theme::accent_deep());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(4), theme::accent_deep());
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -27478,7 +27962,7 @@ fn draw_elided_path_label(ui: &mut Ui, rect: Rect, path: &str) {
     response.on_hover_text(path);
 }
 
-fn elide_start_to_width(ui: &Ui, text: &str, max_width: f32, font: FontId) -> String {
+pub(crate) fn elide_start_to_width(ui: &Ui, text: &str, max_width: f32, font: FontId) -> String {
     let text_width = |value: &str| {
         ui.fonts(|fonts| {
             fonts
@@ -29498,12 +29982,15 @@ fn commit_branches_layout(value: &str, width: f32) -> egui::text::LayoutJob {
 
 fn commit_subject_layout(ui: &Ui, value: &str) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
-    RichText::new(value).strong().color(theme::text()).append_to(
-        &mut job,
-        ui.style(),
-        egui::FontSelection::Default,
-        Align::Min,
-    );
+    RichText::new(value)
+        .strong()
+        .color(theme::text())
+        .append_to(
+            &mut job,
+            ui.style(),
+            egui::FontSelection::Default,
+            Align::Min,
+        );
     job.wrap.max_width = ui.available_width().max(1.0);
     job.wrap.max_rows = 2;
     job.wrap.overflow_character = Some('…');
@@ -29517,9 +30004,8 @@ fn commit_summary_subject(ui: &mut Ui, value: &str, rules: &[CompiledCommitTextL
         return;
     }
     let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), value)
-    });
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), value));
     ui.painter().galley(rect.min, galley, theme::text());
     response.on_hover_ui(|ui| {
         ui.set_max_width(480.0);
@@ -29546,7 +30032,11 @@ fn commit_summary_branches(ui: &mut Ui, branches: &[String]) -> egui::Response {
             egui::ScrollArea::vertical()
                 .max_height(280.0)
                 .show(ui, |ui| {
-                    ui.add(egui::Label::new(branches.join("\n")).selectable(true).wrap());
+                    ui.add(
+                        egui::Label::new(branches.join("\n"))
+                            .selectable(true)
+                            .wrap(),
+                    );
                 });
         })
     })
@@ -30332,7 +30822,20 @@ fn repo_tab_with_close(
     tab_id: egui::Id,
     rename: Option<&mut RepoTabRenameState>,
 ) -> RepoTabInteraction {
-    let width = repo_tab_width(ui, label);
+    repo_tab_with_badge(ui, icon, selected, label, close_label, tab_id, rename, None)
+}
+
+fn repo_tab_with_badge(
+    ui: &mut Ui,
+    icon: UiIcon,
+    selected: bool,
+    label: &str,
+    close_label: &str,
+    tab_id: egui::Id,
+    rename: Option<&mut RepoTabRenameState>,
+    badge: Option<&crate::plugins::RepositoryTabBadge>,
+) -> RepoTabInteraction {
+    let width = repo_tab_width_with_badge(ui, label, badge);
     let is_renaming = rename.is_some();
     let sense = if is_renaming {
         Sense::hover()
@@ -30361,10 +30864,22 @@ fn repo_tab_with_close(
         Pos2::new(rect.left() + 17.0, rect.center().y),
         Vec2::splat(14.0),
     );
-    let text_rect = Rect::from_min_max(
+    let badge_rect = badge.filter(|_| !is_renaming).map(|badge| {
+        Rect::from_min_max(
+            Pos2::new(
+                close_rect.left() - 4.0 - repo_tab_badge_width(ui, badge) + 6.0,
+                rect.top(),
+            ),
+            Pos2::new(close_rect.left() - 4.0, rect.bottom()),
+        )
+    });
+    let mut text_rect = Rect::from_min_max(
         Pos2::new(rect.left() + 34.0, rect.top()),
         Pos2::new(close_rect.left() - 2.0, rect.bottom()),
     );
+    if let Some(badge_rect) = badge_rect {
+        text_rect.set_right(badge_rect.left() - 6.0);
+    }
 
     paint_connected_tab_shadow_for_state(ui, rect, visuals);
     ui.painter().rect_filled(rect, top_corners(3), fill);
@@ -30410,6 +30925,27 @@ fn repo_tab_with_close(
             );
     }
 
+    if let (Some(badge), Some(badge_rect)) = (badge, badge_rect) {
+        let badge_icon_rect = Rect::from_center_size(
+            Pos2::new(badge_rect.left() + 5.5, badge_rect.center().y),
+            Vec2::splat(11.0),
+        );
+        egui::Image::from_bytes(badge.icon_uri.clone(), badge.icon_bytes.clone())
+            .fit_to_exact_size(badge_icon_rect.size())
+            .tint(icon_color)
+            .paint_at(ui, badge_icon_rect);
+        ui.painter()
+            .with_clip_rect(badge_rect.intersect(ui.clip_rect()))
+            .text(
+                Pos2::new(badge_icon_rect.right() + 4.0, badge_rect.center().y),
+                Align2::LEFT_CENTER,
+                &badge.text,
+                FontId::proportional(11.0),
+                text_color,
+            );
+        ui.interact(badge_rect, tab_id.with("badge"), Sense::hover())
+            .on_hover_text(&badge.tooltip);
+    }
     let mut close_clicked = false;
     if show_close {
         let close_response = ui
@@ -31143,6 +31679,7 @@ fn global_settings_dialog_height(
         SettingsTab::Git => 430.0,
         SettingsTab::Ai => 410.0,
         SettingsTab::Verification => 240.0,
+        SettingsTab::Plugins => SETTINGS_DIALOG_HEIGHT,
         _ => 300.0,
     }
 }
@@ -31159,6 +31696,8 @@ fn global_settings_content_max_height(dialog_height: f32) -> f32 {
 
 fn settings_tab_label(language: Language, tab: SettingsTab) -> &'static str {
     match (language, tab) {
+        (Language::Chinese, SettingsTab::Plugins | SettingsTab::RepoPlugins) => "插件",
+        (_, SettingsTab::Plugins | SettingsTab::RepoPlugins) => "Plugins",
         (Language::Chinese, SettingsTab::General) => "\u{5e38}\u{89c4}",
         (Language::Chinese, SettingsTab::Git) => "Git",
         (Language::Chinese, SettingsTab::Ai) => "AI",
@@ -31221,6 +31760,11 @@ fn global_settings_tab_strip(ui: &mut Ui, current: &mut SettingsTab, language: L
             UiIcon::User,
             settings_tab_label(language, SettingsTab::CommitAuthors),
         ),
+        (
+            SettingsTab::Plugins,
+            UiIcon::Tag,
+            settings_tab_label(language, SettingsTab::Plugins),
+        ),
     ];
     settings_tab_strip(ui, current, &tabs);
 }
@@ -31243,7 +31787,7 @@ fn repo_settings_dialog_height(tab: SettingsTab) -> f32 {
     match tab {
         SettingsTab::RepoRemotes => 330.0,
         SettingsTab::RepoIgnoreRules => REPO_SETTINGS_DIALOG_HEIGHT,
-        SettingsTab::RepoAdvanced => REPO_SETTINGS_DIALOG_HEIGHT,
+        SettingsTab::RepoAdvanced | SettingsTab::RepoPlugins => REPO_SETTINGS_DIALOG_HEIGHT,
         _ => 330.0,
     }
 }
@@ -31252,7 +31796,7 @@ fn repo_settings_content_max_height(tab: SettingsTab) -> f32 {
     match tab {
         SettingsTab::RepoRemotes => 190.0,
         SettingsTab::RepoIgnoreRules => 500.0,
-        SettingsTab::RepoAdvanced => 500.0,
+        SettingsTab::RepoAdvanced | SettingsTab::RepoPlugins => 500.0,
         _ => 190.0,
     }
 }
@@ -31273,6 +31817,11 @@ fn repo_settings_tab_strip(ui: &mut Ui, current: &mut SettingsTab, language: Lan
             SettingsTab::RepoAdvanced,
             UiIcon::Settings,
             settings_tab_label(language, SettingsTab::RepoAdvanced),
+        ),
+        (
+            SettingsTab::RepoPlugins,
+            UiIcon::Tag,
+            settings_tab_label(language, SettingsTab::RepoPlugins),
         ),
     ];
     settings_tab_strip(ui, current, &tabs);
@@ -32026,8 +32575,14 @@ fn conflict_resolution_list_panel(
                         for file in conflict_files {
                             let selected = selected_path.as_deref() == Some(file.path.as_str());
                             if conflict_resolution_row(
-                                ui, file, selected, language, &mut history_request,
-                            ).clicked() {
+                                ui,
+                                file,
+                                selected,
+                                language,
+                                &mut history_request,
+                            )
+                            .clicked()
+                            {
                                 *selected_path = Some(file.path.clone());
                             }
                         }
@@ -34351,6 +34906,19 @@ impl<'a> DiffRenderOptions<'a> {
             new_highlight: diff.new_highlight.as_ref(),
         }
     }
+}
+
+/// Reuse the native change viewer for declarative plugin files.
+pub(crate) fn render_plugin_diff(ui: &mut Ui, id: impl std::hash::Hash, text: &str) {
+    fill_diff_scroll_area(
+        ui,
+        id,
+        text,
+        DiffDisplayMode::Full,
+        Language::English,
+        &mut Vec::new(),
+        DiffRenderOptions::default(),
+    );
 }
 
 fn fill_diff_scroll_area(
@@ -38811,21 +39379,33 @@ fn strip_git_suffix(value: &str) -> &str {
 
 #[cfg(test)]
 mod ui_tests {
+    // Architecture checks should survive rustfmt; behavioral tests use real data and UI shapes.
+    fn source_token(value: &str) -> String {
+        value.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     use super::*;
 
     #[test]
     fn disabled_primary_buttons_render_the_same_palette_as_commit() {
-        let icon = egui_extras::image::load_svg_bytes(include_bytes!("../assets/icons/ai.svg")).unwrap();
+        let icon =
+            egui_extras::image::load_svg_bytes(include_bytes!("../assets/icons/ai.svg")).unwrap();
         assert!(icon.pixels.iter().any(|pixel| pixel.a() > 0));
         // Rasterized edge pixels are premultiplied by the SVG loader. Inspect the
         // opaque stroke core rather than assuming RGB == alpha at every edge.
         let core = icon.pixels.iter().max_by_key(|pixel| pixel.a()).unwrap();
-        assert!(core.a() > 200 && core.r() > 200 && core.r() == core.g() && core.g() == core.b(),
-            "AI icon must have white strokes, not black currentColor: {core:?}");
+        assert!(
+            core.a() > 200 && core.r() > 200 && core.r() == core.g() && core.g() == core.b(),
+            "AI icon must have white strokes, not black currentColor: {core:?}"
+        );
         fn flatten<'a>(shape: &'a Shape, shapes: &mut Vec<&'a Shape>) {
             if let Shape::Vec(children) = shape {
-                for child in children { flatten(child, shapes); }
-            } else { shapes.push(shape); }
+                for child in children {
+                    flatten(child, shapes);
+                }
+            } else {
+                shapes.push(shape);
+            }
         }
         for parent_disabled in [false, true] {
             let ctx = egui::Context::default();
@@ -38833,36 +39413,66 @@ mod ui_tests {
             let mut rects = Vec::new();
             let output = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if parent_disabled { ui.disable(); }
+                    if parent_disabled {
+                        ui.disable();
+                    }
                     let ai = commit_ai_generate_button(ui, "AI disabled", parent_disabled);
                     assert!(!ai.enabled());
                     assert!(!ai.clicked());
                     rects.push(ai.rect);
-                    let rect = ui.allocate_exact_size(Vec2::new(112.0, 30.0), Sense::hover()).0;
-                    assert!(!commit_submit_button(ui, rect, "Commit disabled", parent_disabled).clicked());
+                    let rect = ui
+                        .allocate_exact_size(Vec2::new(112.0, 30.0), Sense::hover())
+                        .0;
+                    assert!(
+                        !commit_submit_button(ui, rect, "Commit disabled", parent_disabled)
+                            .clicked()
+                    );
                     rects.push(rect);
                 });
             });
             let mut shapes = Vec::new();
-            for clipped in &output.shapes { flatten(&clipped.shape, &mut shapes); }
+            for clipped in &output.shapes {
+                flatten(&clipped.shape, &mut shapes);
+            }
             let ai_rect = rects[0];
-            let icon_mesh = shapes.iter().find_map(|shape| match shape {
-                Shape::Mesh(mesh) if !mesh.vertices.is_empty() && mesh.vertices.iter().all(|v| ai_rect.contains(v.pos)) => Some(mesh),
-                _ => None,
-            }).expect("disabled AI icon was painted");
-            assert!(icon_mesh.vertices.iter().all(|vertex| vertex.color == disabled_primary_action_foreground()));
-            for rect in rects {
-                let fill = shapes.iter().find_map(|s| match s {
-                    Shape::Rect(shape) if shape.rect == rect => Some(shape.fill),
+            let icon_mesh = shapes
+                .iter()
+                .find_map(|shape| match shape {
+                    Shape::Mesh(mesh)
+                        if !mesh.vertices.is_empty()
+                            && mesh.vertices.iter().all(|v| ai_rect.contains(v.pos)) =>
+                    {
+                        Some(mesh)
+                    }
                     _ => None,
-                }).expect("button background was painted");
+                })
+                .expect("disabled AI icon was painted");
+            assert!(
+                icon_mesh
+                    .vertices
+                    .iter()
+                    .all(|vertex| vertex.color == disabled_primary_action_foreground())
+            );
+            for rect in rects {
+                let fill = shapes
+                    .iter()
+                    .find_map(|s| match s {
+                        Shape::Rect(shape) if shape.rect == rect => Some(shape.fill),
+                        _ => None,
+                    })
+                    .expect("button background was painted");
                 assert_eq!(fill, disabled_primary_action_fill());
             }
             for label in ["AI disabled", "Commit disabled"] {
-                let color = shapes.iter().find_map(|s| match s {
-                    Shape::Text(shape) if shape.galley.job.text == label => Some(shape.galley.job.sections[0].format.color),
-                    _ => None,
-                }).expect("button label was painted");
+                let color = shapes
+                    .iter()
+                    .find_map(|s| match s {
+                        Shape::Text(shape) if shape.galley.job.text == label => {
+                            Some(shape.galley.job.sections[0].format.color)
+                        }
+                        _ => None,
+                    })
+                    .expect("button label was painted");
                 assert_eq!(color, disabled_primary_action_foreground());
             }
         }
@@ -38871,8 +39481,16 @@ mod ui_tests {
     #[test]
     fn ai_commit_language_persists_independently_of_interface_language() {
         for (output, interface, expected) in [
-            (SettingsLanguage::English, SettingsLanguage::Chinese, Language::English),
-            (SettingsLanguage::Chinese, SettingsLanguage::English, Language::Chinese),
+            (
+                SettingsLanguage::English,
+                SettingsLanguage::Chinese,
+                Language::English,
+            ),
+            (
+                SettingsLanguage::Chinese,
+                SettingsLanguage::English,
+                Language::Chinese,
+            ),
         ] {
             let settings = AppSettings {
                 language: interface,
@@ -38897,12 +39515,22 @@ mod ui_tests {
             assert_eq!(settings.effective_ai_commit_language(), expected);
         }
         let source = include_str!("app.rs");
-        let start = source.split("fn start_commit_ai(").nth(1).unwrap()
-            .split("fn poll_commit_ai_task(").next().unwrap();
+        let start = source
+            .split("fn start_commit_ai(")
+            .nth(1)
+            .unwrap()
+            .split("fn poll_commit_ai_task(")
+            .next()
+            .unwrap();
         assert!(start.contains("let chinese = self.ai_commit_language == Language::Chinese"));
         assert!(!start.contains("let chinese = self.language"));
-        let settings = source.split("fn global_ai_settings(").nth(1).unwrap()
-            .split("fn ai_model_settings_modal(").next().unwrap();
+        let settings = source
+            .split("fn global_ai_settings(")
+            .nth(1)
+            .unwrap()
+            .split("fn ai_model_settings_modal(")
+            .next()
+            .unwrap();
         assert!(settings.contains("settings_ai_commit_language"));
         assert!(settings.contains("self.ai_commit_language != language_before"));
         assert!(source.contains("ai_commit_language: Some(self.ai_commit_language.into())"));
@@ -38926,15 +39554,28 @@ mod ui_tests {
             });
         });
         let source = include_str!("app.rs");
-        let button = source.split("fn commit_ai_generate_button(").nth(1).unwrap()
-            .split("fn text_action_button(").next().unwrap();
+        let button = source
+            .split("fn commit_ai_generate_button(")
+            .nth(1)
+            .unwrap()
+            .split("fn text_action_button(")
+            .next()
+            .unwrap();
         assert!(button.contains("Some(UiIcon::Ai)"));
         assert!(button.contains("TextActionTone::Primary"));
-        let controls = source.split("fn commit_ai_controls(").nth(1).unwrap()
-            .split("fn commit_panel(").next().unwrap();
+        let controls = source
+            .split("fn commit_ai_controls(")
+            .nth(1)
+            .unwrap()
+            .split("fn commit_panel(")
+            .next()
+            .unwrap();
         assert!(controls.contains("on_disabled_hover_text"));
         assert!(controls.contains(".on_hover_text(hint)"));
-        assert!(controls.contains("commit_ai_hover_text(self.language, self.selected_ai_model.as_deref())"));
+        assert!(
+            controls
+                .contains("commit_ai_hover_text(self.language, self.selected_ai_model.as_deref())")
+        );
         assert!(controls.contains("self.start_commit_ai(ui.ctx());"));
         assert!(!controls.contains("popup"));
         assert!(!controls.contains("menu_button"));
@@ -38947,22 +39588,32 @@ mod ui_tests {
         for scale in [1.0, 1.25, 1.5, 2.0] {
             ctx.set_pixels_per_point(scale);
             for enabled in [true, false] {
-                for (ai_label, options_label) in [("AI 生成", "提交选项…"), ("AI generate", "Commit options…")] {
+                for (ai_label, options_label) in
+                    [("AI 生成", "提交选项…"), ("AI generate", "Commit options…")]
+                {
                     let _ = ctx.run(egui::RawInput::default(), |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
                             let (options, history, ai) = commit_header_row(ui, |ui| {
                                 panel_heading_inline(ui, "Commit");
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let options = ui.menu_button(options_label, |_| {}).response.rect;
-                                    let history = icon_button(ui, UiIcon::History, "History", true).rect;
+                                    let options =
+                                        ui.menu_button(options_label, |_| {}).response.rect;
+                                    let history =
+                                        icon_button(ui, UiIcon::History, "History", true).rect;
                                     let ai = commit_ai_generate_button(ui, ai_label, enabled).rect;
                                     (options, history, ai)
-                                }).inner
-                            }).inner;
-                            assert!((options.center().y - ai.center().y).abs() <= 0.5 / scale,
-                                "Options {options:?}, AI {ai:?}, scale {scale}, enabled {enabled}");
-                            assert!((history.center().y - ai.center().y).abs() <= 0.5 / scale,
-                                "History {history:?}, AI {ai:?}, scale {scale}, enabled {enabled}");
+                                })
+                                .inner
+                            })
+                            .inner;
+                            assert!(
+                                (options.center().y - ai.center().y).abs() <= 0.5 / scale,
+                                "Options {options:?}, AI {ai:?}, scale {scale}, enabled {enabled}"
+                            );
+                            assert!(
+                                (history.center().y - ai.center().y).abs() <= 0.5 / scale,
+                                "History {history:?}, AI {ai:?}, scale {scale}, enabled {enabled}"
+                            );
                             assert!(ai.right() <= history.left());
                             assert!(history.right() <= options.left());
                         });
@@ -38971,8 +39622,13 @@ mod ui_tests {
             }
         }
         let source = include_str!("app.rs");
-        let panel = source.split("fn commit_panel(").nth(1).unwrap()
-            .split("fn rebase_commit_panel_body(").next().unwrap();
+        let panel = source
+            .split("fn commit_panel(")
+            .nth(1)
+            .unwrap()
+            .split("fn rebase_commit_panel_body(")
+            .next()
+            .unwrap();
         assert!(panel.contains("commit_header_row(ui,"));
     }
 
@@ -38985,8 +39641,10 @@ mod ui_tests {
             assert!(!switched.contains("Model A"));
             assert!(switched.contains("Model B"));
             assert!(switched.contains(i18n::t(language, "commit.ai_privacy")));
-            assert!(commit_ai_hover_text(language, None)
-                .contains(i18n::t(language, "settings.ai_model_none")));
+            assert!(
+                commit_ai_hover_text(language, None)
+                    .contains(i18n::t(language, "settings.ai_model_none"))
+            );
         }
     }
 
@@ -38994,12 +39652,20 @@ mod ui_tests {
     fn commit_ai_writes_directly_but_preserves_concurrent_draft_edits() {
         for original in ["", "An existing draft"] {
             let mut draft = original.to_owned();
-            assert!(replace_unchanged_commit_draft(&mut draft, original, "feat: new message".into()));
+            assert!(replace_unchanged_commit_draft(
+                &mut draft,
+                original,
+                "feat: new message".into()
+            ));
             assert_eq!(draft, "feat: new message");
         }
         for edited in ["User edited while waiting", ""] {
             let mut draft = edited.to_owned();
-            assert!(!replace_unchanged_commit_draft(&mut draft, "Original draft", "feat: generated".into()));
+            assert!(!replace_unchanged_commit_draft(
+                &mut draft,
+                "Original draft",
+                "feat: generated".into()
+            ));
             assert_eq!(draft, edited);
         }
     }
@@ -39033,23 +39699,33 @@ mod ui_tests {
 
     #[test]
     fn repository_undo_redo_are_wired_to_safe_local_actions() {
-        let source = include_str!("app.rs");
-        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation = &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
 
-        assert!(implementation.contains("struct RepositoryUndoEntry"));
-        assert!(implementation.contains("fn start_undoable_git_action("));
-        assert!(implementation.contains("fn undo_repository_action("));
-        assert!(implementation.contains("fn redo_repository_action("));
-        assert!(implementation.contains("RepositoryUndoKind::Position"));
-        assert!(implementation.contains("RepositoryUndoKind::Commit"));
-        assert!(implementation.contains("shortcut_pressed(ctx, egui::Key::Z, false)"));
-        assert!(implementation.contains("shortcut_pressed(ctx, egui::Key::Y, false)"));
-        assert!(implementation.contains("toolbar_button(\n                                    ui,\n                                    \"undo\""));
-        assert!(implementation.contains("toolbar_button(\n                                    ui,\n                                    \"redo\""));
-        assert!(implementation.contains("git::restore_repository_undo_position"));
+        assert!(implementation.contains(source_token("struct RepositoryUndoEntry").as_str()));
+        assert!(implementation.contains(source_token("fn start_undoable_git_action(").as_str()));
+        assert!(implementation.contains(source_token("fn undo_repository_action(").as_str()));
+        assert!(implementation.contains(source_token("fn redo_repository_action(").as_str()));
+        assert!(implementation.contains(source_token("RepositoryUndoKind::Position").as_str()));
+        assert!(implementation.contains(source_token("RepositoryUndoKind::Commit").as_str()));
         assert!(
             implementation
-                .contains("git::reset_to_commit(&root, &entry.before.head, ResetMode::Soft)")
+                .contains(source_token("shortcut_pressed(ctx, egui::Key::Z, false)").as_str())
+        );
+        assert!(
+            implementation
+                .contains(source_token("shortcut_pressed(ctx, egui::Key::Y, false)").as_str())
+        );
+        assert!(implementation.contains(source_token("toolbar_button(\n                                    ui,\n                                    \"undo\"").as_str()));
+        assert!(implementation.contains(source_token("toolbar_button(\n                                    ui,\n                                    \"redo\"").as_str()));
+        assert!(
+            implementation.contains(source_token("git::restore_repository_undo_position").as_str())
+        );
+        assert!(
+            implementation.contains(
+                source_token("git::reset_to_commit(&root, &entry.before.head, ResetMode::Soft)")
+                    .as_str()
+            )
         );
     }
 
@@ -39061,104 +39737,172 @@ mod ui_tests {
             TOP_BAR_HEIGHT,
             TITLE_BAR_HEIGHT + TOP_BAR_ROW_HEIGHT * 2.0 - TOP_BAR_TAB_TOOL_JOIN_OVERLAP
         );
-        let source = include_str!("app.rs");
-        let top_bar_start = source.find("fn top_bar_panel(").unwrap();
-        let top_bar_end = source[top_bar_start..].find("fn main_layout(").unwrap();
+        let source = source_token(include_str!("app.rs"));
+        let top_bar_start = source
+            .find(source_token("fn top_bar_panel(").as_str())
+            .unwrap();
+        let top_bar_end = source[top_bar_start..]
+            .find(source_token("fn main_layout(").as_str())
+            .unwrap();
         let top_bar_source = &source[top_bar_start..top_bar_start + top_bar_end];
-        assert!(source.contains("exact_height(self.top_bar_height())"));
-        assert!(source.contains("if !self.repository_source_active()"));
+        assert!(source.contains(source_token("exact_height(self.top_bar_height())").as_str()));
+        assert!(source.contains(source_token("if !self.repository_source_active()").as_str()));
         assert_eq!(central_panel_margin(false).top, LAYOUT_GAP);
         assert_eq!(central_panel_margin(true).top, 0);
         assert_eq!(central_panel_margin(true).left, LAYOUT_GAP);
         assert_eq!(repository_source_panel_y_margin(), 0);
-        assert!(top_bar_source.contains("let top_island_rect = top_island_rect("));
-        assert!(top_bar_source.contains("let tab_strip_row = repo_tab_strip_rect("));
         assert!(
             top_bar_source
-                .contains(".rect_filled(full, window_top_corner_radius(ui.ctx()), theme::bg())")
+                .contains(source_token("let top_island_rect = top_island_rect(").as_str())
         );
-        assert!(top_bar_source.contains(".fill(theme::chrome_bg())"));
-        assert!(top_bar_source.contains(".shadow(top_bar_shadow())"));
-        assert!(top_bar_source.contains(".paint(top_island_rect)"));
         assert!(
-            top_bar_source.contains("paint_layout_debug_rect(ui, top_island_rect, \"top.island\"")
+            top_bar_source
+                .contains(source_token("let tab_strip_row = repo_tab_strip_rect(").as_str())
         );
-        assert!(top_bar_source.contains("paint_layout_debug_rect(ui, tab_strip_row, \"top.tabs\""));
-        assert!(!top_bar_source.contains("let menu_row = Rect::from_min_max("));
-        assert!(!top_bar_source.contains("max_rect(menu_row)"));
-        let title_bar_start = source.find("fn custom_title_bar(").unwrap();
+        assert!(
+            top_bar_source.contains(
+                source_token(".rect_filled(full, window_top_corner_radius(ui.ctx()), theme::bg())")
+                    .as_str()
+            )
+        );
+        assert!(top_bar_source.contains(source_token(".fill(theme::chrome_bg())").as_str()));
+        assert!(top_bar_source.contains(source_token(".shadow(top_bar_shadow())").as_str()));
+        assert!(top_bar_source.contains(source_token(".paint(top_island_rect)").as_str()));
+        assert!(top_bar_source.contains(
+            source_token("paint_layout_debug_rect(ui, top_island_rect, \"top.island\"").as_str()
+        ));
+        assert!(top_bar_source.contains(
+            source_token("paint_layout_debug_rect(ui, tab_strip_row, \"top.tabs\"").as_str()
+        ));
+        assert!(
+            !top_bar_source.contains(source_token("let menu_row = Rect::from_min_max(").as_str())
+        );
+        assert!(!top_bar_source.contains(source_token("max_rect(menu_row)").as_str()));
+        let title_bar_start = source
+            .find(source_token("fn custom_title_bar(").as_str())
+            .unwrap();
         let title_bar_end = source[title_bar_start..]
-            .find("fn desktop_menu_bar(")
+            .find(source_token("fn desktop_menu_bar(").as_str())
             .unwrap();
         let title_bar_source = &source[title_bar_start..title_bar_start + title_bar_end];
-        assert!(title_bar_source.contains("app_title_logo(ui);"));
-        assert!(title_bar_source.contains("self.desktop_menu_bar(ui, has_repo, has_remote)"));
-        assert!(title_bar_source.contains("title_drag_candidate_rect(rect)"));
-        assert!(title_bar_source.contains("self.title_bar_hit_map = Some(TitleBarHitMap"));
-        assert!(title_bar_source.contains("window_top_corner_radius(ctx)"));
+        assert!(title_bar_source.contains(source_token("app_title_logo(ui);").as_str()));
         assert!(
-            !source[..source.find("#[cfg(test)]").unwrap()].contains("TITLE_MENU_RESERVED_WIDTH")
+            title_bar_source
+                .contains(source_token("self.desktop_menu_bar(ui, has_repo, has_remote)").as_str())
         );
-        assert!(!title_bar_source.contains("RichText::new(\"Git Agent\")"));
-        assert!(top_bar_source.contains("let tool_row_panel_rect = (!source_active).then(|| {"));
-        assert!(top_bar_source.contains("Rect::from_min_max("));
-        assert!(top_bar_source.contains("TOP_BAR_TAB_TOOL_JOIN_OVERLAP"));
-        assert!(top_bar_source.contains("TOP_BAR_PANEL_X_INSET"));
-        assert!(top_bar_source.contains("tab_row.bottom() - TOP_BAR_TAB_TOOL_JOIN_OVERLAP"));
-        assert!(top_bar_source.contains("tool_row_panel_rect"));
-        assert!(top_bar_source.contains("tool_row_corners()"));
-        assert!(top_bar_source.contains("theme::panel()"));
-        assert!(top_bar_source.contains(".fill(theme::chrome_bg())"));
-        assert!(top_bar_source.contains(".paint(tool_row_panel_rect)"));
         assert!(
-            top_bar_source
-                .contains("paint_layout_debug_rect(ui, tool_row_panel_rect, \"top.toolbar\"")
+            title_bar_source.contains(source_token("title_drag_candidate_rect(rect)").as_str())
+        );
+        assert!(
+            title_bar_source
+                .contains(source_token("self.title_bar_hit_map = Some(TitleBarHitMap").as_str())
+        );
+        assert!(title_bar_source.contains(source_token("window_top_corner_radius(ctx)").as_str()));
+        assert!(
+            !source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()]
+                .contains(source_token("TITLE_MENU_RESERVED_WIDTH").as_str())
+        );
+        assert!(!title_bar_source.contains(source_token("RichText::new(\"Git Agent\")").as_str()));
+        assert!(top_bar_source.contains(
+            source_token("let tool_row_panel_rect = (!source_active).then(|| {").as_str()
+        ));
+        assert!(top_bar_source.contains(source_token("Rect::from_min_max(").as_str()));
+        assert!(top_bar_source.contains(source_token("TOP_BAR_TAB_TOOL_JOIN_OVERLAP").as_str()));
+        assert!(top_bar_source.contains(source_token("TOP_BAR_PANEL_X_INSET").as_str()));
+        assert!(
+            top_bar_source.contains(
+                source_token("tab_row.bottom() - TOP_BAR_TAB_TOOL_JOIN_OVERLAP").as_str()
+            )
+        );
+        assert!(top_bar_source.contains(source_token("tool_row_panel_rect").as_str()));
+        assert!(top_bar_source.contains(source_token("tool_row_corners()").as_str()));
+        assert!(top_bar_source.contains(source_token("theme::panel()").as_str()));
+        assert!(top_bar_source.contains(source_token(".fill(theme::chrome_bg())").as_str()));
+        assert!(top_bar_source.contains(source_token(".paint(tool_row_panel_rect)").as_str()));
+        assert!(
+            top_bar_source.contains(
+                source_token("paint_layout_debug_rect(ui, tool_row_panel_rect, \"top.toolbar\"")
+                    .as_str()
+            )
         );
         assert_eq!(TOP_BAR_GLOBAL_ACTION_Y_OFFSET, -1.0);
         assert!(
             top_bar_source
-                .contains("let global_action_row = tab_right.translate(Vec2::new(0.0, TOP_BAR_GLOBAL_ACTION_Y_OFFSET));")
+                .contains(source_token("let global_action_row = tab_right.translate(Vec2::new(0.0, TOP_BAR_GLOBAL_ACTION_Y_OFFSET));").as_str())
         );
-        assert!(!top_bar_source.contains("top_bar_drag_region(ctx, ui, tab_right"));
-        assert!(top_bar_source.contains("let tool_content_row = tool_row_panel_rect"));
-        assert!(top_bar_source.contains(".map(|rect| Rect::from_min_max(rect.left_top()"));
-        assert!(top_bar_source.contains("if let Some(tool_content_row) = tool_content_row"));
-        assert!(top_bar_source.contains("max_rect(tool_content_row)"));
+        assert!(
+            !top_bar_source
+                .contains(source_token("top_bar_drag_region(ctx, ui, tab_right").as_str())
+        );
+        assert!(
+            top_bar_source
+                .contains(source_token("let tool_content_row = tool_row_panel_rect").as_str())
+        );
+        assert!(
+            top_bar_source
+                .contains(source_token(".map(|rect| Rect::from_min_max(rect.left_top()").as_str())
+        );
+        assert!(
+            top_bar_source.contains(
+                source_token("if let Some(tool_content_row) = tool_content_row").as_str()
+            )
+        );
+        assert!(top_bar_source.contains(source_token("max_rect(tool_content_row)").as_str()));
         assert_eq!(REPO_TAB_STRIP_LEFT_PADDING, TOP_BAR_PANEL_X_INSET);
-        assert!(!top_bar_source.contains(".rect_filled(full, CornerRadius::ZERO, theme::panel())"));
-        assert!(source.contains("fn toolbar_button_normal_fill("));
-        assert!(source.contains("fn toolbar_button_hover_fill("));
-        assert!(!top_bar_source.contains("MENU_BAR_HEIGHT"));
-        let menu_button_start = source.find("fn menu_button(").unwrap();
-        let menu_button_end = source[menu_button_start..].find("fn menu_label(").unwrap();
+        assert!(!top_bar_source.contains(
+            source_token(".rect_filled(full, CornerRadius::ZERO, theme::panel())").as_str()
+        ));
+        assert!(source.contains(source_token("fn toolbar_button_normal_fill(").as_str()));
+        assert!(source.contains(source_token("fn toolbar_button_hover_fill(").as_str()));
+        assert!(!top_bar_source.contains(source_token("MENU_BAR_HEIGHT").as_str()));
+        let menu_button_start = source
+            .find(source_token("fn menu_button(").as_str())
+            .unwrap();
+        let menu_button_end = source[menu_button_start..]
+            .find(source_token("fn menu_label(").as_str())
+            .unwrap();
         let menu_button_source = &source[menu_button_start..menu_button_start + menu_button_end];
+        assert!(menu_button_source.contains(
+            source_token("ui.spacing_mut().button_padding = Vec2::new(6.0, 2.0)").as_str()
+        ));
         assert!(
-            menu_button_source.contains("ui.spacing_mut().button_padding = Vec2::new(6.0, 2.0)")
+            menu_button_source
+                .contains(source_token("widgets.inactive.bg_fill = Color32::TRANSPARENT").as_str())
         );
-        assert!(menu_button_source.contains("widgets.inactive.bg_fill = Color32::TRANSPARENT"));
-        assert!(
-            menu_button_source.contains("widgets.inactive.weak_bg_fill = Color32::TRANSPARENT")
-        );
+        assert!(menu_button_source.contains(
+            source_token("widgets.inactive.weak_bg_fill = Color32::TRANSPARENT").as_str()
+        ));
         let tab_right_start = source
-            .find("ui.allocate_new_ui(egui::UiBuilder::new().max_rect(global_action_row)")
+            .find(
+                source_token(
+                    "ui.allocate_new_ui(egui::UiBuilder::new().max_rect(global_action_row)",
+                )
+                .as_str(),
+            )
             .unwrap();
         let tab_right_end = source[tab_right_start..]
-            .find("if !self.repository_source_active()")
+            .find(source_token("if !self.repository_source_active()").as_str())
             .unwrap();
         let tab_right_source = &source[tab_right_start..tab_right_start + tab_right_end];
-        assert!(tab_right_source.contains("ui.set_clip_rect(global_action_row);"));
-        assert!(tab_right_source.contains("responsive_global_action_button(\n                    ui,\n                    \"settings\""));
-        assert!(tab_right_source.contains("\"git-flow\""));
-        assert!(tab_right_source.contains("\"remote\""));
-        assert!(tab_right_source.contains("\"terminal\""));
-        assert!(tab_right_source.contains("\"resource-manager\""));
-        assert!(top_bar_source.contains("let global_action_labels = ["));
-        assert!(top_bar_source.contains("global_action_row_width("));
-        assert!(top_bar_source.contains("global_action_presentation("));
-        assert!(!tab_right_source.contains("toolbar_button(ui, \"open\""));
+        assert!(
+            tab_right_source
+                .contains(source_token("ui.set_clip_rect(global_action_row);").as_str())
+        );
+        assert!(tab_right_source.contains(source_token("responsive_global_action_button(\n                    ui,\n                    \"settings\"").as_str()));
+        assert!(tab_right_source.contains(source_token("\"git-flow\"").as_str()));
+        assert!(tab_right_source.contains(source_token("\"remote\"").as_str()));
+        assert!(tab_right_source.contains(source_token("\"terminal\"").as_str()));
+        assert!(tab_right_source.contains(source_token("\"resource-manager\"").as_str()));
+        assert!(top_bar_source.contains(source_token("let global_action_labels = [").as_str()));
+        assert!(top_bar_source.contains(source_token("global_action_row_width(").as_str()));
+        assert!(top_bar_source.contains(source_token("global_action_presentation(").as_str()));
+        assert!(!tab_right_source.contains(source_token("toolbar_button(ui, \"open\"").as_str()));
         assert!(
             !tab_right_source.contains(
-                "toolbar_button(\n                    ui,\n                    \"refresh\""
+                source_token(
+                    "toolbar_button(\n                    ui,\n                    \"refresh\""
+                )
+                .as_str()
             )
         );
         assert_eq!(
@@ -39273,13 +40017,13 @@ mod ui_tests {
 
     #[test]
     fn create_patch_worktree_tab_uses_compact_width_and_footer() {
-        let source = include_str!("app.rs");
-        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation = &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let start = implementation
-            .find("fn create_patch_action_modal(")
+            .find(source_token("fn create_patch_action_modal(").as_str())
             .unwrap();
         let end = implementation[start..]
-            .find("fn create_patch_history_tab(")
+            .find(source_token("fn create_patch_history_tab(").as_str())
             .unwrap();
         let modal = &implementation[start..start + end];
         for required in [
@@ -39289,9 +40033,12 @@ mod ui_tests {
             ".auto_shrink([false, true])",
             "ui.horizontal(|ui| {\n                ui.with_layout(Layout::right_to_left(Align::Center)",
         ] {
-            assert!(modal.contains(required), "missing {required}");
+            assert!(
+                modal.contains(source_token(required).as_str()),
+                "missing {required}"
+            );
         }
-        assert!(!modal.contains(".max_height(330.0)"));
+        assert!(!modal.contains(source_token(".max_height(330.0)").as_str()));
     }
 
     #[test]
@@ -39448,52 +40195,77 @@ mod ui_tests {
 
     #[test]
     fn main_layout_outer_panels_use_exact_painted_rects_not_frame_sizing() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
-        let layout_start = implementation_source.find("fn main_layout(").unwrap();
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
+        let layout_start = implementation_source
+            .find(source_token("fn main_layout(").as_str())
+            .unwrap();
         let layout_end = implementation_source[layout_start..]
-            .find("fn top_bar(")
+            .find(source_token("fn top_bar(").as_str())
             .unwrap();
         let layout_source = &implementation_source[layout_start..layout_start + layout_end];
 
-        assert!(implementation_source.contains("fn exact_panel_at_rect("));
-        assert!(
-            layout_source
-                .contains("exact_panel_at_rect(\n            ui,\n            sidebar_rect")
-        );
-        assert!(
-            layout_source
-                .contains("exact_panel_at_rect(\n            ui,\n            center_rect")
-        );
+        assert!(implementation_source.contains(source_token("fn exact_panel_at_rect(").as_str()));
         assert!(
             layout_source.contains(
-                "exact_panel_at_rect(\n                ui,\n                details_rect"
+                source_token("exact_panel_at_rect(\n            ui,\n            sidebar_rect")
+                    .as_str()
             )
         );
-        assert!(!layout_source.contains("content_panel_frame(theme::panel()).show"));
+        assert!(layout_source.contains(
+            source_token("exact_panel_at_rect(\n            ui,\n            center_rect").as_str()
+        ));
+        assert!(
+            layout_source.contains(
+                source_token(
+                    "exact_panel_at_rect(\n                ui,\n                details_rect"
+                )
+                .as_str()
+            )
+        );
         assert!(
             !layout_source
-                .contains("soft_panel_frame(theme::panel(), LAYOUT_GAP, LAYOUT_GAP).show")
+                .contains(source_token("content_panel_frame(theme::panel()).show").as_str())
         );
+        assert!(!layout_source.contains(
+            source_token("soft_panel_frame(theme::panel(), LAYOUT_GAP, LAYOUT_GAP).show").as_str()
+        ));
     }
 
     #[test]
     fn layout_debug_overlay_can_trace_panel_and_workspace_rects() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
-        assert!(implementation_source.contains("GIT_AGENT_LAYOUT_DEBUG"));
-        assert!(implementation_source.contains("fn layout_debug_enabled("));
-        assert!(implementation_source.contains("fn paint_layout_debug_rect("));
-        assert!(implementation_source.contains("fn log_layout_debug_once("));
-        assert!(implementation_source.contains("paint_layout_debug_rect(ui, layout.sidebar"));
-        assert!(implementation_source.contains("paint_layout_debug_rect(ui, layout.center"));
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
+        assert!(implementation_source.contains(source_token("GIT_AGENT_LAYOUT_DEBUG").as_str()));
+        assert!(implementation_source.contains(source_token("fn layout_debug_enabled(").as_str()));
         assert!(
-            implementation_source.contains("paint_layout_debug_rect(ui, layout.staged_rect")
+            implementation_source.contains(source_token("fn paint_layout_debug_rect(").as_str())
+        );
+        assert!(implementation_source.contains(source_token("fn log_layout_debug_once(").as_str()));
+        assert!(
+            implementation_source
+                .contains(source_token("paint_layout_debug_rect(ui, layout.sidebar").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("paint_layout_debug_rect(ui, layout.center").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("paint_layout_debug_rect(ui, layout.staged_rect").as_str())
                 || implementation_source.contains(
-                    "paint_layout_debug_rect(\n            ui,\n            layout.staged_rect"
+                    source_token(
+                        "paint_layout_debug_rect(\n            ui,\n            layout.staged_rect"
+                    )
+                    .as_str()
                 )
         );
-        assert!(implementation_source.contains("paint_layout_debug_rect(ui, layout.commit_rect"));
+        assert!(
+            implementation_source
+                .contains(source_token("paint_layout_debug_rect(ui, layout.commit_rect").as_str())
+        );
     }
 
     #[test]
@@ -39861,8 +40633,13 @@ mod ui_tests {
     #[test]
     fn ai_settings_validation_exercises_commit_generation_protocol() {
         let source = include_str!("app.rs");
-        let validation = source.split("fn test_ai_provider_settings(").nth(1).unwrap()
-            .split("fn validate_llm_model_settings(").next().unwrap();
+        let validation = source
+            .split("fn test_ai_provider_settings(")
+            .nth(1)
+            .unwrap()
+            .split("fn validate_llm_model_settings(")
+            .next()
+            .unwrap();
         assert!(validation.contains("crate::commit_ai::test_provider"));
         assert!(!validation.contains("Reply with OK"));
     }
@@ -41129,7 +41906,8 @@ mod ui_tests {
     #[test]
     fn commit_subject_summary_is_limited_to_two_rows_with_full_hover_content() {
         let ctx = egui::Context::default();
-        let subject = "Merge branch 'feature/用户信息模块' of https://example.com/team/project ".repeat(20);
+        let subject =
+            "Merge branch 'feature/用户信息模块' of https://example.com/team/project ".repeat(20);
         for scale in [1.0, 1.5, 2.0] {
             ctx.set_pixels_per_point(scale);
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -41148,17 +41926,21 @@ mod ui_tests {
                             assert!(ui.min_rect().bottom() - top <= galley.size().y + 1.0);
                         });
                     }
-                    let short = ui.fonts(|fonts| {
-                        fonts.layout_job(commit_subject_layout(ui, "fix: typo"))
-                    });
+                    let short =
+                        ui.fonts(|fonts| fonts.layout_job(commit_subject_layout(ui, "fix: typo")));
                     assert_eq!(short.rows.len(), 1);
                     assert!(!short.elided);
                 });
             });
         }
         let source = include_str!("app.rs");
-        let helper = source.split("fn commit_summary_subject(").nth(1).unwrap()
-            .split("fn commit_summary_branches(").next().unwrap();
+        let helper = source
+            .split("fn commit_summary_subject(")
+            .nth(1)
+            .unwrap()
+            .split("fn commit_summary_branches(")
+            .next()
+            .unwrap();
         assert_eq!(helper.matches(".on_hover_ui(").count(), 1);
         assert!(!helper.contains("Label::new(galley)"));
         assert!(helper.contains("commit_text_with_links_ui(ui, value, rules, true)"));
@@ -41189,17 +41971,21 @@ mod ui_tests {
                             assert!(response.rect.height() <= galley.size().y + 1.0);
                         });
                     }
-                    let short = ui.fonts(|fonts| {
-                        fonts.layout_job(commit_branches_layout("main", 240.0))
-                    });
+                    let short =
+                        ui.fonts(|fonts| fonts.layout_job(commit_branches_layout("main", 240.0)));
                     assert_eq!(short.rows.len(), 1);
                     assert!(!short.elided);
                 });
             });
         }
         let source = include_str!("app.rs");
-        let helper = source.split("fn commit_summary_branches(").nth(1).unwrap()
-            .split("fn commit_summary_icon(").next().unwrap();
+        let helper = source
+            .split("fn commit_summary_branches(")
+            .nth(1)
+            .unwrap()
+            .split("fn commit_summary_icon(")
+            .next()
+            .unwrap();
         assert!(helper.contains(".on_hover_ui("));
         assert_eq!(helper.matches(".on_hover_ui(").count(), 1);
         assert!(helper.contains("ui.painter().galley("));
@@ -41219,22 +42005,45 @@ mod ui_tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let rect = Rect::from_min_size(ui.cursor().min, Vec2::new(400.0, 36.0));
                     let mut query = "usePinService".to_owned();
-                    let response = ui.put(rect, themed_singleline_text_edit(&mut query, "搜索提交")
-                        .desired_width(rect.width()).min_size(rect.size()).vertical_align(Align::Center));
+                    let response = ui.put(
+                        rect,
+                        themed_singleline_text_edit(&mut query, "搜索提交")
+                            .desired_width(rect.width())
+                            .min_size(rect.size())
+                            .vertical_align(Align::Center),
+                    );
                     assert!((response.rect.height() - 36.0).abs() <= 0.5 / scale);
                 });
             });
         }
         let (_sender, receiver) = mpsc::channel();
         let cancelled = std::sync::Arc::new(AtomicBool::new(false));
-        drop(FileSearchTask { root: PathBuf::from("test-repo"), cancelled: cancelled.clone(), timed_out: false, receiver });
+        drop(FileSearchTask {
+            root: PathBuf::from("test-repo"),
+            cancelled: cancelled.clone(),
+            timed_out: false,
+            receiver,
+        });
         assert!(cancelled.load(Ordering::Relaxed));
         let source = include_str!("app.rs");
-        let poll = source.split("if let Some(mut task) = self.file_search_task.take()").nth(1).unwrap()
-            .split("if let Some(receiver) = self.blame_task.take()").next().unwrap();
-        for token in ["self.active_repo_root_matches(&task.root)", "self.file_search_complete = finished",
-            "task.timed_out = true", "task.cancelled.store(true", "self.file_search_task = Some(task)",
-            "search.timeout", "search.disconnected"] { assert!(poll.contains(token), "{token}"); }
+        let poll = source
+            .split("if let Some(mut task) = self.file_search_task.take()")
+            .nth(1)
+            .unwrap()
+            .split("if let Some(receiver) = self.blame_task.take()")
+            .next()
+            .unwrap();
+        for token in [
+            "self.active_repo_root_matches(&task.root)",
+            "self.file_search_complete = finished",
+            "task.timed_out = true",
+            "task.cancelled.store(true",
+            "self.file_search_task = Some(task)",
+            "search.timeout",
+            "search.disconnected",
+        ] {
+            assert!(poll.contains(token), "{token}");
+        }
         for language in [Language::Chinese, Language::English] {
             assert_ne!(i18n::t(language, "search.timeout"), "search.timeout");
         }
@@ -41254,8 +42063,14 @@ mod ui_tests {
         assert!(search_source.contains("search_dimension_dropdown("));
         assert!(search_source.contains("search_submit_button("));
         assert!(search_source.contains("file_search_busy"));
-        let cancel_start = search_source.find("let task = self.file_search_task.as_ref().unwrap();").unwrap();
-        let cancel_source = &search_source[cancel_start..search_source[cancel_start..].find("ui.ctx().request_repaint_after").unwrap() + cancel_start];
+        let cancel_start = search_source
+            .find("let task = self.file_search_task.as_ref().unwrap();")
+            .unwrap();
+        let cancel_source = &search_source[cancel_start
+            ..search_source[cancel_start..]
+                .find("ui.ctx().request_repaint_after")
+                .unwrap()
+                + cancel_start];
         assert!(cancel_source.contains("text_action_button("));
         assert!(cancel_source.contains("self.tr(\"search.cancel\")"));
         assert!(cancel_source.contains("!task.cancelled.load(Ordering::Relaxed)"));
@@ -41329,15 +42144,20 @@ mod ui_tests {
 
     #[test]
     fn file_history_navigation_uses_exact_full_path_search() {
-        assert!(file_search_query_looks_like_path("src/views/user/index.vue"));
-        assert!(file_search_query_looks_like_path("src\\views\\user\\index.vue"));
+        assert!(file_search_query_looks_like_path(
+            "src/views/user/index.vue"
+        ));
+        assert!(file_search_query_looks_like_path(
+            "src\\views\\user\\index.vue"
+        ));
         assert!(!file_search_query_looks_like_path("index.vue"));
 
         let source = include_str!("app.rs");
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let open_start = implementation.find("fn open_file_history(").unwrap();
         let open_end = implementation[open_start..]
-            .find("fn queue_file_history(").unwrap();
+            .find("fn queue_file_history(")
+            .unwrap();
         let open = &implementation[open_start..open_start + open_end];
         for required in [
             "self.reset_search_view_state()",
@@ -41365,7 +42185,8 @@ mod ui_tests {
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let reset_start = implementation.find("fn reset_search_view_state(").unwrap();
         let reset_end = implementation[reset_start..]
-            .find("fn enter_search_view(").unwrap();
+            .find("fn enter_search_view(")
+            .unwrap();
         let reset = &implementation[reset_start..reset_start + reset_end];
         for required in [
             "self.search_view_query.clear()",
@@ -41379,16 +42200,20 @@ mod ui_tests {
             assert!(reset.contains(required), "{required}");
         }
 
-        let load_start = implementation.find("fn load_repository_with_cache_mode(").unwrap();
+        let load_start = implementation
+            .find("fn load_repository_with_cache_mode(")
+            .unwrap();
         let load_end = implementation[load_start..]
-            .find("fn spawn_repository_snapshot_load(").unwrap();
+            .find("fn spawn_repository_snapshot_load(")
+            .unwrap();
         let load = &implementation[load_start..load_start + load_end];
         assert!(load.contains("if repository_transition"));
         assert!(load.contains("self.reset_search_view_state();"));
 
         let enter_start = implementation.find("fn enter_search_view(").unwrap();
         let enter_end = implementation[enter_start..]
-            .find("fn open_file_history(").unwrap();
+            .find("fn open_file_history(")
+            .unwrap();
         let enter = &implementation[enter_start..enter_start + enter_end];
         assert!(enter.contains("if self.active_view != MainView::Search"));
         assert!(enter.contains("self.reset_search_view_state();"));
@@ -41682,21 +42507,25 @@ mod ui_tests {
 
     #[test]
     fn history_cherry_pick_checkboxes_use_shadow_not_border() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let checkbox_start = implementation_source
-            .find("fn history_cherry_pick_checkbox_at(")
+            .find(source_token("fn history_cherry_pick_checkbox_at(").as_str())
             .unwrap();
         let checkbox_end = implementation_source[checkbox_start..]
-            .find("#[derive(Clone, Copy, Debug)]\nstruct SearchColumnWidths")
+            .find(source_token("#[derive(Clone, Copy, Debug)]\nstruct SearchColumnWidths").as_str())
             .unwrap();
         let checkbox_source = &implementation_source[checkbox_start..checkbox_start + checkbox_end];
 
-        assert!(checkbox_source.contains("paint_action_checkbox_square("));
-        assert!(checkbox_source.contains("on_hover_cursor(egui::CursorIcon::PointingHand)"));
-        assert!(!checkbox_source.contains("rect_stroke("));
-        assert!(!checkbox_source.contains("StrokeKind::Inside"));
-        assert!(!checkbox_source.contains("theme::muted()"));
+        assert!(checkbox_source.contains(source_token("paint_action_checkbox_square(").as_str()));
+        assert!(
+            checkbox_source
+                .contains(source_token("on_hover_cursor(egui::CursorIcon::PointingHand)").as_str())
+        );
+        assert!(!checkbox_source.contains(source_token("rect_stroke(").as_str()));
+        assert!(!checkbox_source.contains(source_token("StrokeKind::Inside").as_str()));
+        assert!(!checkbox_source.contains(source_token("theme::muted()").as_str()));
     }
 
     #[test]
@@ -41791,8 +42620,8 @@ mod ui_tests {
         let legacy: RepoCommitState = serde_json::from_str("{}").unwrap();
         assert!(legacy.commit_text_links.is_empty());
 
-        let source = include_str!("app.rs");
-        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation = &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         for needle in [
             "pending_commit_text_link: Option<CommitTextLinkDialog>",
             "self.commit_text_link_modal(ctx);",
@@ -41805,96 +42634,139 @@ mod ui_tests {
             "commit_text_with_links_ui(",
             "ui.ctx().open_url(egui::OpenUrl::new_tab(url))",
         ] {
-            assert!(implementation.contains(needle), "missing {needle}");
+            assert!(
+                implementation.contains(source_token(needle).as_str()),
+                "missing {needle}"
+            );
         }
         let panel_start = implementation
-            .find("fn repo_settings_commit_links_panel(")
+            .find(source_token("fn repo_settings_commit_links_panel(").as_str())
             .unwrap();
         let panel_end = implementation[panel_start..]
-            .find("#[derive(Clone, Debug)]\nenum WorktreeMenuAction")
+            .find(source_token("#[derive(Clone, Debug)]\nenum WorktreeMenuAction").as_str())
             .unwrap();
         let panel = &implementation[panel_start..panel_start + panel_end];
-        assert!(panel.matches("inline_text_action_button(").count() >= 3);
-        assert!(!panel.contains("false,\n                    false,"));
+        assert!(
+            panel
+                .matches(source_token("inline_text_action_button(").as_str())
+                .count()
+                >= 3
+        );
+        assert!(!panel.contains(source_token("false,\n                    false,").as_str()));
     }
 
     #[test]
     fn commit_message_draft_is_scoped_per_repository_branch() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let fields_start = implementation_source
-            .find("pub struct GitAgentApp")
+            .find(source_token("pub struct GitAgentApp").as_str())
             .unwrap();
         let fields_end = implementation_source[fields_start..]
-            .find("#[derive(Clone, Debug)]\nstruct RepoTab")
+            .find(source_token("#[derive(Clone, Debug)]\nstruct RepoTab").as_str())
             .unwrap();
         let fields_source = &implementation_source[fields_start..fields_start + fields_end];
-        assert!(fields_source.contains("commit_message_drafts: HashMap<String, String>"));
-        assert!(implementation_source.contains("draft_message: String"));
         assert!(
-            implementation_source.contains("draft_messages_by_branch: BTreeMap<String, String>")
+            fields_source
+                .contains(source_token("commit_message_drafts: HashMap<String, String>").as_str())
+        );
+        assert!(implementation_source.contains(source_token("draft_message: String").as_str()));
+        assert!(
+            implementation_source.contains(
+                source_token("draft_messages_by_branch: BTreeMap<String, String>").as_str()
+            )
+        );
+        assert!(implementation_source.contains(
+            source_token("fn commit_message_draft_key(path: &Path, branch: &str)").as_str()
+        ));
+        assert!(
+            implementation_source
+                .contains(source_token("fn save_commit_message_draft_for_active_repo(").as_str())
         );
         assert!(
             implementation_source
-                .contains("fn commit_message_draft_key(path: &Path, branch: &str)")
+                .contains(source_token("fn load_commit_message_draft_for_active_repo(").as_str())
         );
-        assert!(implementation_source.contains("fn save_commit_message_draft_for_active_repo("));
-        assert!(implementation_source.contains("fn load_commit_message_draft_for_active_repo("));
-        assert!(implementation_source.contains("fn save_commit_message_draft_for_branch("));
-        assert!(implementation_source.contains("fn load_commit_message_draft_for_branch("));
+        assert!(
+            implementation_source
+                .contains(source_token("fn save_commit_message_draft_for_branch(").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("fn load_commit_message_draft_for_branch(").as_str())
+        );
 
         let load_start = implementation_source
-            .find("fn load_repository_with_cache_mode(")
+            .find(source_token("fn load_repository_with_cache_mode(").as_str())
             .unwrap();
         let load_end = implementation_source[load_start..]
-            .find("fn spawn_repository_snapshot_load(")
+            .find(source_token("fn spawn_repository_snapshot_load(").as_str())
             .unwrap();
         let load_source = &implementation_source[load_start..load_start + load_end];
-        assert!(load_source.contains("self.save_commit_message_draft_for_active_repo();"));
-        assert!(load_source.contains("self.load_commit_message_draft_for_active_repo();"));
+        assert!(
+            load_source.contains(
+                source_token("self.save_commit_message_draft_for_active_repo();").as_str()
+            )
+        );
+        assert!(
+            load_source.contains(
+                source_token("self.load_commit_message_draft_for_active_repo();").as_str()
+            )
+        );
         assert!(
             load_source
-                .find("self.save_commit_message_draft_for_active_repo();")
+                .find(source_token("self.save_commit_message_draft_for_active_repo();").as_str())
                 .unwrap()
                 < load_source
-                    .find("self.ensure_repo_tab(path.clone());")
+                    .find(source_token("self.ensure_repo_tab(path.clone());").as_str())
                     .unwrap()
         );
         assert!(
             load_source
-                .find("self.load_commit_message_draft_for_active_repo();")
+                .find(source_token("self.load_commit_message_draft_for_active_repo();").as_str())
                 .unwrap()
                 > load_source
-                    .find("self.load_commit_state_for_active_repo();")
+                    .find(source_token("self.load_commit_state_for_active_repo();").as_str())
                     .unwrap()
         );
 
-        let switch_start = implementation_source.find("fn switch_repo_tab(").unwrap();
+        let switch_start = implementation_source
+            .find(source_token("fn switch_repo_tab(").as_str())
+            .unwrap();
         let switch_end = implementation_source[switch_start..]
-            .find("fn switch_to_next_tab(")
+            .find(source_token("fn switch_to_next_tab(").as_str())
             .unwrap();
         let switch_source = &implementation_source[switch_start..switch_start + switch_end];
-        assert!(switch_source.contains("self.load_repository(tab.root);"));
-        assert!(!switch_source.contains("self.active_repo_tab = Some(index);"));
+        assert!(switch_source.contains(source_token("self.load_repository(tab.root);").as_str()));
         assert!(
-            load_source.contains("if !self.active_repo_root_matches(&path)"),
+            !switch_source.contains(source_token("self.active_repo_tab = Some(index);").as_str())
+        );
+        assert!(
+            load_source.contains(source_token("if !self.active_repo_root_matches(&path)").as_str()),
             "the common loader must not overwrite a target draft after callers activate it"
         );
 
         let commit_start = implementation_source
-            .find("fn commit_current_message(&mut self")
+            .find(source_token("fn commit_current_message(&mut self").as_str())
             .unwrap();
         let commit_end = implementation_source[commit_start..]
-            .find("fn show_toast(")
+            .find(source_token("fn show_toast(").as_str())
             .unwrap();
         let commit_source = &implementation_source[commit_start..commit_start + commit_end];
-        assert!(commit_source.contains("self.commit_message.clear();"));
-        assert!(commit_source.contains("self.save_commit_message_draft_for_active_repo();"));
+        assert!(commit_source.contains(source_token("self.commit_message.clear();").as_str()));
+        assert!(
+            commit_source.contains(
+                source_token("self.save_commit_message_draft_for_active_repo();").as_str()
+            )
+        );
         assert!(
             commit_source
-                .find("self.save_commit_message_draft_for_active_repo();")
+                .find(source_token("self.save_commit_message_draft_for_active_repo();").as_str())
                 .unwrap()
-                > commit_source.find("self.commit_message.clear();").unwrap()
+                > commit_source
+                    .find(source_token("self.commit_message.clear();").as_str())
+                    .unwrap()
         );
     }
 
@@ -42106,7 +42978,9 @@ mod ui_tests {
         assert!(implementation_source.contains("COMMIT_MESSAGE_BOTTOM_GAP"));
         assert!(panel_source.contains("commit_action_row_rect(ui.max_rect())"));
         assert!(panel_source.contains("max_rect(action_row_rect)"));
-        assert!(!panel_source.contains("ui.add_space(\n                    (ui.available_height()"));
+        assert!(
+            !panel_source.contains("ui.add_space(\n                    (ui.available_height()")
+        );
         assert!(panel_source.contains("commit_action_row("));
         assert!(
             !panel_source.contains("ui.add_space(6.0);\r\n                ui.horizontal(|ui|")
@@ -42118,9 +42992,12 @@ mod ui_tests {
     fn long_commit_messages_scroll_inside_the_editor_instead_of_moving_the_action_row() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
-        let editor_start = implementation_source.find("fn commit_message_editor_ui(").unwrap();
+        let editor_start = implementation_source
+            .find("fn commit_message_editor_ui(")
+            .unwrap();
         let editor_end = implementation_source[editor_start..]
-            .find("fn commit_submit_button(").unwrap();
+            .find("fn commit_submit_button(")
+            .unwrap();
         let editor_source = &implementation_source[editor_start..editor_start + editor_end];
         assert!(editor_source.contains("ScrollArea::vertical()"));
         assert!(editor_source.contains(".id_salt(id.with(\"scroll\"))"));
@@ -42772,101 +43649,173 @@ mod ui_tests {
 
     #[test]
     fn workspace_repository_quick_panel_uses_workspace_tabs_and_cached_status() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let app_start = implementation_source
-            .find("pub struct GitAgentApp")
+            .find(source_token("pub struct GitAgentApp").as_str())
             .unwrap();
         let app_end = implementation_source[app_start..]
-            .find("#[derive(Clone, Debug)]")
+            .find(source_token("#[derive(Clone, Debug)]").as_str())
             .unwrap();
         let app_source = &implementation_source[app_start..app_start + app_end];
-        let layout_start = implementation_source.find("fn main_layout(").unwrap();
+        let layout_start = implementation_source
+            .find(source_token("fn main_layout(").as_str())
+            .unwrap();
         let layout_end = implementation_source[layout_start..]
-            .find("fn top_bar(")
+            .find(source_token("fn top_bar(").as_str())
             .unwrap();
         let layout_source = &implementation_source[layout_start..layout_start + layout_end];
         let panel_start = implementation_source
-            .find("fn workspace_repositories_panel(")
+            .find(source_token("fn workspace_repositories_panel(").as_str())
             .unwrap();
         let panel_end = implementation_source[panel_start..]
-            .find("fn filtered_workspace_panel_repositories(")
+            .find(source_token("fn filtered_workspace_panel_repositories(").as_str())
             .unwrap();
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
         let row_start = implementation_source
-            .find("fn workspace_repository_status_row(")
+            .find(source_token("fn workspace_repository_status_row(").as_str())
             .unwrap();
         let row_end = implementation_source[row_start..]
-            .find("fn form_row(")
+            .find(source_token("fn form_row(").as_str())
             .unwrap();
         let row_source = &implementation_source[row_start..row_start + row_end];
 
-        assert!(app_source.contains("show_workspace_repositories: bool"));
-        assert!(app_source.contains("workspace_repository_search: String"));
-        assert!(app_source.contains("next_workspace_repo_status_load_at: Instant"));
-        assert!(layout_source.contains("workspace_repositories_panel("));
-        assert!(layout_source.contains("workspace_repositories_drawer_rect(full)"));
-        assert!(layout_source.contains("&& !self.repo_settings_open"));
-        assert!(layout_source.contains("workspace_repositories_drawer_should_close("));
-        assert!(layout_source.contains("workspace_repositories_drawer_at_rect("));
-        assert!(implementation_source.contains("fn workspace_repositories_drawer_shadow("));
-        assert!(implementation_source.contains("offset: [-5, 5]"));
-        assert!(layout_source.contains("main_layout_rects(\n            full,"));
-        assert!(!layout_source.contains("let main_rect ="));
-        assert!(panel_source.contains("repository_workspace_tab_strip("));
-        assert!(panel_source.contains("self.maybe_start_workspace_repository_status_load("));
-        assert!(panel_source.contains(".show_rows("));
-        assert!(panel_source.contains("WORKSPACE_REPOSITORY_ROW_HEIGHT"));
-        assert!(panel_source.contains("repositories.len()"));
-        assert!(panel_source.contains("let row_origin = ui.cursor().min"));
-        assert!(panel_source.contains("for (row_offset, index) in row_range.enumerate()"));
-        assert!(panel_source.contains("row_offset as f32 * WORKSPACE_REPOSITORY_ROW_HEIGHT"));
-        assert!(panel_source.contains("Rect::from_min_size("));
-        assert!(!panel_source.contains("missing_status_paths"));
-        assert!(!panel_source.contains("for path in missing_status_paths"));
-        assert!(panel_source.contains("load_path = Some(repository.root.clone())"));
-        assert!(panel_source.contains("self.load_repository(path)"));
-        assert!(implementation_source.contains("fn workspace_repository_snapshot_for("));
-        assert!(implementation_source.contains("paths_equal(&snapshot.root, root)"));
-        assert!(implementation_source.contains("fn workspace_repository_has_unstaged("));
-        assert!(implementation_source.contains("fn workspace_repository_display_order("));
-        assert!(implementation_source.contains("fn maybe_start_workspace_repository_status_load("));
-        assert!(implementation_source.contains("Duration::from_millis(250)"));
-        assert!(row_source.contains("snapshot.branch"));
-        assert!(row_source.contains("snapshot.unstaged.len()"));
-        assert!(row_source.contains("upstream_sync_counts(Some(snapshot))"));
-        assert!(row_source.contains("user_facing_path_string(&repository.root)"));
-        assert!(!row_source.contains("\\u{25cf}"));
-        assert!(!row_source.contains("workspace_repository_status_meta_line("));
-        assert!(!row_source.contains("workspace_repository_sync_counts_line("));
-        assert!(row_source.contains("workspace_repository_unstaged_badge_line("));
-        assert!(row_source.contains("workspace_repository_branch_sync_line("));
-        assert!(row_source.contains("workspace_repository_unstaged_color()"));
-        assert!(row_source.contains("workspace_repository_branch_badges("));
-        assert!(row_source.contains("let top_line_top = body_rect.top() + 3.0;"));
-        assert!(row_source.contains("let branch_line_top = body_rect.top() + 25.0;"));
-        assert!(row_source.contains("name_rect"));
-        assert!(!row_source.contains("sync_rect"));
-        assert!(implementation_source.contains("UiIcon::UnstagedFile"));
-        assert!(implementation_source.contains(
-            "UiIcon::UnstagedFile => egui::include_image!(\"../assets/icons/unstaged-file.svg\")"
+        assert!(app_source.contains(source_token("show_workspace_repositories: bool").as_str()));
+        assert!(app_source.contains(source_token("workspace_repository_search: String").as_str()));
+        assert!(
+            app_source
+                .contains(source_token("next_workspace_repo_status_load_at: Instant").as_str())
+        );
+        assert!(layout_source.contains(source_token("workspace_repositories_panel(").as_str()));
+        assert!(
+            layout_source
+                .contains(source_token("workspace_repositories_drawer_rect(full)").as_str())
+        );
+        assert!(layout_source.contains(source_token("&& !self.repo_settings_open").as_str()));
+        assert!(
+            layout_source
+                .contains(source_token("workspace_repositories_drawer_should_close(").as_str())
+        );
+        assert!(
+            layout_source.contains(source_token("workspace_repositories_drawer_at_rect(").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("fn workspace_repositories_drawer_shadow(").as_str())
+        );
+        assert!(implementation_source.contains(source_token("offset: [-5, 5]").as_str()));
+        assert!(
+            layout_source.contains(source_token("main_layout_rects(\n            full,").as_str())
+        );
+        assert!(!layout_source.contains(source_token("let main_rect =").as_str()));
+        assert!(panel_source.contains(source_token("repository_workspace_tab_strip(").as_str()));
+        assert!(
+            panel_source.contains(
+                source_token("self.maybe_start_workspace_repository_status_load(").as_str()
+            )
+        );
+        assert!(panel_source.contains(source_token(".show_rows(").as_str()));
+        assert!(panel_source.contains(source_token("WORKSPACE_REPOSITORY_ROW_HEIGHT").as_str()));
+        assert!(panel_source.contains(source_token("repositories.len()").as_str()));
+        assert!(panel_source.contains(source_token("let row_origin = ui.cursor().min").as_str()));
+        assert!(
+            panel_source.contains(
+                source_token("for (row_offset, index) in row_range.enumerate()").as_str()
+            )
+        );
+        assert!(panel_source.contains(
+            source_token("row_offset as f32 * WORKSPACE_REPOSITORY_ROW_HEIGHT").as_str()
         ));
-        assert!(row_source.contains("WORKSPACE_REPOSITORY_ROW_HEIGHT"));
-        assert!(row_source.contains("ui.interact("));
-        assert!(!row_source.contains("allocate_exact_size("));
-        assert!(!row_source.contains("ui.advance_cursor_after_rect(rect)"));
-        assert!(row_source.contains("workspace_repository_row_body_rect(rect)"));
-        assert!(row_source.contains("body_rect.left()"));
-        assert!(row_source.contains("body_rect.top()"));
-        assert!(row_source.contains("paint_workspace_repository_row_debug_guides("));
-        assert!(row_source.contains("workspace_repository_text_line("));
-        assert!(row_source.contains("let path_rect = Rect::from_min_max("));
-        assert!(row_source.contains("workspace_repository_path_text_line("));
-        assert!(row_source.contains("workspace_repository_row_hover_rect(rect)"));
-        assert!(row_source.contains("elide_end_to_width("));
-        assert!(row_source.contains("with_clip_rect"));
-        assert!(!row_source.contains("rect.shrink2(Vec2::new(1.0, 2.0))"));
-        assert!(!row_source.contains("line_rect(44.0, 62.0)"));
+        assert!(panel_source.contains(source_token("Rect::from_min_size(").as_str()));
+        assert!(!panel_source.contains(source_token("missing_status_paths").as_str()));
+        assert!(!panel_source.contains(source_token("for path in missing_status_paths").as_str()));
+        assert!(
+            panel_source
+                .contains(source_token("load_path = Some(repository.root.clone())").as_str())
+        );
+        assert!(panel_source.contains(source_token("self.load_repository(path)").as_str()));
+        assert!(
+            implementation_source
+                .contains(source_token("fn workspace_repository_snapshot_for(").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("paths_equal(&snapshot.root, root)").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("fn workspace_repository_has_unstaged(").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("fn workspace_repository_display_order(").as_str())
+        );
+        assert!(
+            implementation_source.contains(
+                source_token("fn maybe_start_workspace_repository_status_load(").as_str()
+            )
+        );
+        assert!(
+            implementation_source.contains(source_token("Duration::from_millis(250)").as_str())
+        );
+        assert!(row_source.contains(source_token("snapshot.branch").as_str()));
+        assert!(row_source.contains(source_token("snapshot.unstaged.len()").as_str()));
+        assert!(row_source.contains(source_token("upstream_sync_counts(Some(snapshot))").as_str()));
+        assert!(
+            row_source.contains(source_token("user_facing_path_string(&repository.root)").as_str())
+        );
+        assert!(!row_source.contains(source_token("\\u{25cf}").as_str()));
+        assert!(
+            !row_source.contains(source_token("workspace_repository_status_meta_line(").as_str())
+        );
+        assert!(
+            !row_source.contains(source_token("workspace_repository_sync_counts_line(").as_str())
+        );
+        assert!(
+            row_source.contains(source_token("workspace_repository_unstaged_badge_line(").as_str())
+        );
+        assert!(
+            row_source.contains(source_token("workspace_repository_branch_sync_line(").as_str())
+        );
+        assert!(
+            row_source.contains(source_token("workspace_repository_unstaged_color()").as_str())
+        );
+        assert!(row_source.contains(source_token("workspace_repository_branch_badges(").as_str()));
+        assert!(
+            row_source.contains(source_token("let top_line_top = body_rect.top() + 3.0;").as_str())
+        );
+        assert!(
+            row_source
+                .contains(source_token("let branch_line_top = body_rect.top() + 25.0;").as_str())
+        );
+        assert!(row_source.contains(source_token("name_rect").as_str()));
+        assert!(!row_source.contains(source_token("sync_rect").as_str()));
+        assert!(implementation_source.contains(source_token("UiIcon::UnstagedFile").as_str()));
+        assert!(implementation_source.contains(source_token("UiIcon::UnstagedFile => egui::include_image!(\"../assets/icons/unstaged-file.svg\")").as_str()));
+        assert!(row_source.contains(source_token("WORKSPACE_REPOSITORY_ROW_HEIGHT").as_str()));
+        assert!(row_source.contains(source_token("ui.interact(").as_str()));
+        assert!(!row_source.contains(source_token("allocate_exact_size(").as_str()));
+        assert!(!row_source.contains(source_token("ui.advance_cursor_after_rect(rect)").as_str()));
+        assert!(
+            row_source.contains(source_token("workspace_repository_row_body_rect(rect)").as_str())
+        );
+        assert!(row_source.contains(source_token("body_rect.left()").as_str()));
+        assert!(row_source.contains(source_token("body_rect.top()").as_str()));
+        assert!(
+            row_source
+                .contains(source_token("paint_workspace_repository_row_debug_guides(").as_str())
+        );
+        assert!(row_source.contains(source_token("workspace_repository_text_line(").as_str()));
+        assert!(row_source.contains(source_token("let path_rect = Rect::from_min_max(").as_str()));
+        assert!(row_source.contains(source_token("workspace_repository_path_text_line(").as_str()));
+        assert!(
+            row_source.contains(source_token("workspace_repository_row_hover_rect(rect)").as_str())
+        );
+        assert!(row_source.contains(source_token("elide_end_to_width(").as_str()));
+        assert!(row_source.contains(source_token("with_clip_rect").as_str()));
+        assert!(!row_source.contains(source_token("rect.shrink2(Vec2::new(1.0, 2.0))").as_str()));
+        assert!(!row_source.contains(source_token("line_rect(44.0, 62.0)").as_str()));
 
         let desktop = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 760.0));
         let drawer = workspace_repositories_drawer_rect(desktop);
@@ -42883,18 +43832,26 @@ mod ui_tests {
         assert!(hover.top() >= row.top());
         assert!(hover.bottom() <= row.bottom());
         assert!(row.bottom() - hover.bottom() <= 1.0);
-        assert!(implementation_source.contains("fn paint_workspace_repository_row_debug_guides("));
         assert!(
-            implementation_source.contains("paint_layout_debug_rect(ui, row_rect, \"repo.row\"")
+            implementation_source
+                .contains(source_token("fn paint_workspace_repository_row_debug_guides(").as_str())
         );
         assert!(
-            implementation_source.contains("paint_layout_debug_rect(ui, body_rect, \"repo.body\"")
+            implementation_source.contains(
+                source_token("paint_layout_debug_rect(ui, row_rect, \"repo.row\"").as_str()
+            )
         );
-        assert!(implementation_source.contains("workspace_repository_debug_line("));
-        assert!(implementation_source.contains("repo.row.top"));
-        assert!(implementation_source.contains("\"repo.row.bottom\""));
-        assert!(implementation_source.contains("\"repo.body.top\""));
-        assert!(implementation_source.contains("\"repo.body.bottom\""));
+        assert!(implementation_source.contains(
+            source_token("paint_layout_debug_rect(ui, body_rect, \"repo.body\"").as_str()
+        ));
+        assert!(
+            implementation_source
+                .contains(source_token("workspace_repository_debug_line(").as_str())
+        );
+        assert!(implementation_source.contains(source_token("repo.row.top").as_str()));
+        assert!(implementation_source.contains(source_token("\"repo.row.bottom\"").as_str()));
+        assert!(implementation_source.contains(source_token("\"repo.body.top\"").as_str()));
+        assert!(implementation_source.contains(source_token("\"repo.body.bottom\"").as_str()));
     }
 
     #[test]
@@ -45257,13 +46214,14 @@ mod ui_tests {
 
     #[test]
     fn interactive_rebase_reword_modal_uses_a_self_contained_nested_surface() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let modal_start = implementation_source
-            .find("fn interactive_rebase_reword_modal(")
+            .find(source_token("fn interactive_rebase_reword_modal(").as_str())
             .unwrap();
         let modal_end = implementation_source[modal_start..]
-            .find("fn rebase_control_modal(")
+            .find(source_token("fn rebase_control_modal(").as_str())
             .unwrap();
         let modal_source = &implementation_source[modal_start..modal_start + modal_end];
 
@@ -45275,7 +46233,10 @@ mod ui_tests {
             "TextEdit::multiline(message)\n                                                .frame(false)",
             "dialog_cancel_button(",
         ] {
-            assert!(modal_source.contains(required), "{required}");
+            assert!(
+                modal_source.contains(source_token(required).as_str()),
+                "{required}"
+            );
         }
     }
 
@@ -46265,8 +47226,13 @@ mod ui_tests {
         fn over(foreground: Color32, background: Color32) -> Color32 {
             let [r, g, b, a] = foreground.to_srgba_unmultiplied();
             let alpha = a as f32 / 255.0;
-            let channel = |fg: u8, bg: u8| (fg as f32 * alpha + bg as f32 * (1.0 - alpha)).round() as u8;
-            Color32::from_rgb(channel(r, background.r()), channel(g, background.g()), channel(b, background.b()))
+            let channel =
+                |fg: u8, bg: u8| (fg as f32 * alpha + bg as f32 * (1.0 - alpha)).round() as u8;
+            Color32::from_rgb(
+                channel(r, background.r()),
+                channel(g, background.g()),
+                channel(b, background.b()),
+            )
         }
 
         for mode in [theme::ThemeMode::Light, theme::ThemeMode::Dark] {
@@ -46421,22 +47387,26 @@ mod ui_tests {
             std::cmp::Ordering::Less
         );
 
-        let source = include_str!("app.rs");
+        let source = source_token(include_str!("app.rs"));
         let filter_start = source
-            .find("fn filtered_workspace_panel_repositories(")
+            .find(source_token("fn filtered_workspace_panel_repositories(").as_str())
             .unwrap();
         let filter_end = source[filter_start..]
-            .find("fn workspace_repository_snapshot_for(")
+            .find(source_token("fn workspace_repository_snapshot_for(").as_str())
             .unwrap();
         let filter_source = &source[filter_start..filter_start + filter_end];
-        assert!(filter_source.contains("repositories.sort_by("));
-        assert!(filter_source.contains("self.workspace_repository_has_unstaged(&repository.root)"));
-        let sort_start = filter_source.find("repositories.sort_by(").unwrap();
+        assert!(filter_source.contains(source_token("repositories.sort_by(").as_str()));
+        assert!(filter_source.contains(
+            source_token("self.workspace_repository_has_unstaged(&repository.root)").as_str()
+        ));
+        let sort_start = filter_source
+            .find(source_token("repositories.sort_by(").as_str())
+            .unwrap();
         let sort_end = filter_source[sort_start..]
-            .find("repositories\n            .into_iter()")
+            .find(source_token("repositories\n            .into_iter()").as_str())
             .unwrap();
         let sort_source = &filter_source[sort_start..sort_start + sort_end];
-        assert!(!sort_source.contains("workspace_repository_has_unstaged"));
+        assert!(!sort_source.contains(source_token("workspace_repository_has_unstaged").as_str()));
     }
 
     #[test]
@@ -46739,13 +47709,14 @@ mod ui_tests {
 
     #[test]
     fn every_in_app_file_diff_uses_the_shared_fill_scroll_area() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         assert_eq!(
             implementation_source
-                .matches("fill_diff_scroll_area(")
+                .matches(source_token("fill_diff_scroll_area(").as_str())
                 .count(),
-            6
+            7
         );
         for salt in [
             "commit_diff_scroll",
@@ -47230,13 +48201,16 @@ mod ui_tests {
 
     #[test]
     fn action_modals_submit_default_action_on_enter() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
-        assert!(implementation_source.contains("fn dialog_default_submit_requested("));
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         assert!(
             implementation_source
-                .contains("input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)")
+                .contains(source_token("fn dialog_default_submit_requested(").as_str())
         );
+        assert!(implementation_source.contains(
+            source_token("input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)").as_str()
+        ));
 
         for (start, end) in [
             ("fn fetch_action_modal(", "fn pull_current("),
@@ -47255,28 +48229,28 @@ mod ui_tests {
             ("fn repo_remote_action_modal(", "fn remote_settings_table("),
         ] {
             let modal_start = implementation_source
-                .find(start)
+                .find(source_token(start).as_str())
                 .unwrap_or_else(|| panic!("{start}"));
             let modal_end = implementation_source[modal_start..]
-                .find(end)
+                .find(source_token(end).as_str())
                 .unwrap_or_else(|| panic!("{end}"));
             let modal_source = &implementation_source[modal_start..modal_start + modal_end];
             assert!(
-                modal_source.contains("dialog_default_submit_requested(ui)"),
+                modal_source.contains(source_token("dialog_default_submit_requested(ui)").as_str()),
                 "{start} should submit its default action on Enter"
             );
         }
 
         let conflict_start = implementation_source
-            .find(
-                "WorktreeActionDialog::ResolveConflicts {\n                selected_path,\n                select_after_refresh,\n            } =>",
-            )
+            .find(source_token("WorktreeActionDialog::ResolveConflicts {\n                selected_path,\n                select_after_refresh,\n            } =>").as_str())
             .unwrap();
         let conflict_end = implementation_source[conflict_start..]
-            .find("fn archive_action_modal(")
+            .find(source_token("fn archive_action_modal(").as_str())
             .unwrap();
         let conflict_source = &implementation_source[conflict_start..conflict_start + conflict_end];
-        assert!(!conflict_source.contains("dialog_default_submit_requested(ui)"));
+        assert!(
+            !conflict_source.contains(source_token("dialog_default_submit_requested(ui)").as_str())
+        );
     }
 
     #[test]
@@ -47771,14 +48745,15 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn background_patterns_map_every_accent_and_are_user_toggleable() {
-        let source = include_str!("app.rs");
-        let cargo_manifest = include_str!("../Cargo.toml");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let cargo_manifest = source_token(include_str!("../Cargo.toml"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let pattern_start = implementation_source
-            .find("fn background_pattern_source(")
+            .find(source_token("fn background_pattern_source(").as_str())
             .unwrap();
         let pattern_end = implementation_source[pattern_start..]
-            .find("fn resource_header(")
+            .find(source_token("fn resource_header(").as_str())
             .unwrap();
         let pattern_source = &implementation_source[pattern_start..pattern_start + pattern_end];
         for asset in [
@@ -47793,150 +48768,217 @@ diff --git a/file.txt b/file.txt
         ] {
             assert!(pattern_source.contains(asset), "missing {asset}");
         }
-        assert!(pattern_source.contains("theme::pattern_accent(mode, accent)"));
-        assert!(pattern_source.contains("Color32::from_black_alpha(shadow_alpha)"));
-        assert!(pattern_source.contains("TexturePoll::Ready"));
+        assert!(
+            pattern_source.contains(source_token("theme::pattern_accent(mode, accent)").as_str())
+        );
         assert!(
             pattern_source
-                .contains("const BACKGROUND_PATTERN_TEXTURE_SIZE: Vec2 = Vec2::new(180.0, 32.0)")
+                .contains(source_token("Color32::from_black_alpha(shadow_alpha)").as_str())
         );
+        assert!(pattern_source.contains(source_token("TexturePoll::Ready").as_str()));
         assert!(
-            pattern_source.contains("load_for_size(ui.ctx(), BACKGROUND_PATTERN_TEXTURE_SIZE)")
+            pattern_source.contains(
+                source_token(
+                    "const BACKGROUND_PATTERN_TEXTURE_SIZE: Vec2 = Vec2::new(180.0, 32.0)"
+                )
+                .as_str()
+            )
         );
-        assert!(implementation_source.contains("warm_background_pattern_texture("));
-        let constructor_start = implementation_source.find("pub fn new(").unwrap();
+        assert!(pattern_source.contains(
+            source_token("load_for_size(ui.ctx(), BACKGROUND_PATTERN_TEXTURE_SIZE)").as_str()
+        ));
+        assert!(
+            implementation_source
+                .contains(source_token("warm_background_pattern_texture(").as_str())
+        );
+        let constructor_start = implementation_source
+            .find(source_token("pub fn new(").as_str())
+            .unwrap();
         let constructor_end = implementation_source[constructor_start..]
-            .find("fn load_repository(&mut self")
+            .find(source_token("fn load_repository(&mut self").as_str())
             .unwrap();
         let constructor =
             &implementation_source[constructor_start..constructor_start + constructor_end];
         let install_loaders = constructor
-            .find("egui_extras::install_image_loaders(&cc.egui_ctx)")
+            .find(source_token("egui_extras::install_image_loaders(&cc.egui_ctx)").as_str())
             .unwrap();
         let warm_texture = constructor
-            .find("warm_background_pattern_texture(")
+            .find(source_token("warm_background_pattern_texture(").as_str())
             .unwrap();
         assert!(install_loaders < warm_texture);
-        assert!(pattern_source.contains("with_clip_rect(rect)"));
-        assert!(!pattern_source.contains("paint_at("));
-        assert!(cargo_manifest.contains("features = [\"svg\"]"));
+        assert!(pattern_source.contains(source_token("with_clip_rect(rect)").as_str()));
+        assert!(!pattern_source.contains(source_token("paint_at(").as_str()));
+        assert!(cargo_manifest.contains(source_token("features = [\"svg\"]").as_str()));
 
-        let update_start = implementation_source.find("fn update(&mut self").unwrap();
+        let update_start = implementation_source
+            .find(source_token("fn update(&mut self").as_str())
+            .unwrap();
         let update_end = implementation_source[update_start..]
-            .find("\n    }\n}\n\nimpl GitAgentApp")
+            .find(source_token("\n    }\n}\n\nimpl GitAgentApp").as_str())
             .unwrap();
         let update_source = &implementation_source[update_start..update_start + update_end];
-        assert!(!update_source.contains("paint_background_pattern("));
+        assert!(!update_source.contains(source_token("paint_background_pattern(").as_str()));
 
         let top_panel_start = implementation_source
-            .find("fn top_bar_panel(&mut self")
+            .find(source_token("fn top_bar_panel(&mut self").as_str())
             .unwrap();
         let top_panel_end = implementation_source[top_panel_start..]
-            .find("fn repository_source_view(")
+            .find(source_token("fn repository_source_view(").as_str())
             .unwrap();
         let top_panel_source =
             &implementation_source[top_panel_start..top_panel_start + top_panel_end];
-        assert!(!top_panel_source.contains("paint_background_pattern("));
+        assert!(!top_panel_source.contains(source_token("paint_background_pattern(").as_str()));
 
-        let title_start = implementation_source.find("fn custom_title_bar(").unwrap();
+        let title_start = implementation_source
+            .find(source_token("fn custom_title_bar(").as_str())
+            .unwrap();
         let title_end = implementation_source[title_start..]
-            .find("fn desktop_menu_bar(")
+            .find(source_token("fn desktop_menu_bar(").as_str())
             .unwrap();
         let title_source = &implementation_source[title_start..title_start + title_end];
-        let background_index = title_source.find(".rect_filled(rect").unwrap();
-        let pattern_rect_index = title_source.find("title_pattern_rect(").unwrap();
-        let pattern_index = title_source.find("paint_background_pattern(").unwrap();
+        let background_index = title_source
+            .find(source_token(".rect_filled(rect").as_str())
+            .unwrap();
+        let pattern_rect_index = title_source
+            .find(source_token("title_pattern_rect(").as_str())
+            .unwrap();
+        let pattern_index = title_source
+            .find(source_token("paint_background_pattern(").as_str())
+            .unwrap();
         let drag_index = title_source
-            .find("title_drag_candidate_rect(rect)")
+            .find(source_token("title_drag_candidate_rect(rect)").as_str())
             .unwrap();
         assert!(background_index < pattern_rect_index);
         assert!(pattern_rect_index < pattern_index);
         assert!(pattern_index < drag_index);
-        assert!(title_source.contains("if self.background_pattern_enabled"));
-        assert!(title_source.contains("self.title_bar_hit_map"));
+        assert!(title_source.contains(source_token("if self.background_pattern_enabled").as_str()));
+        assert!(title_source.contains(source_token("self.title_bar_hit_map").as_str()));
 
         let pattern_svgs = [
-            include_str!("../assets/patterns/sky-blue.svg"),
-            include_str!("../assets/patterns/neon-green.svg"),
-            include_str!("../assets/patterns/tempting-purple.svg"),
-            include_str!("../assets/patterns/rose-red.svg"),
-            include_str!("../assets/patterns/vitamin-c-orange.svg"),
-            include_str!("../assets/patterns/sun-red.svg"),
-            include_str!("../assets/patterns/deep-sea-blue.svg"),
-            include_str!("../assets/patterns/forest-green.svg"),
+            source_token(include_str!("../assets/patterns/sky-blue.svg")),
+            source_token(include_str!("../assets/patterns/neon-green.svg")),
+            source_token(include_str!("../assets/patterns/tempting-purple.svg")),
+            source_token(include_str!("../assets/patterns/rose-red.svg")),
+            source_token(include_str!("../assets/patterns/vitamin-c-orange.svg")),
+            source_token(include_str!("../assets/patterns/sun-red.svg")),
+            source_token(include_str!("../assets/patterns/deep-sea-blue.svg")),
+            source_token(include_str!("../assets/patterns/forest-green.svg")),
         ];
         for svg in pattern_svgs {
-            assert!(svg.contains("width=\"360\" height=\"64\""));
-            assert!(svg.contains("transform=\"scale(.5)\""));
-            assert!(svg.contains("data-scale-pattern="));
-            assert!(svg.contains("scale(1)"));
-            assert!(svg.contains("scale(.72)"));
-            assert!(svg.contains("fill=\"#ffffff\"") || svg.contains("stroke=\"#ffffff\""));
-            assert!(!svg.contains("fill=\"#ed2c25\""));
-            assert!(!svg.contains("<path d=\"\""));
-            assert!(!svg.contains("translate(324 32)"));
+            assert!(svg.contains(source_token("width=\"360\" height=\"64\"").as_str()));
+            assert!(svg.contains(source_token("transform=\"scale(.5)\"").as_str()));
+            assert!(svg.contains(source_token("data-scale-pattern=").as_str()));
+            assert!(svg.contains(source_token("scale(1)").as_str()));
+            assert!(svg.contains(source_token("scale(.72)").as_str()));
+            assert!(
+                svg.contains(source_token("fill=\"#ffffff\"").as_str())
+                    || svg.contains(source_token("stroke=\"#ffffff\"").as_str())
+            );
+            assert!(!svg.contains(source_token("fill=\"#ed2c25\"").as_str()));
+            assert!(!svg.contains(source_token("<path d=\"\"").as_str()));
+            assert!(!svg.contains(source_token("translate(324 32)").as_str()));
         }
-        let bubble_pattern = include_str!("../assets/patterns/neon-green.svg");
-        assert!(bubble_pattern.contains("data-icon=\"single-bubble-outline\""));
-        assert_eq!(bubble_pattern.matches("<circle ").count(), 1);
-        assert_eq!(bubble_pattern.matches("<path ").count(), 2);
-        assert!(bubble_pattern.contains("fill=\"none\""));
-        assert!(bubble_pattern.contains("stroke-linecap=\"round\""));
-        let rose_pattern = include_str!("../assets/patterns/rose-red.svg");
-        assert!(rose_pattern.contains("data-icon=\"rose-outline-sparse\""));
-        assert!(rose_pattern.contains("translate(30 0) scale(1)"));
-        assert!(rose_pattern.contains("translate(120 37) scale(.72)"));
-        assert_eq!(rose_pattern.matches("<use ").count(), 4);
+        let bubble_pattern = source_token(include_str!("../assets/patterns/neon-green.svg"));
         assert!(
-            include_str!("../assets/patterns/sky-blue.svg")
-                .contains("data-icon=\"ruyi-cloud-outline\"")
+            bubble_pattern.contains(source_token("data-icon=\"single-bubble-outline\"").as_str())
         );
-        let whale_pattern = include_str!("../assets/patterns/deep-sea-blue.svg");
-        assert!(whale_pattern.contains("data-icon=\"plump-whale-no-spout\""));
-        assert!(whale_pattern.contains("translate(300 32) scale(1)"));
-        assert!(whale_pattern.contains("translate(130 5) scale(.72)"));
-        assert!(whale_pattern.contains("translate(250 2.5) scale(.86)"));
-        assert!(!whale_pattern.contains("translate(324 32)"));
+        assert_eq!(
+            bubble_pattern
+                .matches(source_token("<circle ").as_str())
+                .count(),
+            1
+        );
+        assert_eq!(
+            bubble_pattern
+                .matches(source_token("<path ").as_str())
+                .count(),
+            2
+        );
+        assert!(bubble_pattern.contains(source_token("fill=\"none\"").as_str()));
+        assert!(bubble_pattern.contains(source_token("stroke-linecap=\"round\"").as_str()));
+        let rose_pattern = source_token(include_str!("../assets/patterns/rose-red.svg"));
+        assert!(rose_pattern.contains(source_token("data-icon=\"rose-outline-sparse\"").as_str()));
+        assert!(rose_pattern.contains(source_token("translate(30 0) scale(1)").as_str()));
+        assert!(rose_pattern.contains(source_token("translate(120 37) scale(.72)").as_str()));
+        assert_eq!(
+            rose_pattern.matches(source_token("<use ").as_str()).count(),
+            4
+        );
         assert!(
-            include_str!("../assets/patterns/forest-green.svg")
-                .contains("data-icon=\"four-leaf-clover-separated-solid\"")
+            source_token(include_str!("../assets/patterns/sky-blue.svg"))
+                .contains(source_token("data-icon=\"ruyi-cloud-outline\"").as_str())
         );
-        let clover_pattern = include_str!("../assets/patterns/forest-green.svg");
-        assert!(clover_pattern.contains("data-center-gap=\"2.5\""));
-        assert_eq!(clover_pattern.matches("<path ").count(), 5);
-        assert!(pattern_source.contains("360.0 / 64.0"));
+        let whale_pattern = source_token(include_str!("../assets/patterns/deep-sea-blue.svg"));
+        assert!(
+            whale_pattern.contains(source_token("data-icon=\"plump-whale-no-spout\"").as_str())
+        );
+        assert!(whale_pattern.contains(source_token("translate(300 32) scale(1)").as_str()));
+        assert!(whale_pattern.contains(source_token("translate(130 5) scale(.72)").as_str()));
+        assert!(whale_pattern.contains(source_token("translate(250 2.5) scale(.86)").as_str()));
+        assert!(!whale_pattern.contains(source_token("translate(324 32)").as_str()));
+        assert!(
+            source_token(include_str!("../assets/patterns/forest-green.svg"))
+                .contains(source_token("data-icon=\"four-leaf-clover-separated-solid\"").as_str())
+        );
+        let clover_pattern = source_token(include_str!("../assets/patterns/forest-green.svg"));
+        assert!(clover_pattern.contains(source_token("data-center-gap=\"2.5\"").as_str()));
+        assert_eq!(
+            clover_pattern
+                .matches(source_token("<path ").as_str())
+                .count(),
+            5
+        );
+        assert!(pattern_source.contains(source_token("360.0 / 64.0").as_str()));
 
         let compact_title_start = implementation_source
-            .find("fn compact_dialog_title_bar(")
+            .find(source_token("fn compact_dialog_title_bar(").as_str())
             .unwrap();
         let compact_title_end = implementation_source[compact_title_start..]
-            .find("fn paint_dialog_title_pattern(")
+            .find(source_token("fn paint_dialog_title_pattern(").as_str())
             .unwrap();
         let compact_title_source =
             &implementation_source[compact_title_start..compact_title_start + compact_title_end];
-        assert!(compact_title_source.contains("paint_dialog_title_pattern(ui, rect)"));
+        assert!(
+            compact_title_source
+                .contains(source_token("paint_dialog_title_pattern(ui, rect)").as_str())
+        );
 
         let settings_title_start = implementation_source
-            .find("fn settings_dialog_title_row(")
+            .find(source_token("fn settings_dialog_title_row(").as_str())
             .unwrap();
         let settings_title_end = implementation_source[settings_title_start..]
-            .find("fn global_settings_dialog_width(")
+            .find(source_token("fn global_settings_dialog_width(").as_str())
             .unwrap();
         let settings_title_source =
             &implementation_source[settings_title_start..settings_title_start + settings_title_end];
-        assert!(settings_title_source.contains("paint_dialog_title_pattern(ui, rect)"));
         assert!(
-            implementation_source
-                .contains("static BACKGROUND_PATTERN_ENABLED: AtomicBool = AtomicBool::new(false)")
+            settings_title_source
+                .contains(source_token("paint_dialog_title_pattern(ui, rect)").as_str())
         );
         assert!(
-            implementation_source
-                .contains("BACKGROUND_PATTERN_ENABLED.store(enabled, Ordering::Relaxed)")
+            implementation_source.contains(
+                source_token(
+                    "static BACKGROUND_PATTERN_ENABLED: AtomicBool = AtomicBool::new(false)"
+                )
+                .as_str()
+            )
         );
+        assert!(implementation_source.contains(
+            source_token("BACKGROUND_PATTERN_ENABLED.store(enabled, Ordering::Relaxed)").as_str()
+        ));
 
-        assert!(implementation_source.contains("background_pattern_enabled: bool"));
-        assert!(implementation_source.contains("background_pattern_enabled: false"));
-        assert!(implementation_source.contains("fn set_background_pattern_enabled("));
+        assert!(
+            implementation_source
+                .contains(source_token("background_pattern_enabled: bool").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("background_pattern_enabled: false").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("fn set_background_pattern_enabled(").as_str())
+        );
         assert_eq!(
             i18n::t(Language::Chinese, "settings.background_pattern"),
             "\u{80cc}\u{666f}\u{82b1}\u{7eb9}"
@@ -48186,57 +49228,79 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn pull_action_uses_dialog_with_remote_branch_and_options() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
 
-        assert!(implementation_source.contains("pending_pull_action: Option<PullActionDialog>"));
-        assert!(implementation_source.contains("struct PullActionDialog"));
-        assert!(implementation_source.contains("fn open_pull_dialog("));
-        assert!(implementation_source.contains("fn pull_action_modal("));
-        assert!(implementation_source.contains("git::pull_from_remote("));
-        assert!(implementation_source.contains("git::fetch_remote("));
+        assert!(
+            implementation_source
+                .contains(source_token("pending_pull_action: Option<PullActionDialog>").as_str())
+        );
+        assert!(implementation_source.contains(source_token("struct PullActionDialog").as_str()));
+        assert!(implementation_source.contains(source_token("fn open_pull_dialog(").as_str()));
+        assert!(implementation_source.contains(source_token("fn pull_action_modal(").as_str()));
+        assert!(implementation_source.contains(source_token("git::pull_from_remote(").as_str()));
+        assert!(implementation_source.contains(source_token("git::fetch_remote(").as_str()));
 
-        let pull_current_start = implementation_source.find("fn pull_current(").unwrap();
+        let pull_current_start = implementation_source
+            .find(source_token("fn pull_current(").as_str())
+            .unwrap();
         let pull_current_end = implementation_source[pull_current_start..]
-            .find("fn quick_pull_current(")
+            .find(source_token("fn quick_pull_current(").as_str())
             .unwrap();
         let pull_current_source =
             &implementation_source[pull_current_start..pull_current_start + pull_current_end];
-        assert!(pull_current_source.contains("self.open_pull_dialog(None);"));
+        assert!(
+            pull_current_source.contains(source_token("self.open_pull_dialog(None);").as_str())
+        );
 
-        let pull_dialog_start = implementation_source.find("fn open_pull_dialog(").unwrap();
+        let pull_dialog_start = implementation_source
+            .find(source_token("fn open_pull_dialog(").as_str())
+            .unwrap();
         let pull_dialog_end = implementation_source[pull_dialog_start..]
-            .find("fn remote_names(")
+            .find(source_token("fn remote_names(").as_str())
             .unwrap();
         let pull_dialog_source =
             &implementation_source[pull_dialog_start..pull_dialog_start + pull_dialog_end];
-        assert!(!pull_dialog_source.contains("git::pull(root)"));
+        assert!(!pull_dialog_source.contains(source_token("git::pull(root)").as_str()));
+        assert!(pull_dialog_source.contains(
+            source_token(".find(|branch| !branch.remote && branch.name == local_branch)").as_str()
+        ));
         assert!(
             pull_dialog_source
-                .contains(".find(|branch| !branch.remote && branch.name == local_branch)")
+                .contains(source_token("split_remote_branch_name(&upstream.name)").as_str())
         );
-        assert!(pull_dialog_source.contains("split_remote_branch_name(&upstream.name)"));
 
-        let toolbar_start = implementation_source.find("fn top_bar_panel(").unwrap();
+        let toolbar_start = implementation_source
+            .find(source_token("fn top_bar_panel(").as_str())
+            .unwrap();
         let toolbar_end = implementation_source[toolbar_start..]
-            .find("fn refresh_known_repositories(")
+            .find(source_token("fn refresh_known_repositories(").as_str())
             .unwrap();
         let toolbar_source = &implementation_source[toolbar_start..toolbar_start + toolbar_end];
-        assert!(toolbar_source.contains("RepoToolbarAction::Pull"));
+        assert!(toolbar_source.contains(source_token("RepoToolbarAction::Pull").as_str()));
 
         let branch_handler_start = implementation_source
-            .find("fn handle_branch_action(&mut self, action: BranchMenuAction)")
+            .find(
+                source_token("fn handle_branch_action(&mut self, action: BranchMenuAction)")
+                    .as_str(),
+            )
             .unwrap();
         let branch_handler_end = implementation_source[branch_handler_start..]
-            .find("fn handle_tag_action(")
+            .find(source_token("fn handle_tag_action(").as_str())
             .unwrap();
         let branch_handler_source =
             &implementation_source[branch_handler_start..branch_handler_start + branch_handler_end];
-        assert!(branch_handler_source.contains("self.open_pull_dialog(Some(name));"));
+        assert!(
+            branch_handler_source
+                .contains(source_token("self.open_pull_dialog(Some(name));").as_str())
+        );
 
-        let modal_start = implementation_source.find("fn pull_action_modal(").unwrap();
+        let modal_start = implementation_source
+            .find(source_token("fn pull_action_modal(").as_str())
+            .unwrap();
         let modal_end = implementation_source[modal_start..]
-            .find("fn push_action_modal(")
+            .find(source_token("fn push_action_modal(").as_str())
             .unwrap();
         let modal_source = &implementation_source[modal_start..modal_start + modal_end];
         for needle in [
@@ -48250,92 +49314,136 @@ diff --git a/file.txt b/file.txt
             "pull.rebase",
             "pull.refresh",
         ] {
-            assert!(modal_source.contains(needle));
+            assert!(modal_source.contains(source_token(needle).as_str()));
         }
-        assert!(modal_source.contains("dialog_inline_action_button("));
-        assert!(modal_source.contains("constrain_pull_push_after_pull("));
-        assert!(modal_source.contains("push_after_pull_plan.is_some()"));
-        assert!(modal_source.contains("self.pending_push_after_pull = push_after_success"));
-        assert!(modal_source.contains("self.execute_git_action(action)"));
-        assert!(modal_source.contains("UiIcon::Refresh"));
-        assert!(modal_source.contains("recessed_combo_box("));
-        assert!(!modal_source.contains("egui::ComboBox::from_id_salt("));
-        assert_eq!(modal_source.matches("labeled_content_row(").count(), 3);
+        assert!(modal_source.contains(source_token("dialog_inline_action_button(").as_str()));
+        assert!(modal_source.contains(source_token("constrain_pull_push_after_pull(").as_str()));
+        assert!(modal_source.contains(source_token("push_after_pull_plan.is_some()").as_str()));
+        assert!(
+            modal_source.contains(
+                source_token("self.pending_push_after_pull = push_after_success").as_str()
+            )
+        );
+        assert!(modal_source.contains(source_token("self.execute_git_action(action)").as_str()));
+        assert!(modal_source.contains(source_token("UiIcon::Refresh").as_str()));
+        assert!(modal_source.contains(source_token("recessed_combo_box(").as_str()));
+        assert!(!modal_source.contains(source_token("egui::ComboBox::from_id_salt(").as_str()));
+        assert_eq!(
+            modal_source
+                .matches(source_token("labeled_content_row(").as_str())
+                .count(),
+            3
+        );
         let labeled_row_start = implementation_source
-            .find("fn labeled_content_row(")
+            .find(source_token("fn labeled_content_row(").as_str())
             .unwrap();
         let labeled_row_end = implementation_source[labeled_row_start..]
-            .find("#[derive(Clone, Copy, Debug)]\nstruct ErrorDialogLayout")
+            .find(source_token("#[derive(Clone, Copy, Debug)]\nstruct ErrorDialogLayout").as_str())
             .unwrap();
         let labeled_row_source =
             &implementation_source[labeled_row_start..labeled_row_start + labeled_row_end];
         assert!(
             labeled_row_source
-                .matches("Layout::left_to_right(Align::Center)")
+                .matches(source_token("Layout::left_to_right(Align::Center)").as_str())
                 .count()
                 >= 1
         );
-        assert!(labeled_row_source.contains("row_height.max(ui.spacing().interact_size.y)"));
-        assert!(labeled_row_source.contains("ui.allocate_exact_size("));
-        assert!(labeled_row_source.contains(".max_rect(content_rect)"));
-        assert!(labeled_row_source.contains("let content_bounds = content_ui.min_rect();"));
-        assert!(labeled_row_source.contains("let content_bottom = content_bounds.bottom()"));
-        assert!(labeled_row_source.contains("ui.advance_cursor_after_rect("));
         assert!(
-            labeled_row_source.contains("content_ui.spacing_mut().interact_size.y = row_height;")
+            labeled_row_source
+                .contains(source_token("row_height.max(ui.spacing().interact_size.y)").as_str())
+        );
+        assert!(labeled_row_source.contains(source_token("ui.allocate_exact_size(").as_str()));
+        assert!(labeled_row_source.contains(source_token(".max_rect(content_rect)").as_str()));
+        assert!(
+            labeled_row_source
+                .contains(source_token("let content_bounds = content_ui.min_rect();").as_str())
         );
         assert!(
             labeled_row_source
-                .contains("let first_line_center_y = content_bounds.top() + row_height * 0.5;")
+                .contains(source_token("let content_bottom = content_bounds.bottom()").as_str())
         );
-        assert!(labeled_row_source.contains("first_line_center_y - label_rect.center().y"));
-        assert!(labeled_row_source.contains("egui::TextStyle::Button"));
-        assert!(labeled_row_source.contains("Align2::LEFT_CENTER.align_size_within_rect"));
-        assert!(labeled_row_source.contains("label_text_width + 20.0"));
-        assert!(labeled_row_source.contains("egui::TextWrapMode::Truncate"));
-        assert!(!labeled_row_source.contains("egui::Label::new("));
-        assert!(labeled_row_source.contains("add_contents"));
-        assert!(labeled_row_source.contains("Vec2::new(2.0, 12.0)"));
-        assert!(labeled_row_source.contains("rect_filled"));
-        assert!(labeled_row_source.contains("theme::accent()"));
-        assert!(!labeled_row_source.contains("Shadow"));
+        assert!(
+            labeled_row_source.contains(source_token("ui.advance_cursor_after_rect(").as_str())
+        );
+        assert!(labeled_row_source.contains(
+            source_token("content_ui.spacing_mut().interact_size.y = row_height;").as_str()
+        ));
+        assert!(
+            labeled_row_source.contains(
+                source_token("let first_line_center_y = content_bounds.top() + row_height * 0.5;")
+                    .as_str()
+            )
+        );
+        assert!(
+            labeled_row_source
+                .contains(source_token("first_line_center_y - label_rect.center().y").as_str())
+        );
+        assert!(labeled_row_source.contains(source_token("egui::TextStyle::Button").as_str()));
+        assert!(
+            labeled_row_source
+                .contains(source_token("Align2::LEFT_CENTER.align_size_within_rect").as_str())
+        );
+        assert!(labeled_row_source.contains(source_token("label_text_width + 20.0").as_str()));
+        assert!(labeled_row_source.contains(source_token("egui::TextWrapMode::Truncate").as_str()));
+        assert!(!labeled_row_source.contains(source_token("egui::Label::new(").as_str()));
+        assert!(labeled_row_source.contains(source_token("add_contents").as_str()));
+        assert!(labeled_row_source.contains(source_token("Vec2::new(2.0, 12.0)").as_str()));
+        assert!(labeled_row_source.contains(source_token("rect_filled").as_str()));
+        assert!(labeled_row_source.contains(source_token("theme::accent()").as_str()));
+        assert!(!labeled_row_source.contains(source_token("Shadow").as_str()));
         let options_start = modal_source
-            .find("full_width_recessed_panel(ui, |ui| {")
+            .find(source_token("full_width_recessed_panel(ui, |ui| {").as_str())
             .unwrap();
         let options_end = modal_source[options_start..]
-            .find("ui.add_space(4.0);")
+            .find(source_token("ui.add_space(4.0);").as_str())
             .unwrap();
         let options_source = &modal_source[options_start..options_start + options_end];
-        assert!(options_source.contains("full_width_recessed_panel("));
-        assert!(options_source.contains("RichText::new(self.tr(\"pull.options\"))"));
-        assert!(options_source.contains(".size(13.0)"));
-        assert!(options_source.contains(".strong()"));
-        assert!(!options_source.contains("circle_filled"));
-        assert!(!options_source.contains("rect_stroke"));
-        assert!(modal_source.contains("dialog_footer_row(ui"));
-        assert!(modal_source.contains("dialog_primary_button("));
-        assert!(modal_source.contains("dialog_cancel_button("));
-        assert!(!modal_source.contains("egui::Button::new(self.tr(\"pull.refresh\"))"));
-        assert!(!modal_source.contains("egui::Button::new(self.tr(\"action.pull\"))"));
-        assert!(!modal_source.contains("ui.button(self.tr(\"dialog.cancel\"))"));
+        assert!(options_source.contains(source_token("full_width_recessed_panel(").as_str()));
+        assert!(
+            options_source
+                .contains(source_token("RichText::new(self.tr(\"pull.options\"))").as_str())
+        );
+        assert!(options_source.contains(source_token(".size(13.0)").as_str()));
+        assert!(options_source.contains(source_token(".strong()").as_str()));
+        assert!(!options_source.contains(source_token("circle_filled").as_str()));
+        assert!(!options_source.contains(source_token("rect_stroke").as_str()));
+        assert!(modal_source.contains(source_token("dialog_footer_row(ui").as_str()));
+        assert!(modal_source.contains(source_token("dialog_primary_button(").as_str()));
+        assert!(modal_source.contains(source_token("dialog_cancel_button(").as_str()));
+        assert!(
+            !modal_source
+                .contains(source_token("egui::Button::new(self.tr(\"pull.refresh\"))").as_str())
+        );
+        assert!(
+            !modal_source
+                .contains(source_token("egui::Button::new(self.tr(\"action.pull\"))").as_str())
+        );
+        assert!(
+            !modal_source.contains(source_token("ui.button(self.tr(\"dialog.cancel\"))").as_str())
+        );
 
         let text_button_start = implementation_source
-            .find("fn text_action_button(")
+            .find(source_token("fn text_action_button(").as_str())
             .unwrap();
         let text_button_end = implementation_source[text_button_start..]
-            .find("fn dialog_inline_action_button_width(")
+            .find(source_token("fn dialog_inline_action_button_width(").as_str())
             .unwrap();
         let text_button_source =
             &implementation_source[text_button_start..text_button_start + text_button_end];
-        assert!(text_button_source.contains("theme::accent()"));
-        assert!(text_button_source.contains("theme::accent_soft()"));
-        assert!(text_button_source.contains("TextActionTone::Primary"));
-        assert!(text_button_source.contains("TextActionTone::Secondary"));
-        assert!(text_button_source.contains("TextActionTone::Accent"));
-        assert!(text_button_source.contains("TextActionTone::Destructive"));
-        assert!(text_button_source.contains("Stroke::NONE"));
-        assert!(text_button_source.contains("paint_text_button_hover_shadow_for_response("));
-        assert!(text_button_source.contains("pointing_hand_cursor(response)"));
+        assert!(text_button_source.contains(source_token("theme::accent()").as_str()));
+        assert!(text_button_source.contains(source_token("theme::accent_soft()").as_str()));
+        assert!(text_button_source.contains(source_token("TextActionTone::Primary").as_str()));
+        assert!(text_button_source.contains(source_token("TextActionTone::Secondary").as_str()));
+        assert!(text_button_source.contains(source_token("TextActionTone::Accent").as_str()));
+        assert!(text_button_source.contains(source_token("TextActionTone::Destructive").as_str()));
+        assert!(text_button_source.contains(source_token("Stroke::NONE").as_str()));
+        assert!(
+            text_button_source
+                .contains(source_token("paint_text_button_hover_shadow_for_response(").as_str())
+        );
+        assert!(
+            text_button_source.contains(source_token("pointing_hand_cursor(response)").as_str())
+        );
     }
 
     #[test]
@@ -48366,14 +49474,15 @@ diff --git a/file.txt b/file.txt
             }],
             ..RepositorySnapshot::default()
         };
-        let plan = pull_dialog_push_after_pull_plan(
-            &snapshot,
-            "origin",
-            "codex/complex-checkout-left",
-        ).expect("same-name remote push plan");
+        let plan =
+            pull_dialog_push_after_pull_plan(&snapshot, "origin", "codex/complex-checkout-left")
+                .expect("same-name remote push plan");
         assert_eq!(plan.remote, "origin");
         assert_eq!(plan.remote_branch, "codex/complex-checkout-left");
-        let PushAfterPullRetry::Selected { branches, options, .. } = plan.retry else {
+        let PushAfterPullRetry::Selected {
+            branches, options, ..
+        } = plan.retry
+        else {
             panic!("missing upstream should use an explicit tracked push");
         };
         assert_eq!(branches.len(), 1);
@@ -49312,63 +50421,86 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn dirty_local_branch_checkout_tries_native_checkout_then_offers_recovery() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
 
+        assert!(implementation_source.contains(source_token("CheckoutRecovery {\n        name: String,\n        checkout_error: String,\n        discard_changes: bool,\n    }").as_str()));
         assert!(implementation_source.contains(
-            "CheckoutRecovery {\n        name: String,\n        checkout_error: String,\n        discard_changes: bool,\n    }"
+            source_token("fn request_branch_checkout(&mut self, name: String)").as_str()
         ));
-        assert!(
-            implementation_source.contains("fn request_branch_checkout(&mut self, name: String)")
-        );
-        assert!(implementation_source.contains(
-            "fn start_branch_checkout(&mut self, name: String, strategy: BranchCheckoutStrategy)"
-        ));
+        assert!(implementation_source.contains(source_token("fn start_branch_checkout(&mut self, name: String, strategy: BranchCheckoutStrategy)").as_str()));
 
         let request_start = implementation_source
-            .find("fn request_branch_checkout(&mut self, name: String)")
+            .find(source_token("fn request_branch_checkout(&mut self, name: String)").as_str())
             .unwrap();
         let request_end = implementation_source[request_start..]
-            .find("fn start_branch_checkout(")
+            .find(source_token("fn start_branch_checkout(").as_str())
             .unwrap();
         let request_source = &implementation_source[request_start..request_start + request_end];
-        assert!(request_source.contains(
-            "self.start_branch_checkout(name, BranchCheckoutStrategy::PreserveLocalChanges);"
-        ));
+        assert!(request_source.contains(source_token("self.start_branch_checkout(name, BranchCheckoutStrategy::PreserveLocalChanges);").as_str()));
 
         let checkout_start = implementation_source
-            .find("fn start_branch_checkout(&mut self, name: String, strategy: BranchCheckoutStrategy)")
+            .find(source_token("fn start_branch_checkout(&mut self, name: String, strategy: BranchCheckoutStrategy)").as_str())
             .unwrap();
         let checkout_end = implementation_source[checkout_start..]
-            .find("fn remote_git_busy(&self)")
+            .find(source_token("fn remote_git_busy(&self)").as_str())
             .unwrap();
         let checkout_source = &implementation_source[checkout_start..checkout_start + checkout_end];
-        assert!(checkout_source.contains("let has_local_changes = !snapshot.status.is_empty();"));
-        assert!(checkout_source.contains("BranchCheckoutStrategy::PreserveLocalChanges"));
-        assert!(checkout_source.contains("BranchCheckoutStrategy::StashLocalChanges"));
-        assert!(checkout_source.contains("BranchCheckoutStrategy::MergeLocalChanges"));
-        assert!(checkout_source.contains("BranchCheckoutStrategy::DiscardLocalChanges"));
-        assert!(checkout_source.contains("git::stash_push("));
-        assert!(checkout_source.contains("git::checkout_branch_with_merge(&root, &name)"));
-        assert!(checkout_source.contains("git::discard_all_changes(&root)?;"));
-        assert!(checkout_source.contains("git::checkout_branch(&root, &name)"));
+        assert!(checkout_source.contains(
+            source_token("let has_local_changes = !snapshot.status.is_empty();").as_str()
+        ));
+        assert!(
+            checkout_source
+                .contains(source_token("BranchCheckoutStrategy::PreserveLocalChanges").as_str())
+        );
+        assert!(
+            checkout_source
+                .contains(source_token("BranchCheckoutStrategy::StashLocalChanges").as_str())
+        );
+        assert!(
+            checkout_source
+                .contains(source_token("BranchCheckoutStrategy::MergeLocalChanges").as_str())
+        );
+        assert!(
+            checkout_source
+                .contains(source_token("BranchCheckoutStrategy::DiscardLocalChanges").as_str())
+        );
+        assert!(checkout_source.contains(source_token("git::stash_push(").as_str()));
+        assert!(
+            checkout_source
+                .contains(source_token("git::checkout_branch_with_merge(&root, &name)").as_str())
+        );
+        assert!(
+            checkout_source.contains(source_token("git::discard_all_changes(&root)?;").as_str())
+        );
+        assert!(
+            checkout_source.contains(source_token("git::checkout_branch(&root, &name)").as_str())
+        );
 
         let dialog_start = implementation_source
-            .find("fn branch_action_modal(&mut self")
+            .find(source_token("fn branch_action_modal(&mut self").as_str())
             .unwrap();
         let dialog_end = implementation_source[dialog_start..]
-            .find("fn tag_action_modal(")
+            .find(source_token("fn tag_action_modal(").as_str())
             .unwrap();
         let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
-        assert!(dialog_source.contains("BranchActionDialog::CheckoutRecovery"));
-        assert!(dialog_source.contains("branch.checkout_recovery_title"));
-        assert!(dialog_source.contains("branch.checkout_stash_and_switch"));
-        assert!(dialog_source.contains("branch.checkout_merge_and_switch"));
-        assert!(dialog_source.contains("branch.checkout_discard_and_switch"));
-        assert!(dialog_source.contains("branch.discard_before_checkout"));
-        assert!(dialog_source.contains("action_checkbox("));
-        assert!(dialog_source.contains("discard_changes,"));
-        assert!(dialog_source.contains("self.start_branch_checkout(name, strategy);"));
+        assert!(
+            dialog_source.contains(source_token("BranchActionDialog::CheckoutRecovery").as_str())
+        );
+        assert!(dialog_source.contains(source_token("branch.checkout_recovery_title").as_str()));
+        assert!(dialog_source.contains(source_token("branch.checkout_stash_and_switch").as_str()));
+        assert!(dialog_source.contains(source_token("branch.checkout_merge_and_switch").as_str()));
+        assert!(
+            dialog_source.contains(source_token("branch.checkout_discard_and_switch").as_str())
+        );
+        assert!(dialog_source.contains(source_token("branch.discard_before_checkout").as_str()));
+        assert!(dialog_source.contains(source_token("action_checkbox(").as_str()));
+        assert!(dialog_source.contains(source_token("discard_changes,").as_str()));
+        assert!(
+            dialog_source
+                .contains(source_token("self.start_branch_checkout(name, strategy);").as_str())
+        );
     }
 
     #[test]
@@ -49724,26 +50856,20 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn conflict_reload_releases_its_owner_even_after_switching_tabs() {
-        let source = include_str!("app.rs");
-        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
-        let poll_start = implementation.find("fn poll_tasks(").unwrap();
+        let source = source_token(include_str!("app.rs"));
+        let implementation = &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
+        let poll_start = implementation
+            .find(source_token("fn poll_tasks(").as_str())
+            .unwrap();
         let poll_end = implementation[poll_start..]
-            .find("fn poll_merge_tool_task(")
+            .find(source_token("fn poll_merge_tool_task(").as_str())
             .unwrap();
         let poll = &implementation[poll_start..poll_start + poll_end];
 
-        assert!(poll.contains(
-            "if was_foreground {\n                            self.finish_conflict_merge_reload_for(&requested_root);"
-        ));
-        assert!(poll.contains(
-            "if was_foreground {\n                    self.finish_conflict_merge_reload_for_key(&key);"
-        ));
-        assert!(!poll.contains(
-            "if was_foreground && self.active_repo_root_matches(&requested_root) {\n                            self.finish_conflict_merge_reload_for"
-        ));
-        assert!(!poll.contains(
-            "if was_foreground && self.active_repo_key_matches(&key) {\n                    self.finish_conflict_merge_reload_for_key"
-        ));
+        assert!(poll.contains(source_token("if was_foreground {\n                            self.finish_conflict_merge_reload_for(&requested_root);").as_str()));
+        assert!(poll.contains(source_token("if was_foreground {\n                    self.finish_conflict_merge_reload_for_key(&key);").as_str()));
+        assert!(!poll.contains(source_token("if was_foreground && self.active_repo_root_matches(&requested_root) {\n                            self.finish_conflict_merge_reload_for").as_str()));
+        assert!(!poll.contains(source_token("if was_foreground && self.active_repo_key_matches(&key) {\n                    self.finish_conflict_merge_reload_for_key").as_str()));
     }
 
     #[test]
@@ -49886,81 +51012,109 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repository_snapshot_preserves_commit_ime_focus_only_when_editor_survives() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
 
         let apply_start = implementation_source
-            .find("fn apply_repository_snapshot(&mut self")
+            .find(source_token("fn apply_repository_snapshot(&mut self").as_str())
             .unwrap();
         let apply_end = implementation_source[apply_start..]
-            .find("fn apply_repository_history(")
+            .find(source_token("fn apply_repository_history(").as_str())
             .unwrap();
         let apply_source = &implementation_source[apply_start..apply_start + apply_end];
-        assert!(apply_source.contains("let replaces_existing_snapshot = self.snapshot.is_some()"));
-        assert!(apply_source.contains("commit_message_editor_survives_repository_snapshot("));
-        assert!(apply_source.contains("repository_snapshot_focus_clear_pending"));
-        assert!(apply_source.contains("preserve_commit_message_focus_on_snapshot"));
+        assert!(apply_source.contains(
+            source_token("let replaces_existing_snapshot = self.snapshot.is_some()").as_str()
+        ));
+        assert!(apply_source.contains(
+            source_token("commit_message_editor_survives_repository_snapshot(").as_str()
+        ));
+        assert!(
+            apply_source.contains(source_token("repository_snapshot_focus_clear_pending").as_str())
+        );
+        assert!(
+            apply_source
+                .contains(source_token("preserve_commit_message_focus_on_snapshot").as_str())
+        );
 
         let clear_view_start = implementation_source
-            .find("fn clear_repository_snapshot_view(")
+            .find(source_token("fn clear_repository_snapshot_view(").as_str())
             .unwrap();
         let clear_view_end = implementation_source[clear_view_start..]
-            .find("fn invalidate_branch_sensitive_tasks(")
+            .find(source_token("fn invalidate_branch_sensitive_tasks(").as_str())
             .unwrap();
         let clear_view_source =
             &implementation_source[clear_view_start..clear_view_start + clear_view_end];
-        assert!(clear_view_source.contains("if self.snapshot.is_some()"));
-        assert!(
-            clear_view_source.contains("self.preserve_commit_message_focus_on_snapshot = false")
-        );
+        assert!(clear_view_source.contains(source_token("if self.snapshot.is_some()").as_str()));
+        assert!(clear_view_source.contains(
+            source_token("self.preserve_commit_message_focus_on_snapshot = false").as_str()
+        ));
         for cancelled_task in [
             "self.details_task = None",
             "self.diff_task = None",
             "self.blame_task = None",
         ] {
             assert!(
-                clear_view_source.contains(cancelled_task),
+                clear_view_source.contains(source_token(cancelled_task).as_str()),
                 "repository transition must cancel stale task {cancelled_task}"
             );
         }
-        assert!(clear_view_source.contains("self.reset_search_view_state();"));
-        let reset_start = implementation_source.find("fn reset_search_view_state(").unwrap();
+        assert!(
+            clear_view_source.contains(source_token("self.reset_search_view_state();").as_str())
+        );
+        let reset_start = implementation_source
+            .find(source_token("fn reset_search_view_state(").as_str())
+            .unwrap();
         let reset_end = implementation_source[reset_start..]
-            .find("fn enter_search_view(").unwrap();
+            .find(source_token("fn enter_search_view(").as_str())
+            .unwrap();
         let reset_source = &implementation_source[reset_start..reset_start + reset_end];
-        assert!(reset_source.contains("self.file_search_task.take()"));
-        assert!(reset_source.contains("task.cancelled.store(true"));
+        assert!(reset_source.contains(source_token("self.file_search_task.take()").as_str()));
+        assert!(reset_source.contains(source_token("task.cancelled.store(true").as_str()));
 
         let focus_start = implementation_source
-            .find("fn clear_focus_before_repository_snapshot_ui(")
+            .find(source_token("fn clear_focus_before_repository_snapshot_ui(").as_str())
             .unwrap();
         let focus_end = implementation_source[focus_start..]
-            .find("fn apply_repository_history(")
+            .find(source_token("fn apply_repository_history(").as_str())
             .unwrap();
         let focus_source = &implementation_source[focus_start..focus_start + focus_end];
-        assert!(focus_source.contains("memory.focused() == Some(commit_message_input_id())"));
-        assert!(focus_source.contains("memory.surrender_focus(id)"));
-        assert!(focus_source.contains("memory.stop_text_input()"));
+        assert!(focus_source.contains(
+            source_token("memory.focused() == Some(commit_message_input_id())").as_str()
+        ));
+        assert!(focus_source.contains(source_token("memory.surrender_focus(id)").as_str()));
+        assert!(focus_source.contains(source_token("memory.stop_text_input()").as_str()));
 
-        let panel_start = implementation_source.find("fn commit_panel(").unwrap();
+        let panel_start = implementation_source
+            .find(source_token("fn commit_panel(").as_str())
+            .unwrap();
         let panel_end = implementation_source[panel_start..]
-            .find("fn rebase_commit_panel_body(")
+            .find(source_token("fn rebase_commit_panel_body(").as_str())
             .unwrap();
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
-        assert!(panel_source.contains("let commit_message_input = commit_message_input_id()"));
-        assert!(!panel_source.contains("ui.make_persistent_id(\"commit_message_input\")"));
+        assert!(panel_source.contains(
+            source_token("let commit_message_input = commit_message_input_id()").as_str()
+        ));
+        assert!(
+            !panel_source
+                .contains(source_token("ui.make_persistent_id(\"commit_message_input\")").as_str())
+        );
 
-        let update_start = implementation_source.find("fn update(&mut self").unwrap();
+        let update_start = implementation_source
+            .find(source_token("fn update(&mut self").as_str())
+            .unwrap();
         let update_end = implementation_source[update_start..]
-            .find("\n}\n\nimpl GitAgentApp")
+            .find(source_token("\n}\n\nimpl GitAgentApp").as_str())
             .unwrap();
         let update_source = &implementation_source[update_start..update_start + update_end];
-        let poll_index = update_source.find("self.poll_tasks(ctx);").unwrap();
+        let poll_index = update_source
+            .find(source_token("self.poll_tasks(ctx);").as_str())
+            .unwrap();
         let clear_index = update_source
-            .find("self.clear_focus_before_repository_snapshot_ui(ctx);")
+            .find(source_token("self.clear_focus_before_repository_snapshot_ui(ctx);").as_str())
             .unwrap();
         let top_bar_index = update_source
-            .find("egui::TopBottomPanel::top(\"top_bar\")")
+            .find(source_token("egui::TopBottomPanel::top(\"top_bar\")").as_str())
             .unwrap();
         assert!(poll_index < clear_index);
         assert!(clear_index < top_bar_index);
@@ -50196,6 +51350,129 @@ diff --git a/file.txt b/file.txt
         assert_eq!(repo_tab_close_color(false, true, false), Color32::WHITE);
         assert_eq!(repo_tab_close_color(false, true, true), Color32::WHITE);
         assert_eq!(repo_tab_close_color(false, false, false), theme::text());
+    }
+    fn test_repository_star_badge() -> crate::plugins::RepositoryTabBadge {
+        crate::plugins::RepositoryTabBadge {
+            text: "1.2k".into(),
+            tooltip: "Stars: 1234".into(),
+            icon_uri: "bytes://tests/star.svg".into(),
+            icon_bytes: std::sync::Arc::from(
+                &include_bytes!("../tests/fixtures/plugin-contract/assets/star.svg")[..],
+            ),
+        }
+    }
+    #[test]
+    fn repository_star_badge_reserves_space_between_name_and_close() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let badge = test_repository_star_badge();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(
+                    repo_tab_width_with_badge(ui, "repo", None),
+                    repo_tab_width(ui, "repo")
+                );
+                assert!(
+                    repo_tab_width_with_badge(ui, "repo", Some(&badge))
+                        > repo_tab_width(ui, "repo")
+                );
+                repo_tab_with_badge(
+                    ui,
+                    UiIcon::Folder,
+                    true,
+                    "repo",
+                    "Close",
+                    ui.id().with("repo"),
+                    None,
+                    Some(&badge),
+                );
+            });
+        });
+        let text = |caption: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == caption => {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(text("repo").pos.x + text("repo").galley.size().x < text("1.2k").pos.x - 15.0);
+        assert!(text("1.2k").pos.x + text("1.2k").galley.size().x < text("\u{00d7}").pos.x);
+    }
+    #[test]
+    fn repository_star_badge_preserves_close_hit_target() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let badge = test_repository_star_badge();
+        let mut rect = Rect::NOTHING;
+        let mut closed = false;
+        let mut selected = false;
+        let screen = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 120.0)));
+        let mut draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let interaction = repo_tab_with_badge(
+                    ui,
+                    UiIcon::Folder,
+                    true,
+                    "repo",
+                    "Close",
+                    ui.id().with("repo"),
+                    None,
+                    Some(&badge),
+                );
+                rect = interaction.response.rect;
+                closed |= interaction.close_clicked;
+                selected |= interaction.tab_clicked;
+            });
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: screen,
+                ..Default::default()
+            },
+            &mut draw,
+        );
+        drop(draw);
+        let position = Pos2::new(rect.right() - 12.0, rect.center().y);
+        for pressed in [true, false] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: screen,
+                    events: vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let interaction = repo_tab_with_badge(
+                            ui,
+                            UiIcon::Folder,
+                            true,
+                            "repo",
+                            "Close",
+                            ui.id().with("repo"),
+                            None,
+                            Some(&badge),
+                        );
+                        closed |= interaction.close_clicked;
+                        selected |= interaction.tab_clicked;
+                    });
+                },
+            );
+        }
+        assert!(closed);
+        assert!(!selected);
     }
 
     #[test]
@@ -50676,83 +51953,134 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_tab_switch_uses_cached_snapshot_before_async_refresh() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let fields_start = implementation_source
-            .find("pub struct GitAgentApp")
+            .find(source_token("pub struct GitAgentApp").as_str())
             .unwrap();
         let fields_end = implementation_source[fields_start..]
-            .find("struct RepoTab")
+            .find(source_token("struct RepoTab").as_str())
             .unwrap();
         let fields_source = &implementation_source[fields_start..fields_start + fields_end];
-        assert!(fields_source.contains("snapshot_cache: HashMap<String, RepositorySnapshot>"));
+        assert!(fields_source.contains(
+            source_token("snapshot_cache: HashMap<String, RepositorySnapshot>").as_str()
+        ));
         assert!(
-            fields_source.contains("repo_tasks: HashMap<String, Receiver<RepoTaskResult>>"),
+            fields_source.contains(
+                source_token("repo_tasks: HashMap<String, Receiver<RepoTaskResult>>").as_str()
+            ),
             "repo loads must be keyed per repository so A/B quick switches keep both refreshes alive"
         );
 
         let load_start = implementation_source
-            .find("fn load_repository(&mut self, path: PathBuf)")
+            .find(source_token("fn load_repository(&mut self, path: PathBuf)").as_str())
             .unwrap();
         let load_end = implementation_source[load_start..]
-            .find("fn open_repository_source_tab")
+            .find(source_token("fn open_repository_source_tab").as_str())
             .unwrap();
         let load_source = &implementation_source[load_start..load_start + load_end];
-        assert!(load_source.contains("self.apply_cached_snapshot_for(&path)"));
-        assert!(load_source.contains("self.clear_repository_snapshot_view()"));
-        assert!(load_source.contains("self.start_repository_snapshot_load(path)"));
-        assert!(load_source.contains("self.restart_repository_snapshot_load(path)"));
-        assert!(implementation_source.contains("fn repository_refresh_scheduler_loop("));
-        assert!(implementation_source.contains("git::open_repository_core(request.path.clone())"));
         assert!(
-            implementation_source
-                .contains("self.repository_refresh_scheduler\n            .request(")
+            load_source.contains(source_token("self.apply_cached_snapshot_for(&path)").as_str())
+        );
+        assert!(
+            load_source.contains(source_token("self.clear_repository_snapshot_view()").as_str())
+        );
+        assert!(
+            load_source
+                .contains(source_token("self.start_repository_snapshot_load(path)").as_str())
+        );
+        assert!(
+            load_source
+                .contains(source_token("self.restart_repository_snapshot_load(path)").as_str())
         );
         assert!(
             implementation_source
-                .contains("repo_history_tasks: HashMap<String, Receiver<RepoHistoryTaskResult>>"),
+                .contains(source_token("fn repository_refresh_scheduler_loop(").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("git::open_repository_core(request.path.clone())").as_str())
+        );
+        assert!(implementation_source.contains(
+            source_token("self.repository_refresh_scheduler\n            .request(").as_str()
+        ));
+        assert!(
+            implementation_source.contains(
+                source_token(
+                    "repo_history_tasks: HashMap<String, Receiver<RepoHistoryTaskResult>>"
+                )
+                .as_str()
+            ),
             "history must use an independent task so core repository state can appear first"
         );
-        assert!(implementation_source.contains("fn spawn_repository_history_load("));
-        assert!(implementation_source.contains("git::load_repository_history("));
         assert!(
-            implementation_source.contains("let layout = graph::layout(&history.commits);"),
+            implementation_source
+                .contains(source_token("fn spawn_repository_history_load(").as_str())
+        );
+        assert!(
+            implementation_source.contains(source_token("git::load_repository_history(").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("let layout = graph::layout(&history.commits);").as_str()),
             "large history graph layout must stay off the UI thread"
         );
         assert!(
-            !implementation_source.contains("cached.apply_history(history.clone())"),
+            !implementation_source
+                .contains(source_token("cached.apply_history(history.clone())").as_str()),
             "active history must not be retained in both the visible snapshot and repository cache"
         );
 
         let clear_start = implementation_source
-            .find("fn clear_repository_snapshot_view(")
+            .find(source_token("fn clear_repository_snapshot_view(").as_str())
             .unwrap();
         let clear_end = implementation_source[clear_start..]
-            .find("fn apply_repository_snapshot(")
+            .find(source_token("fn apply_repository_snapshot(").as_str())
             .unwrap();
         let clear_source = &implementation_source[clear_start..clear_start + clear_end];
-        assert!(clear_source.contains("self.snapshot = None"));
+        assert!(clear_source.contains(source_token("self.snapshot = None").as_str()));
 
-        let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
+        let poll_start = implementation_source
+            .find(source_token("fn poll_tasks(").as_str())
+            .unwrap();
         let poll_end = implementation_source[poll_start..]
-            .find("fn poll_merge_tool_task(")
+            .find(source_token("fn poll_merge_tool_task(").as_str())
             .unwrap();
         let poll_source = &implementation_source[poll_start..poll_start + poll_end];
         let compact_poll_source = poll_source.split_whitespace().collect::<String>();
-        assert!(compact_poll_source.contains("self.repo_tasks.retain("));
-        assert!(poll_source.contains("for (requested_root, result) in repo_results"));
-        assert!(poll_source.contains("Ok(snapshot)"));
-        assert!(poll_source.contains("self.cache_repository_snapshot(&snapshot)"));
+        assert!(compact_poll_source.contains(source_token("self.repo_tasks.retain(").as_str()));
         assert!(
             poll_source
-                .contains("let active_repo = self.active_repo_root_matches(&requested_root)")
+                .contains(source_token("for (requested_root, result) in repo_results").as_str())
         );
-        assert!(poll_source.contains("self.apply_repository_snapshot(snapshot)"));
+        assert!(poll_source.contains(source_token("Ok(snapshot)").as_str()));
         assert!(
-            poll_source.contains("self.apply_repository_history(&requested_root, history, layout)")
+            poll_source
+                .contains(source_token("self.cache_repository_snapshot(&snapshot)").as_str())
         );
-        assert!(poll_source.contains("self.queued_repo_history_loads.remove(&key)"));
-        assert!(poll_source.contains("self.loading_repo = self.active_repo_has_pending_load()"));
+        assert!(
+            poll_source.contains(
+                source_token("let active_repo = self.active_repo_root_matches(&requested_root)")
+                    .as_str()
+            )
+        );
+        assert!(
+            poll_source.contains(source_token("self.apply_repository_snapshot(snapshot)").as_str())
+        );
+        assert!(
+            poll_source.contains(
+                source_token("self.apply_repository_history(&requested_root, history, layout)")
+                    .as_str()
+            )
+        );
+        assert!(
+            poll_source
+                .contains(source_token("self.queued_repo_history_loads.remove(&key)").as_str())
+        );
+        assert!(poll_source.contains(
+            source_token("self.loading_repo = self.active_repo_has_pending_load()").as_str()
+        ));
     }
 
     #[test]
@@ -51039,6 +52367,107 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
+    fn plugin_toolbar_matches_core_text_metrics_and_button_height() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let mut sizes = Vec::new();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    sizes.push(
+                        AppButton::toolbar(UiIcon::Pull, "PRs (3)", true)
+                            .show(ui)
+                            .rect
+                            .size(),
+                    );
+                    let image = egui::Image::new(egui::include_image!(
+                        "../tests/fixtures/plugin-contract/assets/pull-request.svg"
+                    ));
+                    let button = toolbar_image_button(ui, image, "PRs (3)", theme::text(), false);
+                    sizes.push(
+                        with_toolbar_button_style(ui, |ui| ui.add(button))
+                            .inner
+                            .rect
+                            .size(),
+                    );
+                });
+            });
+        });
+        assert_eq!(sizes[0], sizes[1]);
+        assert_eq!(sizes[1].y, TOOLBAR_BUTTON_HEIGHT);
+        let captions = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == "PRs (3)" => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(captions.len(), 2);
+        for caption in captions {
+            assert!(
+                caption
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .all(|section| section.format.font_id
+                        == FontId::proportional(TOOLBAR_BUTTON_TEXT))
+            );
+        }
+    }
+
+    #[test]
+    fn selected_plugin_toolbar_uses_selection_foreground_for_icon_and_text() {
+        for mut visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            visuals.selection.bg_fill = Color32::from_rgb(128, 80, 39);
+            let foreground = Color32::from_rgb(250, 248, 245);
+            visuals.selection.stroke.color = foreground;
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals);
+            egui_extras::install_image_loaders(&ctx);
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let image = egui::Image::new(egui::include_image!(
+                        "../tests/fixtures/plugin-contract/assets/pull-request.svg"
+                    ));
+                    let button = toolbar_image_button(ui, image, "PRs (3)", Color32::BLACK, true);
+                    with_toolbar_button_style(ui, |ui| ui.add(button));
+                });
+            });
+            let caption = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == "PRs (3)" => {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .expect("selected PR button must paint its caption");
+            assert!(
+                caption
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .all(|section| section.format.color == foreground)
+            );
+        }
+        let source = include_str!("app.rs");
+        let helper = source
+            .split("pub(crate) fn toolbar_image_button")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn toolbar_menu_button")
+            .next()
+            .unwrap();
+        assert!(helper.contains("ui.visuals().selection.stroke.color"));
+        assert!(helper.contains(".tint(tint)"));
+        assert!(helper.contains(".color(tint)"));
+    }
+
+    #[test]
     fn tool_row_corners_join_tabs_without_right_top_radius() {
         let corners = tool_row_corners();
         assert_eq!(corners.nw, 0);
@@ -51085,110 +52514,193 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn worktree_conflicts_have_resolve_entry() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let dialog_start = implementation_source
-            .find(
-                "WorktreeActionDialog::ResolveConflicts {\n                selected_path,\n                select_after_refresh,\n            } =>",
-            )
+            .find(source_token("WorktreeActionDialog::ResolveConflicts {\n                selected_path,\n                select_after_refresh,\n            } =>").as_str())
             .unwrap();
         let dialog_end = implementation_source[dialog_start..]
-            .find("if let Some((path, side)) = accept_side")
+            .find(source_token("if let Some((path, side)) = accept_side").as_str())
             .unwrap();
         let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
-        assert!(implementation_source.contains("fn worktree_conflict_files("));
-        assert!(implementation_source.contains("WorktreeActionDialog::ResolveConflicts"));
-        assert!(dialog_source.contains("window_control_button(ui, \"\\u{00d7}\", true)"));
-        assert!(dialog_source.contains("egui::Area::new"));
-        assert!(dialog_source.contains("conflict_resolution_modal_rect(ctx)"));
-        assert!(dialog_source.contains("Layout::top_down(Align::Min)"));
-        assert!(dialog_source.contains("let content_height = ui.available_height()"));
-        assert!(dialog_source.contains("let panel_size"));
-        assert!(dialog_source.contains("Vec2::new(CONFLICT_LIST_PANEL_SIZE.x, content_height)"));
-        assert!(!dialog_source.contains(".anchor(Align2::CENTER_CENTER, Vec2::ZERO)"));
-        assert!(implementation_source.contains("conflict_resolution_list_panel("));
-        assert!(implementation_source.contains("conflict_resolution_actions_panel("));
-        assert!(dialog_source.contains("!conflict_action_busy"));
-        assert!(dialog_source.contains("self.branch_actions_busy()"));
-        assert!(dialog_source.contains("select_after_refresh ="));
-        assert!(implementation_source.contains("CONFLICT_ACTION_BUTTON_SIZE"));
-        assert!(implementation_source.contains("CONFLICT_MODAL_SIZE"));
+        assert!(
+            implementation_source.contains(source_token("fn worktree_conflict_files(").as_str())
+        );
         assert!(
             implementation_source
-                .contains("CONFLICT_MODAL_SIZE: Vec2 = Vec2 { x: 760.0, y: 360.0 }")
+                .contains(source_token("WorktreeActionDialog::ResolveConflicts").as_str())
         );
-        assert!(implementation_source.contains("conflict_resolution_dialog_background()"));
+        assert!(
+            dialog_source
+                .contains(source_token("window_control_button(ui, \"\\u{00d7}\", true)").as_str())
+        );
+        assert!(dialog_source.contains(source_token("egui::Area::new").as_str()));
+        assert!(
+            dialog_source.contains(source_token("conflict_resolution_modal_rect(ctx)").as_str())
+        );
+        assert!(dialog_source.contains(source_token("Layout::top_down(Align::Min)").as_str()));
+        assert!(
+            dialog_source
+                .contains(source_token("let content_height = ui.available_height()").as_str())
+        );
+        assert!(dialog_source.contains(source_token("let panel_size").as_str()));
+        assert!(dialog_source.contains(
+            source_token("Vec2::new(CONFLICT_LIST_PANEL_SIZE.x, content_height)").as_str()
+        ));
+        assert!(
+            !dialog_source
+                .contains(source_token(".anchor(Align2::CENTER_CENTER, Vec2::ZERO)").as_str())
+        );
         assert!(
             implementation_source
-                .contains("soft_panel_frame(conflict_resolution_dialog_background(), 12, 12)")
+                .contains(source_token("conflict_resolution_list_panel(").as_str())
         );
-        assert!(dialog_source.contains(".fixed_pos(modal_rect.min)"));
-        assert!(dialog_source.contains("safe_set_min_size(ui, CONFLICT_MODAL_SIZE)"));
-        assert!(dialog_source.contains("ui.set_max_size(CONFLICT_MODAL_SIZE)"));
-        assert!(implementation_source.contains("CONFLICT_LIST_PANEL_SIZE"));
-        assert!(implementation_source.contains("CONFLICT_ACTION_PANEL_SIZE"));
-        assert!(implementation_source.contains("worktree.conflicts.empty"));
-        assert!(!dialog_source.contains("ui.set_min_size(ui.available_size())"));
-        assert!(!implementation_source.contains("ui.available_width() - action_width"));
-        assert!(!implementation_source.contains("ui.available_height() - 4.0"));
+        assert!(
+            implementation_source
+                .contains(source_token("conflict_resolution_actions_panel(").as_str())
+        );
+        assert!(dialog_source.contains(source_token("!conflict_action_busy").as_str()));
+        assert!(dialog_source.contains(source_token("self.branch_actions_busy()").as_str()));
+        assert!(dialog_source.contains(source_token("select_after_refresh =").as_str()));
+        assert!(
+            implementation_source.contains(source_token("CONFLICT_ACTION_BUTTON_SIZE").as_str())
+        );
+        assert!(implementation_source.contains(source_token("CONFLICT_MODAL_SIZE").as_str()));
+        assert!(implementation_source.contains(
+            source_token("CONFLICT_MODAL_SIZE: Vec2 = Vec2 { x: 760.0, y: 360.0 }").as_str()
+        ));
+        assert!(
+            implementation_source
+                .contains(source_token("conflict_resolution_dialog_background()").as_str())
+        );
+        assert!(
+            implementation_source.contains(
+                source_token("soft_panel_frame(conflict_resolution_dialog_background(), 12, 12)")
+                    .as_str()
+            )
+        );
+        assert!(dialog_source.contains(source_token(".fixed_pos(modal_rect.min)").as_str()));
+        assert!(
+            dialog_source
+                .contains(source_token("safe_set_min_size(ui, CONFLICT_MODAL_SIZE)").as_str())
+        );
+        assert!(
+            dialog_source.contains(source_token("ui.set_max_size(CONFLICT_MODAL_SIZE)").as_str())
+        );
+        assert!(implementation_source.contains(source_token("CONFLICT_LIST_PANEL_SIZE").as_str()));
+        assert!(
+            implementation_source.contains(source_token("CONFLICT_ACTION_PANEL_SIZE").as_str())
+        );
+        assert!(implementation_source.contains(source_token("worktree.conflicts.empty").as_str()));
+        assert!(
+            !dialog_source.contains(source_token("ui.set_min_size(ui.available_size())").as_str())
+        );
+        assert!(
+            !implementation_source
+                .contains(source_token("ui.available_width() - action_width").as_str())
+        );
+        assert!(
+            !implementation_source.contains(source_token("ui.available_height() - 4.0").as_str())
+        );
         let header_button_start = implementation_source
-            .find("fn worktree_header_action_button(")
+            .find(source_token("fn worktree_header_action_button(").as_str())
             .unwrap();
         let header_button_end = implementation_source[header_button_start..]
-            .find("fn conflict_resolution_dialog_background(")
+            .find(source_token("fn conflict_resolution_dialog_background(").as_str())
             .unwrap();
         let header_button_source =
             &implementation_source[header_button_start..header_button_start + header_button_end];
         let action_button_start = implementation_source
-            .find("fn conflict_resolution_action_button(")
+            .find(source_token("fn conflict_resolution_action_button(").as_str())
             .unwrap();
         let action_button_end = implementation_source[action_button_start..]
-            .find("fn conflict_resolution_header(")
+            .find(source_token("fn conflict_resolution_header(").as_str())
             .unwrap();
         let action_button_source =
             &implementation_source[action_button_start..action_button_start + action_button_end];
-        assert!(header_button_source.contains("paint_text_button_hover_shadow_for_response"));
-        assert!(action_button_source.contains("paint_text_button_hover_shadow_for_response"));
-        assert!(action_button_source.contains("Layout::top_down(Align::Center)"));
-        assert!(action_button_source.contains("ui.add_sized(CONFLICT_ACTION_BUTTON_SIZE, button)"));
-        assert!(implementation_source.contains("worktree.accept_yours"));
-        assert!(implementation_source.contains("worktree.accept_theirs"));
-        assert!(implementation_source.contains("worktree.resolve_conflicts"));
-        assert!(implementation_source.contains("worktree_header_action_button("));
-        assert!(implementation_source.contains("WorktreeMenuAction::ResolveConflict"));
-        assert!(implementation_source.contains("fn open_conflict_merge_tool("));
-        assert!(implementation_source.contains("command.arg(\"--ai-model\").arg(ai_model_name)"));
         assert!(
-            implementation_source.contains("let ai_model_name = self.selected_ai_model.clone();")
+            header_button_source
+                .contains(source_token("paint_text_button_hover_shadow_for_response").as_str())
+        );
+        assert!(
+            action_button_source
+                .contains(source_token("paint_text_button_hover_shadow_for_response").as_str())
+        );
+        assert!(
+            action_button_source.contains(source_token("Layout::top_down(Align::Center)").as_str())
+        );
+        assert!(
+            action_button_source.contains(
+                source_token("ui.add_sized(CONFLICT_ACTION_BUTTON_SIZE, button)").as_str()
+            )
+        );
+        assert!(implementation_source.contains(source_token("worktree.accept_yours").as_str()));
+        assert!(implementation_source.contains(source_token("worktree.accept_theirs").as_str()));
+        assert!(
+            implementation_source.contains(source_token("worktree.resolve_conflicts").as_str())
+        );
+        assert!(
+            implementation_source.contains(source_token("worktree_header_action_button(").as_str())
         );
         assert!(
             implementation_source
-                .contains("merge_tool_task: Option<Receiver<MergeToolTaskResult>>")
+                .contains(source_token("WorktreeMenuAction::ResolveConflict").as_str())
         );
-        assert!(implementation_source.contains("fn poll_merge_tool_task("));
-        assert!(implementation_source.contains("fn merge_tool_busy(&self) -> bool"));
-        assert!(implementation_source.contains("self.merge_tool_busy()"));
-        assert!(implementation_source.contains(".wait()"));
         assert!(
-            implementation_source.contains("Some(crate::merge_tool::MERGE_TOOL_CANCEL_EXIT_CODE)")
+            implementation_source.contains(source_token("fn open_conflict_merge_tool(").as_str())
         );
-        assert!(implementation_source.contains("self.load_repository_uncached(root)"));
-        assert!(implementation_source.contains("self.merge_tool_task = Some(receiver)"));
-        assert!(implementation_source.contains(".arg(\"--repo-root\")"));
-        assert!(implementation_source.contains(".arg(\"--stage\")"));
-        assert!(implementation_source.contains(".arg(\"--theme\")"));
-        assert!(implementation_source.contains(".arg(merge_theme_arg(self.theme_mode))"));
-        assert!(implementation_source.contains(".arg(\"--language\")"));
-        assert!(implementation_source.contains(".arg(merge_language_arg(self.language))"));
+        assert!(
+            implementation_source
+                .contains(source_token("command.arg(\"--ai-model\").arg(ai_model_name)").as_str())
+        );
+        assert!(implementation_source.contains(
+            source_token("let ai_model_name = self.selected_ai_model.clone();").as_str()
+        ));
+        assert!(implementation_source.contains(
+            source_token("merge_tool_task: Option<Receiver<MergeToolTaskResult>>").as_str()
+        ));
+        assert!(implementation_source.contains(source_token("fn poll_merge_tool_task(").as_str()));
+        assert!(
+            implementation_source
+                .contains(source_token("fn merge_tool_busy(&self) -> bool").as_str())
+        );
+        assert!(implementation_source.contains(source_token("self.merge_tool_busy()").as_str()));
+        assert!(implementation_source.contains(source_token(".wait()").as_str()));
+        assert!(implementation_source.contains(
+            source_token("Some(crate::merge_tool::MERGE_TOOL_CANCEL_EXIT_CODE)").as_str()
+        ));
+        assert!(
+            implementation_source
+                .contains(source_token("self.load_repository_uncached(root)").as_str())
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("self.merge_tool_task = Some(receiver)").as_str())
+        );
+        assert!(implementation_source.contains(source_token(".arg(\"--repo-root\")").as_str()));
+        assert!(implementation_source.contains(source_token(".arg(\"--stage\")").as_str()));
+        assert!(implementation_source.contains(source_token(".arg(\"--theme\")").as_str()));
+        assert!(
+            implementation_source
+                .contains(source_token(".arg(merge_theme_arg(self.theme_mode))").as_str())
+        );
+        assert!(implementation_source.contains(source_token(".arg(\"--language\")").as_str()));
+        assert!(
+            implementation_source
+                .contains(source_token(".arg(merge_language_arg(self.language))").as_str())
+        );
 
-        let row_start = implementation_source.find("fn worktree_file_row(").unwrap();
+        let row_start = implementation_source
+            .find(source_token("fn worktree_file_row(").as_str())
+            .unwrap();
         let row_end = implementation_source[row_start..]
-            .find("fn commit_context_menu(")
+            .find(source_token("fn commit_context_menu(").as_str())
             .unwrap();
         let row_source = &implementation_source[row_start..row_start + row_end];
-        assert!(row_source.contains("file.is_conflicted()"));
-        assert!(row_source.contains("\"U\""));
-        assert!(row_source.contains("worktree.resolve_conflict"));
+        assert!(row_source.contains(source_token("file.is_conflicted()").as_str()));
+        assert!(row_source.contains(source_token("\"U\"").as_str()));
+        assert!(row_source.contains(source_token("worktree.resolve_conflict").as_str()));
     }
 
     #[test]
@@ -51269,34 +52781,46 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn conflict_dialog_accepts_a_side_and_refreshes_in_place() {
-        let source = include_str!("app.rs");
-        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = source_token(include_str!("app.rs"));
+        let implementation_source =
+            &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let dialog_start = implementation_source
-            .find(
-                "WorktreeActionDialog::ResolveConflicts {\n                selected_path,\n                select_after_refresh,\n            } =>",
-            )
+            .find(source_token("WorktreeActionDialog::ResolveConflicts {\n                selected_path,\n                select_after_refresh,\n            } =>").as_str())
             .unwrap();
         let dialog_end = implementation_source[dialog_start..]
-            .find("fn blame_action_modal(")
+            .find(source_token("fn blame_action_modal(").as_str())
             .unwrap();
         let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
         let accept_start = dialog_source
-            .find("ConflictResolutionDialogAction::Accept(")
+            .find(source_token("ConflictResolutionDialogAction::Accept(").as_str())
             .unwrap();
         let accept_end = dialog_source[accept_start..]
-            .find("ConflictResolutionDialogAction::Merge")
+            .find(source_token("ConflictResolutionDialogAction::Merge").as_str())
             .unwrap();
         let accept_source = &dialog_source[accept_start..accept_start + accept_end];
 
-        assert!(dialog_source.contains("let conflict_action_busy = self.branch_actions_busy();"));
-        assert!(dialog_source.contains("selected_path.is_some()"));
-        assert!(dialog_source.contains("&& !conflict_action_busy"));
-        assert!(accept_source.contains("select_after_refresh ="));
-        assert!(!accept_source.contains("close_after = true"));
-        assert!(dialog_source.contains("self.execute_git_action(move |root|"));
-        assert!(dialog_source.contains("self.pending_worktree_action = Some("));
-        assert!(dialog_source.contains("conflict_files.is_empty() && !conflict_action_busy"));
-        assert!(implementation_source.contains("self.load_repository_uncached(root)"));
+        assert!(dialog_source.contains(
+            source_token("let conflict_action_busy = self.branch_actions_busy();").as_str()
+        ));
+        assert!(dialog_source.contains(source_token("selected_path.is_some()").as_str()));
+        assert!(dialog_source.contains(source_token("&& !conflict_action_busy").as_str()));
+        assert!(accept_source.contains(source_token("select_after_refresh =").as_str()));
+        assert!(!accept_source.contains(source_token("close_after = true").as_str()));
+        assert!(
+            dialog_source.contains(source_token("self.execute_git_action(move |root|").as_str())
+        );
+        assert!(
+            dialog_source.contains(source_token("self.pending_worktree_action = Some(").as_str())
+        );
+        assert!(
+            dialog_source.contains(
+                source_token("conflict_files.is_empty() && !conflict_action_busy").as_str()
+            )
+        );
+        assert!(
+            implementation_source
+                .contains(source_token("self.load_repository_uncached(root)").as_str())
+        );
     }
 
     #[test]
@@ -51472,60 +52996,122 @@ diff --git a/file.txt b/file.txt
         );
         let general_height = global_settings_dialog_height(SettingsTab::General, 2, 0, 0);
         assert_eq!(global_settings_content_max_height(general_height), 424.0);
-        let source = include_str!("app.rs");
-        assert!(source.contains("fn settings_modal"));
-        assert!(source.contains("fn repo_settings_modal"));
-        assert!(source.contains("self.tr(\"options.title\")"));
-        assert!(source.contains("self.tr(\"repo.settings.title\")"));
-        let global_start = source.find("fn global_settings_page").unwrap();
-        let global_end = source.find("fn repo_remotes_settings_page").unwrap();
-        assert!(!source[global_start..global_end].contains("Repository panels"));
-        assert!(source[global_start..global_end].contains("settings_choice_button("));
-        assert!(source[global_start..global_end].contains("settings_accent_button("));
-        assert!(source[global_start..global_end].contains("settings.appearance"));
-        assert!(source[global_start..global_end].contains("settings.theme"));
-        assert!(source[global_start..global_end].contains("settings.language"));
-        assert!(!source[global_start..global_end].contains("\"Global Options\""));
-        assert!(!source[global_start..global_end].contains("settings_field(ui, \"Theme\""));
-        assert!(!source[global_start..global_end].contains("settings_field(ui, \"Language\""));
-        let modal_start = source.find("fn settings_modal(&mut self").unwrap();
+        let source = source_token(include_str!("app.rs"));
+        assert!(source.contains(source_token("fn settings_modal").as_str()));
+        assert!(source.contains(source_token("fn repo_settings_modal").as_str()));
+        assert!(source.contains(source_token("self.tr(\"options.title\")").as_str()));
+        assert!(source.contains(source_token("self.tr(\"repo.settings.title\")").as_str()));
+        let global_start = source
+            .find(source_token("fn global_settings_page").as_str())
+            .unwrap();
+        let global_end = source
+            .find(source_token("fn repo_remotes_settings_page").as_str())
+            .unwrap();
+        assert!(
+            !source[global_start..global_end].contains(source_token("Repository panels").as_str())
+        );
+        assert!(
+            source[global_start..global_end]
+                .contains(source_token("settings_choice_button(").as_str())
+        );
+        assert!(
+            source[global_start..global_end]
+                .contains(source_token("settings_accent_button(").as_str())
+        );
+        assert!(
+            source[global_start..global_end].contains(source_token("settings.appearance").as_str())
+        );
+        assert!(source[global_start..global_end].contains(source_token("settings.theme").as_str()));
+        assert!(
+            source[global_start..global_end].contains(source_token("settings.language").as_str())
+        );
+        assert!(
+            !source[global_start..global_end].contains(source_token("\"Global Options\"").as_str())
+        );
+        assert!(
+            !source[global_start..global_end]
+                .contains(source_token("settings_field(ui, \"Theme\"").as_str())
+        );
+        assert!(
+            !source[global_start..global_end]
+                .contains(source_token("settings_field(ui, \"Language\"").as_str())
+        );
+        let modal_start = source
+            .find(source_token("fn settings_modal(&mut self").as_str())
+            .unwrap();
         let modal_end = source[modal_start..]
-            .find("fn repo_settings_modal(&mut self")
+            .find(source_token("fn repo_settings_modal(&mut self").as_str())
             .unwrap();
         let modal_source = &source[modal_start..modal_start + modal_end];
-        assert!(modal_source.contains("global_settings_dialog_width(self.settings_tab)"));
-        assert!(modal_source.contains("global_settings_dialog_height("));
-        assert!(modal_source.contains("global_settings_content_max_height(size.y)"));
-        assert!(modal_source.contains("safe_set_min_size(ui, body_inner_size)"));
-        assert!(modal_source.contains("settings_dialog_footer(ui, |ui|"));
-        assert!(!modal_source.contains("ui.available_height() - SETTINGS_FOOTER_HEIGHT"));
-        assert!(!modal_source.contains("soft_panel_frame(theme::panel(), 16, 12)"));
-        let footer_start = source.find("fn settings_dialog_footer(").unwrap();
+        assert!(
+            modal_source
+                .contains(source_token("global_settings_dialog_width(self.settings_tab)").as_str())
+        );
+        assert!(modal_source.contains(source_token("global_settings_dialog_height(").as_str()));
+        assert!(
+            modal_source
+                .contains(source_token("global_settings_content_max_height(size.y)").as_str())
+        );
+        assert!(
+            modal_source.contains(source_token("safe_set_min_size(ui, body_inner_size)").as_str())
+        );
+        assert!(modal_source.contains(source_token("settings_dialog_footer(ui, |ui|").as_str()));
+        assert!(
+            !modal_source
+                .contains(source_token("ui.available_height() - SETTINGS_FOOTER_HEIGHT").as_str())
+        );
+        assert!(
+            !modal_source
+                .contains(source_token("soft_panel_frame(theme::panel(), 16, 12)").as_str())
+        );
+        let footer_start = source
+            .find(source_token("fn settings_dialog_footer(").as_str())
+            .unwrap();
         let footer_end = source[footer_start..]
-            .find("fn global_settings_dialog_width(")
+            .find(source_token("fn global_settings_dialog_width(").as_str())
             .unwrap();
         let footer_source = &source[footer_start..footer_start + footer_end];
-        assert!(footer_source.contains("let body_rect = ui.max_rect();"));
-        assert!(footer_source.contains("body_rect.bottom() - SETTINGS_FOOTER_HEIGHT"));
-        assert!(footer_source.contains(".max_rect(footer_rect)"));
-        let page_start = source.find("fn global_settings_page(&mut self").unwrap();
+        assert!(footer_source.contains(source_token("let body_rect = ui.max_rect();").as_str()));
+        assert!(
+            footer_source
+                .contains(source_token("body_rect.bottom() - SETTINGS_FOOTER_HEIGHT").as_str())
+        );
+        assert!(footer_source.contains(source_token(".max_rect(footer_rect)").as_str()));
+        let page_start = source
+            .find(source_token("fn global_settings_page(&mut self").as_str())
+            .unwrap();
         let page_end = source[page_start..]
-            .find("fn global_general_settings(&mut self")
+            .find(source_token("fn global_general_settings(&mut self").as_str())
             .unwrap();
         let page_source = &source[page_start..page_start + page_end];
-        assert!(page_source.contains(".max_height(content_max_height)"));
-        let choice_start = source.find("fn settings_choice_button(").unwrap();
+        assert!(page_source.contains(source_token(".max_height(content_max_height)").as_str()));
+        let choice_start = source
+            .find(source_token("fn settings_choice_button(").as_str())
+            .unwrap();
         let choice_end = source[choice_start..]
-            .find("fn settings_accent_button(")
+            .find(source_token("fn settings_accent_button(").as_str())
             .unwrap();
         let choice_source = &source[choice_start..choice_start + choice_end];
-        assert!(choice_source.contains("if selected {\n            Color32::WHITE"));
-        assert!(choice_source.contains("theme::text()"));
-        assert!(choice_source.contains("paint_text_button_hover_shadow_for_response"));
-        let accent_start = source.find("fn settings_accent_button(").unwrap();
-        let accent_end = source[accent_start..].find("fn tree_empty(").unwrap();
+        assert!(
+            choice_source
+                .contains(source_token("if selected {\n            Color32::WHITE").as_str())
+        );
+        assert!(choice_source.contains(source_token("theme::text()").as_str()));
+        assert!(
+            choice_source
+                .contains(source_token("paint_text_button_hover_shadow_for_response").as_str())
+        );
+        let accent_start = source
+            .find(source_token("fn settings_accent_button(").as_str())
+            .unwrap();
+        let accent_end = source[accent_start..]
+            .find(source_token("fn tree_empty(").as_str())
+            .unwrap();
         let accent_source = &source[accent_start..accent_start + accent_end];
-        assert!(accent_source.contains("paint_text_button_hover_shadow_for_response"));
+        assert!(
+            accent_source
+                .contains(source_token("paint_text_button_hover_shadow_for_response").as_str())
+        );
         assert_eq!(
             settings_tab_label(Language::Chinese, SettingsTab::General),
             "\u{5e38}\u{89c4}"
@@ -52200,59 +53786,129 @@ diff --git a/file.txt b/file.txt
     fn automatic_update_setting_defaults_on_and_checks_once_without_interrupting_drag() {
         let old: AppSettings = serde_json::from_str("{}").unwrap();
         assert!(old.auto_check_updates);
-        let disabled = AppSettings { auto_check_updates: false, ..AppSettings::default() };
-        let restored: AppSettings = serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        let disabled = AppSettings {
+            auto_check_updates: false,
+            ..AppSettings::default()
+        };
+        let restored: AppSettings =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
         assert!(!restored.auto_check_updates);
         let mut pending = true;
-        assert!(!take_automatic_update_check(false, &mut pending, false, false));
-        assert!(!take_automatic_update_check(true, &mut pending, true, false));
-        assert!(!take_automatic_update_check(true, &mut pending, false, true));
+        assert!(!take_automatic_update_check(
+            false,
+            &mut pending,
+            false,
+            false
+        ));
+        assert!(!take_automatic_update_check(
+            true,
+            &mut pending,
+            true,
+            false
+        ));
+        assert!(!take_automatic_update_check(
+            true,
+            &mut pending,
+            false,
+            true
+        ));
         assert!(pending);
-        assert!(take_automatic_update_check(true, &mut pending, false, false));
+        assert!(take_automatic_update_check(
+            true,
+            &mut pending,
+            false,
+            false
+        ));
         assert!(!pending);
-        assert!(!take_automatic_update_check(true, &mut pending, false, false));
+        assert!(!take_automatic_update_check(
+            true,
+            &mut pending,
+            false,
+            false
+        ));
         pending = true; // Enabling the setting requests one new check.
-        assert!(take_automatic_update_check(true, &mut pending, false, false));
+        assert!(take_automatic_update_check(
+            true,
+            &mut pending,
+            false,
+            false
+        ));
     }
 
     #[test]
     fn automatic_update_checks_are_silent_owned_and_never_install() {
         let source = include_str!("app.rs");
-        let automatic = source.split("fn maybe_start_automatic_update_check(").nth(1).unwrap()
-            .split("fn start_update_check_task(").next().unwrap();
+        let automatic = source
+            .split("fn maybe_start_automatic_update_check(")
+            .nth(1)
+            .unwrap()
+            .split("fn start_update_check_task(")
+            .next()
+            .unwrap();
         assert!(automatic.contains("take_automatic_update_check("));
         assert!(automatic.contains("self.start_update_check_task(true)"));
         assert!(!automatic.contains("update_dialog_open"));
         assert!(!automatic.contains("start_update_install"));
-        let worker = source.split("fn start_update_check_task(").nth(1).unwrap()
-            .split("fn start_update_install(").next().unwrap();
-        assert!(worker.find("self.update_task = Some(receiver)").unwrap() < worker.find("thread::spawn").unwrap());
+        let worker = source
+            .split("fn start_update_check_task(")
+            .nth(1)
+            .unwrap()
+            .split("fn start_update_install(")
+            .next()
+            .unwrap();
+        assert!(
+            worker.find("self.update_task = Some(receiver)").unwrap()
+                < worker.find("thread::spawn").unwrap()
+        );
         assert!(!worker.contains("update_dialog_open"));
         assert!(!worker.contains("download_and_install"));
-        let poll = source.split("if let Some(receiver) = self.update_task.take()").nth(1).unwrap()
-            .split("if let Some(receiver) = self.create_patch_task.take()").next().unwrap();
+        let poll = source
+            .split("if let Some(receiver) = self.update_task.take()")
+            .nth(1)
+            .unwrap()
+            .split("if let Some(receiver) = self.create_patch_task.take()")
+            .next()
+            .unwrap();
         assert!(poll.contains("if !self.update_check_silent || self.auto_check_updates"));
         assert_eq!(poll.matches("if !self.update_check_silent {").count(), 2);
         assert!(poll.contains("self.update_task = Some(receiver)"));
         assert!(!poll.contains("update_dialog_open"));
         assert!(!poll.contains("show_toast"));
-        let title = source.split("fn custom_title_bar(").nth(1).unwrap()
-            .split("fn desktop_menu_bar(").next().unwrap();
+        let title = source
+            .split("fn custom_title_bar(")
+            .nth(1)
+            .unwrap()
+            .split("fn desktop_menu_bar(")
+            .next()
+            .unwrap();
         assert!(title.contains("filter(|release| release.is_newer)"));
         assert!(title.contains("if available_release.is_some()"));
-        assert!(!source.split("#[cfg(test)]").next().unwrap().contains("preview_update_badge"));
+        assert!(
+            !source
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap()
+                .contains("preview_update_badge")
+        );
         assert!(title.contains("include_rect(&mut window_control_rects, update.rect)"));
         assert!(title.contains("self.update_dialog_open = true"));
         assert!(!title.contains("start_update_install"));
         assert!(!title.contains("check_latest_release"));
-        assert!(include_str!("updater.rs").contains(".timeout(std::time::Duration::from_secs(20))"));
+        assert!(
+            include_str!("updater.rs").contains(".timeout(std::time::Duration::from_secs(20))")
+        );
     }
 
     #[test]
     fn general_settings_put_language_first() {
         let source = include_str!("app.rs");
-        let general = source.split("fn global_general_settings(&mut self").nth(1).unwrap()
-            .split("fn global_font_settings(").next().unwrap();
+        let general = source
+            .split("fn global_general_settings(&mut self")
+            .nth(1)
+            .unwrap()
+            .split("fn global_font_settings(")
+            .next()
+            .unwrap();
         let first_field = general.split("settings_field(").nth(1).unwrap();
         assert!(first_field.starts_with("ui, i18n::t(language, \"settings.language\")"));
         assert_eq!(general.matches("\"settings.language\"").count(), 1);
@@ -52263,10 +53919,18 @@ diff --git a/file.txt b/file.txt
     #[test]
     fn update_badge_fits_title_controls_and_is_excluded_from_drag_in_both_languages() {
         let source = include_str!("app.rs");
-        let badge = source.split("fn update_available_button(").nth(1).unwrap()
-            .split("fn text_action_button(").next().unwrap();
+        let badge = source
+            .split("fn update_available_button(")
+            .nth(1)
+            .unwrap()
+            .split("fn text_action_button(")
+            .next()
+            .unwrap();
         assert!(badge.contains("Some(UiIcon::Update)"));
-        assert!(source.contains("UiIcon::Update => egui::include_image!(\"../assets/icons/update.svg\")"));
+        assert!(
+            source
+                .contains("UiIcon::Update => egui::include_image!(\"../assets/icons/update.svg\")")
+        );
         assert!(!badge.contains("Some(UiIcon::Refresh)"));
         assert!(!badge.contains("on_hover"));
         let ctx = egui::Context::default();
@@ -52274,32 +53938,52 @@ diff --git a/file.txt b/file.txt
             ctx.set_pixels_per_point(scale);
             for language in [Language::Chinese, Language::English] {
                 for enabled in [true, false] {
-                    let output = ctx.run(egui::RawInput {
-                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 120.0))),
-                        ..Default::default()
-                    }, |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let close = window_control_button(ui, "×", true);
-                                let maximize = window_control_button(ui, "□", false);
-                                let minimize = window_control_button(ui, "−", false);
-                                let badge = update_available_button(ui, language, enabled);
-                                assert_eq!(badge.enabled(), enabled);
-                                assert!((badge.rect.height() - 24.0).abs() < 0.5);
-                                assert!(badge.rect.right() <= minimize.rect.left());
-                                assert!(minimize.rect.right() <= maximize.rect.left());
-                                assert!(maximize.rect.right() <= close.rect.left());
-                                assert!((badge.rect.center().y - minimize.rect.center().y).abs() < 0.5);
-                                let controls = badge.rect.union(close.rect);
-                                let hit_map = TitleBarHitMap {
-                                    screen: ctx.screen_rect(), pixels_per_point: scale, language,
-                                    candidate: ctx.screen_rect(), menu_controls: Rect::NOTHING,
-                                    window_controls: controls,
-                                };
-                                assert_eq!(hit_map.hit(ctx.screen_rect(), scale, language, badge.rect.center()), TitleBarDragHit::WindowControls);
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(900.0, 120.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let close = window_control_button(ui, "×", true);
+                                    let maximize = window_control_button(ui, "□", false);
+                                    let minimize = window_control_button(ui, "−", false);
+                                    let badge = update_available_button(ui, language, enabled);
+                                    assert_eq!(badge.enabled(), enabled);
+                                    assert!((badge.rect.height() - 24.0).abs() < 0.5);
+                                    assert!(badge.rect.right() <= minimize.rect.left());
+                                    assert!(minimize.rect.right() <= maximize.rect.left());
+                                    assert!(maximize.rect.right() <= close.rect.left());
+                                    assert!(
+                                        (badge.rect.center().y - minimize.rect.center().y).abs()
+                                            < 0.5
+                                    );
+                                    let controls = badge.rect.union(close.rect);
+                                    let hit_map = TitleBarHitMap {
+                                        screen: ctx.screen_rect(),
+                                        pixels_per_point: scale,
+                                        language,
+                                        candidate: ctx.screen_rect(),
+                                        menu_controls: Rect::NOTHING,
+                                        window_controls: controls,
+                                    };
+                                    assert_eq!(
+                                        hit_map.hit(
+                                            ctx.screen_rect(),
+                                            scale,
+                                            language,
+                                            badge.rect.center()
+                                        ),
+                                        TitleBarDragHit::WindowControls
+                                    );
+                                });
                             });
-                        });
-                    });
+                        },
+                    );
                     assert!(output.platform_output.commands.is_empty());
                 }
             }

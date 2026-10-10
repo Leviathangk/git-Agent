@@ -1,6 +1,36 @@
 use std::fs;
 
 #[test]
+fn dev_script_builds_stages_and_watches_native_plugins() {
+    let script = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/dev.ps1"),
+    )
+    .unwrap();
+    let build = script
+        .split("function Build-Bins")
+        .nth(1)
+        .unwrap()
+        .split("function Start-MainWindow")
+        .next()
+        .unwrap();
+    assert!(build.contains("Build-Plugins"));
+    assert!(build.contains("cargo build --manifest-path $cargoPath --lib --target-dir"));
+    assert!(build.contains("Copy-Item -LiteralPath $libraryPath"));
+    assert!(build.contains("$manifest.locales.PSObject.Properties"));
+    assert!(build.contains("Copy-Item -LiteralPath $localeSource -Destination $localeTarget"));
+    assert!(build.contains("Plugin dictionary path escapes plugin directory"));
+    assert!(build.contains("$resolvedStage -ne $expectedStage"));
+    assert!(script.contains("$env:GIT_AGENT_PLUGIN_DIR = $pluginStageDir"));
+    assert!(script.contains("$path -like \"plugins\\*\""));
+    assert!(script.contains("$path -like \"crates\\*\""));
+    assert!(script.contains("$SmokeTestSeconds"));
+    assert!(script.contains("$ExternalPluginProjects"));
+    assert!(script.contains("git-agent-plugin-template"));
+    assert!(script.contains("Register-ObjectEvent"));
+    assert!(script.contains("Unregister-Event -SourceIdentifier $subscription.SourceIdentifier"));
+}
+
+#[test]
 fn dev_script_stops_running_app_before_building_bins() {
     let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/dev.ps1");
     let script = fs::read_to_string(script_path).expect("dev.ps1 should be readable");

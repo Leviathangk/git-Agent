@@ -93,7 +93,11 @@ fn app_icon_data() -> eframe::egui::IconData {
     let image = egui_extras::image::load_svg_bytes(include_bytes!("../assets/icons/logo-ga.svg"))
         .expect("embedded Git Agent logo must be valid SVG");
     eframe::egui::IconData {
-        rgba: image.pixels.iter().flat_map(|pixel| pixel.to_srgba_unmultiplied()).collect(),
+        rgba: image
+            .pixels
+            .iter()
+            .flat_map(|pixel| pixel.to_srgba_unmultiplied())
+            .collect(),
         width: image.size[0] as u32,
         height: image.size[1] as u32,
     }
@@ -141,7 +145,10 @@ mod tests {
             // A real round hole, not the narrow slit left by a line through its center.
             for dy in -2isize..=1 {
                 for dx in -2isize..=1 {
-                    assert_eq!(alpha((x as isize + dx) as usize, (y as isize + dy) as usize), 0);
+                    assert_eq!(
+                        alpha((x as isize + dx) as usize, (y as isize + dy) as usize),
+                        0
+                    );
                 }
             }
         }
@@ -151,14 +158,32 @@ mod tests {
         let mut visited = std::collections::HashSet::new();
         let mut pending = vec![(23usize, 31usize)];
         while let Some((x, y)) = pending.pop() {
-            if alpha(x, y) < 128 || !visited.insert((x, y)) { continue; }
-            for (nx, ny) in [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)] {
-                if nx < size && ny < size { pending.push((nx, ny)); }
+            if alpha(x, y) < 128 || !visited.insert((x, y)) {
+                continue;
+            }
+            for (nx, ny) in [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ] {
+                if nx < size && ny < size {
+                    pending.push((nx, ny));
+                }
             }
         }
-        assert_eq!(visited.len(), icon.rgba.chunks_exact(4).filter(|p| p[3] >= 128).count());
-        assert_eq!(include_bytes!("../assets/icons/logo-ga.svg"), include_bytes!("../website/public/assets/logo-ga.svg"));
-        assert_eq!(include_bytes!("../assets/icons/logo-ga.png"), include_bytes!("../website/public/assets/logo-ga.png"));
+        assert_eq!(
+            visited.len(),
+            icon.rgba.chunks_exact(4).filter(|p| p[3] >= 128).count()
+        );
+        assert_eq!(
+            include_bytes!("../assets/icons/logo-ga.svg"),
+            include_bytes!("../website/public/assets/logo-ga.svg")
+        );
+        assert_eq!(
+            include_bytes!("../assets/icons/logo-ga.png"),
+            include_bytes!("../website/public/assets/logo-ga.png")
+        );
     }
 
     #[test]

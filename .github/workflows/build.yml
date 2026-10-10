@@ -115,6 +115,20 @@ jobs:
         shell: cmd
         run: cargo build --release --locked
 
+      - name: Stage pinned bundled plugins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            python scripts/prepare-bundled-plugins.py --target x86_64-pc-windows-msvc --output target/release/bundled-plugins
+          elif [ "${{ runner.os }}" = "Linux" ]; then
+            python3 scripts/prepare-bundled-plugins.py --target x86_64-unknown-linux-gnu --output target/release/bundled-plugins
+          else
+            python3 scripts/prepare-bundled-plugins.py --target x86_64-apple-darwin --output dist/universal-bin/bundled-plugins
+            python3 scripts/prepare-bundled-plugins.py --target aarch64-apple-darwin --output dist/universal-bin/bundled-plugins
+          fi
+
       - name: Package installer
         if: runner.os == 'Linux'
         shell: bash
@@ -189,10 +203,20 @@ jobs:
         run: |
           set -euo pipefail
 
+          # SemVer prerelease suffixes precede optional build metadata.
+          version="${TAG_NAME#v}"
+          version="${version%%+*}"
+          release_flags=(--prerelease=false)
+          if [[ "$version" == *-* ]]; then
+            release_flags=(--prerelease --latest=false)
+          fi
+
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" "${release_flags[@]}"
             gh release upload "$TAG_NAME" release-assets/* --clobber
           else
             gh release create "$TAG_NAME" release-assets/* \
+              "${release_flags[@]}" \
               --verify-tag \
               --title "Git Agent $TAG_NAME" \
               --notes "[English changelog](https://github.com/adoin/git-Agent/blob/$TAG_NAME/CHANGELOG.md) · [中文更新日志](https://github.com/adoin/git-Agent/blob/$TAG_NAME/CHANGELOG.zh-CN.md)"

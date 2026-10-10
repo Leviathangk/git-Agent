@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "plugins": [
+    {
+      "id": "github",
+      "version": "0.1.0",
+      "repository": "adoin/git-agent-plugin-template",
+      "tag": "v0.1.0",
+      "revision": "9e7e3792c80cf3a11b089644e0336acf4736a491"
+    }
+  ]
+}

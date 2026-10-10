@@ -7,6 +7,8 @@ if [[ $# -ne 4 ]]; then
 fi
 
 version="${1#v}"
+deb_version="${version%%+*}"
+deb_version="${deb_version/-/~}"
 architecture="$2"
 binary_dir="$3"
 output_dir="$4"
@@ -30,6 +32,11 @@ for executable in git-agent git-agent-merge git-agent-diff; do
   ln -s "../lib/git-agent/$executable" "$package_root/usr/bin/$executable"
 done
 
+if [[ -d "$binary_dir/bundled-plugins" ]]; then
+  mkdir -p "$install_root/bundled-plugins"
+  cp -R "$binary_dir/bundled-plugins/." "$install_root/bundled-plugins/"
+fi
+
 install -m 644 assets/icons/logo-ga.png \
   "$package_root/usr/share/icons/hicolor/64x64/apps/git-agent.png"
 
@@ -48,7 +55,7 @@ DESKTOP
 installed_size=$(du -sk "$package_root/usr" | cut -f1)
 cat > "$package_root/DEBIAN/control" <<CONTROL
 Package: git-agent
-Version: $version
+Version: $deb_version
 Section: devel
 Priority: optional
 Architecture: $architecture

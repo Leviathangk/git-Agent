@@ -540,6 +540,7 @@ pub fn repository_refresh_fingerprint(
     let output = git_output_bytes(
         root,
         &[
+            "--no-optional-locks",
             "status",
             "--porcelain=v1",
             "-z",
@@ -4769,8 +4770,13 @@ mod tests {
     #[test]
     fn refresh_detects_clean_head_refs_and_configuration_changes() -> Result<()> {
         let root = init_patch_test_repo("refresh-full-scope")?;
+        // Same-content writes invalidate stat-cache entries without changing Git status.
+        fs::write(root.join("selected.txt"), "before\n")?;
+        let index_path = git_path(&root, "index").unwrap();
+        let index_before = fs::read(&index_path)?;
         let initial = repository_refresh_fingerprint(&root)?;
         assert_eq!(initial, repository_refresh_fingerprint(&root)?);
+        assert_eq!(index_before, fs::read(index_path)?);
         git_output(&root, &["commit", "--allow-empty", "-m", "external commit"])?;
         let committed = repository_refresh_fingerprint(&root)?;
         assert_eq!(initial.status, committed.status);

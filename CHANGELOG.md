@@ -5,7 +5,16 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.0.2 — 2026-10-13
+
+### Fixed
+
+- Repository refresh probes no longer write Git's optional index stat cache, preventing unchanged repositories from appearing changed on repeated refreshes. Added regression coverage for same-content file writes and index preservation.
+- Includes the commit, refresh and AI merge improvements listed below. Version 2.0.1 failed the refresh regression on all three platforms and did not publish installers.
+
 ## 2.0.1 — 2026-10-13
+
+Installer build failed. Use 2.0.2 or later for the changes below.
 
 ### Improved
 

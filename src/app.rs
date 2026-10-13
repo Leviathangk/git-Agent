@@ -1143,6 +1143,7 @@ struct RepositoryRefreshRequest {
     priority: RepositoryRefreshPriority,
     probe_before_full_refresh: bool,
     result_sender: Sender<RepoTaskResult>,
+    additional_result_senders: Vec<Sender<RepoTaskResult>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1251,6 +1252,9 @@ fn repository_refresh_scheduler_loop(
     automatic_result_sender: Sender<RepoTaskResult>,
     ctx: egui::Context,
 ) {
+    let (completed_sender, completed_receiver) =
+        mpsc::channel::<(String, Option<git::RepositoryRefreshFingerprint>)>();
+    let mut running_keys = HashSet::<String>::new();
     let mut scheduled = HashMap::<String, RepositoryRefreshScheduleState>::new();
     let mut pending = Vec::<RepositoryRefreshRequest>::new();
     let mut pending_exclusive = Vec::<RepositoryExclusiveRequest>::new();
@@ -1266,9 +1270,21 @@ fn repository_refresh_scheduler_loop(
             .map(|state| state.next_refresh_at)
             .min()
             .unwrap_or(now + Duration::from_secs(1));
-        let timeout = next_due
-            .saturating_duration_since(now)
-            .min(Duration::from_secs(1));
+        let mut occupied = exclusive_keys.clone();
+        occupied.extend(running_keys.iter().cloned());
+        let runnable = next_repository_refresh_request_index(&pending, &blocked_keys, &occupied)
+            .is_some_and(|index| {
+                running_keys.len() < 2
+                    && (pending[index].priority == RepositoryRefreshPriority::Foreground
+                        || running_keys.is_empty())
+            });
+        let timeout = if runnable {
+            Duration::ZERO
+        } else {
+            next_due
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(80))
+        };
         match command_receiver.recv_timeout(timeout) {
             Ok(command) => {
                 apply_repository_refresh_scheduler_command(
@@ -1298,16 +1314,34 @@ fn repository_refresh_scheduler_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
+        while let Ok((key, fingerprint)) = completed_receiver.try_recv() {
+            running_keys.remove(&key);
+            if let Some(state) = scheduled.get_mut(&key) {
+                if let Some(fingerprint) = fingerprint {
+                    state.repository.fingerprint = Some(fingerprint);
+                }
+                state.next_refresh_at = Instant::now()
+                    + if state.repository.active {
+                        active_interval
+                    } else {
+                        inactive_interval
+                    };
+            }
+        }
+        let mut unavailable_keys = exclusive_keys.clone();
+        unavailable_keys.extend(running_keys.iter().cloned());
+        let mut automatic_blocked = blocked_keys.clone();
+        automatic_blocked.extend(running_keys.iter().cloned());
         enqueue_due_repository_refreshes(
             &mut scheduled,
             &mut pending,
-            &blocked_keys,
+            &automatic_blocked,
             active_interval,
             inactive_interval,
             &automatic_result_sender,
         );
         if let Some(index) =
-            next_repository_exclusive_request_index(&pending_exclusive, &exclusive_keys)
+            next_repository_exclusive_request_index(&pending_exclusive, &unavailable_keys)
         {
             let request = pending_exclusive.swap_remove(index);
             exclusive_keys.insert(request.key);
@@ -1316,78 +1350,91 @@ fn repository_refresh_scheduler_loop(
             continue;
         }
         if let Some(index) =
-            next_repository_refresh_request_index(&pending, &blocked_keys, &exclusive_keys)
+            next_repository_refresh_request_index(&pending, &blocked_keys, &unavailable_keys)
         {
-            let request = pending.swap_remove(index);
-            let probe_started = Instant::now();
-            let probe = request
-                .probe_before_full_refresh
-                .then(|| git::repository_refresh_fingerprint(&request.path));
-            let probe_matches = probe.as_ref().is_some_and(|probe| {
-                probe.as_ref().is_ok_and(|fingerprint| {
-                    scheduled.get(&request.key).is_some_and(|state| {
-                        state
-                            .repository
-                            .fingerprint
-                            .as_ref()
-                            .map_or(!state.repository.active, |known| known == fingerprint)
-                    })
-                })
-            });
-            if request.probe_before_full_refresh {
-                let outcome = match &probe {
-                    Some(Ok(_)) if probe_matches => "unchanged",
-                    Some(Ok(_)) => "changed",
-                    Some(Err(_)) => "probe-error",
-                    None => "not-run",
-                };
-                diagnostics::repository_refresh_trace(
-                    "refresh.probe",
-                    &format!(
-                        "root={} outcome={outcome} elapsed_ms={}",
-                        request.path.display(),
-                        probe_started.elapsed().as_millis()
-                    ),
-                );
-            }
-            // A changed probe is only a candidate. Do not advance the known
-            // fingerprint until the corresponding full snapshot succeeds;
-            // otherwise one failed refresh would make stale UI permanent.
-            if probe_matches
-                && let Some(Ok(fingerprint)) = probe.as_ref()
-                && let Some(state) = scheduled.get_mut(&request.key)
+            if running_keys.len() >= 2
+                || (pending[index].priority == RepositoryRefreshPriority::Background
+                    && !running_keys.is_empty())
             {
-                state.repository.fingerprint = Some(fingerprint.clone());
+                continue;
             }
-            if !probe_matches {
-                let full_started = Instant::now();
-                let result = git::open_repository_core(request.path.clone());
-                if request.probe_before_full_refresh {
-                    diagnostics::repository_refresh_trace(
-                        "refresh.full",
-                        &format!(
-                            "root={} outcome={} elapsed_ms={}",
-                            request.path.display(),
-                            if result.is_ok() { "success" } else { "error" },
-                            full_started.elapsed().as_millis()
-                        ),
-                    );
-                }
-                let completed_fingerprint = result
-                    .as_ref()
-                    .ok()
-                    .map(git::repository_snapshot_refresh_fingerprint);
-                let delivered = request.result_sender.send((request.path, result)).is_ok();
-                if delivered
-                    && let Some(fingerprint) = completed_fingerprint
-                    && let Some(state) = scheduled.get_mut(&request.key)
-                {
-                    state.repository.fingerprint = Some(fingerprint);
-                }
+            let request = pending.swap_remove(index);
+            running_keys.insert(request.key.clone());
+            let known = scheduled
+                .get(&request.key)
+                .and_then(|state| state.repository.fingerprint.clone());
+            let completed_sender = completed_sender.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let key = request.key.clone();
+                let path = request.path.clone();
+                let mut failure_senders = request.additional_result_senders.clone();
+                failure_senders.push(request.result_sender.clone());
+                let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_repository_refresh(request, known)
+                }))
+                .unwrap_or_else(|_| {
+                    for sender in failure_senders {
+                        let _ = sender.send((
+                            path.clone(),
+                            Err(anyhow::anyhow!(
+                                "Repository refresh worker stopped unexpectedly"
+                            )),
+                        ));
+                    }
+                    (key, None)
+                });
+                let _ = completed_sender.send(completion);
                 ctx.request_repaint();
-            }
+            });
         }
     }
+}
+
+fn run_repository_refresh(
+    request: RepositoryRefreshRequest,
+    known: Option<git::RepositoryRefreshFingerprint>,
+) -> (String, Option<git::RepositoryRefreshFingerprint>) {
+    let started = Instant::now();
+    let probe = request
+        .probe_before_full_refresh
+        .then(|| git::repository_refresh_fingerprint(&request.path));
+    if let Some(Ok(fingerprint)) = &probe {
+        if known.as_ref() == Some(fingerprint) {
+            diagnostics::repository_refresh_trace(
+                "refresh.probe",
+                &format!(
+                    "root={} outcome=unchanged elapsed_ms={}",
+                    request.path.display(),
+                    started.elapsed().as_millis()
+                ),
+            );
+            return (request.key, Some(fingerprint.clone()));
+        }
+    }
+    let result = git::open_repository_core_with_probe(&request.path, probe.and_then(Result::ok));
+    diagnostics::repository_refresh_trace(
+        "refresh.full",
+        &format!(
+            "root={} outcome={} elapsed_ms={}",
+            request.path.display(),
+            if result.is_ok() { "success" } else { "error" },
+            started.elapsed().as_millis()
+        ),
+    );
+    let fingerprint = result
+        .as_ref()
+        .ok()
+        .map(git::repository_snapshot_refresh_fingerprint);
+    for sender in request.additional_result_senders {
+        let copied = result
+            .as_ref()
+            .map(Clone::clone)
+            .map_err(|error| anyhow::anyhow!("{error:#}"));
+        let _ = sender.send((request.path.clone(), copied));
+    }
+    let delivered = request.result_sender.send((request.path, result)).is_ok();
+    (request.key, delivered.then_some(fingerprint).flatten())
 }
 
 fn apply_repository_refresh_scheduler_command(
@@ -1499,6 +1546,7 @@ fn enqueue_due_repository_refreshes(
                 priority: RepositoryRefreshPriority::Background,
                 probe_before_full_refresh: true,
                 result_sender: automatic_result_sender.clone(),
+                additional_result_senders: Vec::new(),
             },
         );
     }
@@ -1509,8 +1557,15 @@ fn enqueue_repository_refresh(
     request: RepositoryRefreshRequest,
 ) {
     if let Some(existing) = pending.iter_mut().find(|queued| queued.key == request.key) {
-        if request.priority >= existing.priority {
-            *existing = request;
+        existing.priority = existing.priority.max(request.priority);
+        existing.probe_before_full_refresh &= request.probe_before_full_refresh;
+        if !request.probe_before_full_refresh {
+            existing
+                .additional_result_senders
+                .push(request.result_sender);
+            existing
+                .additional_result_senders
+                .extend(request.additional_result_senders);
         }
         return;
     }
@@ -1564,7 +1619,7 @@ enum RepositoryUndoDirection {
 #[derive(Clone, Debug)]
 enum RepositoryUndoKind {
     Position,
-    Commit { staged_diff: String },
+    Commit { staged_tree: String },
 }
 
 #[derive(Clone, Debug)]
@@ -4040,6 +4095,7 @@ fn repository_core_snapshots_equal_for_refresh(
         && left.remotes == right.remotes
         && stashes_equal
         && left.tags == right.tags
+        && left.refresh_worktree_signature == right.refresh_worktree_signature
         && left.status == right.status
         && left.staged == right.staged
         && left.unstaged == right.unstaged
@@ -4854,6 +4910,7 @@ impl GitAgentApp {
                 priority,
                 probe_before_full_refresh: false,
                 result_sender: sender,
+                additional_result_senders: Vec::new(),
             });
     }
 
@@ -5502,6 +5559,32 @@ impl GitAgentApp {
     }
 
     fn apply_repository_snapshot(&mut self, mut snapshot: RepositorySnapshot) {
+        let preserve_history = self.snapshot.as_ref().is_some_and(|current| {
+            current.root == snapshot.root
+                && current.branch == snapshot.branch
+                && ["head:", "refs:"].iter().all(|prefix| {
+                    current
+                        .refresh_worktree_signature
+                        .iter()
+                        .find(|entry| entry.starts_with(prefix))
+                        == snapshot
+                            .refresh_worktree_signature
+                            .iter()
+                            .find(|entry| entry.starts_with(prefix))
+                })
+        });
+        if preserve_history {
+            if let Some(current) = self.snapshot.as_mut() {
+                snapshot.commits = std::mem::take(&mut current.commits);
+                snapshot.date_commits = std::mem::take(&mut current.date_commits);
+                snapshot.topology_commits = std::mem::take(&mut current.topology_commits);
+                snapshot.all_date_commits = std::mem::take(&mut current.all_date_commits);
+                snapshot.all_topology_commits = std::mem::take(&mut current.all_topology_commits);
+                snapshot.history_loaded = current.history_loaded;
+                snapshot.history_is_all_branches = current.history_is_all_branches;
+                snapshot.history_is_topology = current.history_is_topology;
+            }
+        }
         // Replacing an existing snapshot also rebuilds worktree/history controls and clears
         // their selections below. A focused control can therefore disappear even when the
         // repository and branch themselves did not change (for example after auto refresh).
@@ -5534,8 +5617,10 @@ impl GitAgentApp {
             self.repository_snapshot_focus_clear_pending = true;
         }
         self.apply_history_sort_order_to_snapshot(&mut snapshot);
-        self.layout = graph::layout(&snapshot.commits);
-        self.selected_commit = (!snapshot.commits.is_empty()).then_some(0);
+        if !preserve_history {
+            self.layout = graph::layout(&snapshot.commits);
+            self.selected_commit = (!snapshot.commits.is_empty()).then_some(0);
+        }
         self.search_selected_commit = None;
         self.sync_active_tab_with_snapshot(&snapshot);
         if repository_transition {
@@ -5546,7 +5631,10 @@ impl GitAgentApp {
         self.maybe_prepare_rewritten_history_prompt(&snapshot);
         self.sidebar_branch_cache = SidebarBranchCache::from_snapshot(&snapshot);
         self.snapshot = Some(snapshot);
-        self.details_cache.clear();
+        if !preserve_history {
+            self.details_cache.clear();
+            self.history_rows_cache.clear();
+        }
         self.diff_cache.clear();
         self.diff_cache_order.clear();
         self.file_search_task = None;
@@ -5561,7 +5649,6 @@ impl GitAgentApp {
         self.search_selected_file_path = None;
         self.selected_diff_rows.clear();
         self.search_selected_diff_rows.clear();
-        self.history_rows_cache.clear();
         self.clear_cherry_pick_selection();
         self.selected_worktree_file = None;
         self.worktree_selection = WorktreeSelectionState::default();
@@ -7722,7 +7809,7 @@ impl GitAgentApp {
                         diagnostics::span("undo.before", format!("root={}", root.display()));
                     git::repository_undo_position(&root)?
                 };
-                let staged_diff = match &kind {
+                let staged_tree = match &kind {
                     RepositoryUndoKind::Position => {
                         if !before.status.trim().is_empty() {
                             anyhow::bail!("repository has uncommitted changes")
@@ -7733,7 +7820,7 @@ impl GitAgentApp {
                         if git::repository_has_worktree_changes(&before) {
                             anyhow::bail!("repository has unstaged or untracked changes")
                         }
-                        Some(git::cached_binary_diff(&root)?)
+                        Some(git::staged_tree_id(&root)?)
                     }
                 };
 
@@ -7757,7 +7844,7 @@ impl GitAgentApp {
                 let kind = match kind {
                     RepositoryUndoKind::Position => RepositoryUndoKind::Position,
                     RepositoryUndoKind::Commit { .. } => RepositoryUndoKind::Commit {
-                        staged_diff: staged_diff.unwrap_or_default(),
+                        staged_tree: staged_tree.unwrap_or_default(),
                     },
                 };
                 Ok(RepositoryUndoTaskOutcome::Recorded(RepositoryUndoEntry {
@@ -7824,11 +7911,11 @@ impl GitAgentApp {
                         }
                         git::reset_to_commit(&root, &entry.before.head, ResetMode::Soft)?;
                     }
-                    (RepositoryUndoKind::Commit { staged_diff }, RepositoryUndoDirection::Redo) => {
+                    (RepositoryUndoKind::Commit { staged_tree }, RepositoryUndoDirection::Redo) => {
                         if current.branch != entry.before.branch
                             || current.head != entry.before.head
                             || git::repository_has_worktree_changes(&current)
-                            || git::cached_binary_diff(&root)? != *staged_diff
+                            || git::staged_tree_id(&root)? != *staged_tree
                         {
                             anyhow::bail!("staged changes changed after the undo action")
                         }
@@ -8666,7 +8753,6 @@ impl GitAgentApp {
                         let stale_checkout_snapshot =
                             belongs_to_pending_checkout && !matches_pending_checkout;
                         let unchanged_background_snapshot = active_repo
-                            && !was_foreground
                             && self.active_snapshot_matches_background_core_refresh(&snapshot);
                         let plugin_refresh_context = self
                             .plugin_repository_events
@@ -10714,7 +10800,7 @@ impl GitAgentApp {
             self.start_undoable_git_action(
                 self.tr("commit.panel").to_owned(),
                 RepositoryUndoKind::Commit {
-                    staged_diff: String::new(),
+                    staged_tree: String::new(),
                 },
                 move |root| {
                     execute_commit_with_identity(root, &message, options, identity_execution)
@@ -52550,10 +52636,9 @@ diff --git a/file.txt b/file.txt
             implementation_source
                 .contains(source_token("fn repository_refresh_scheduler_loop(").as_str())
         );
-        assert!(
-            implementation_source
-                .contains(source_token("git::open_repository_core(request.path.clone())").as_str())
-        );
+        assert!(implementation_source.contains(
+            source_token("git::open_repository_core_with_probe(&request.path,").as_str()
+        ));
         assert!(implementation_source.contains(
             source_token("self.repository_refresh_scheduler\n            .request(").as_str()
         ));
@@ -52823,7 +52908,7 @@ diff --git a/file.txt b/file.txt
             .unwrap();
         let poll_source = &implementation_source[poll_start..poll_start + poll_end];
         assert!(poll_source.contains("let unchanged_background_snapshot = active_repo"));
-        assert!(poll_source.contains("&& !was_foreground"));
+        assert!(!poll_source.contains("&& !was_foreground"));
         assert!(
             poll_source.contains("self.active_snapshot_matches_background_core_refresh(&snapshot)")
         );
@@ -54070,6 +54155,7 @@ diff --git a/file.txt b/file.txt
                 priority: RepositoryRefreshPriority::Background,
                 probe_before_full_refresh: true,
                 result_sender: result_sender.clone(),
+                additional_result_senders: Vec::new(),
             },
         );
         enqueue_repository_refresh(
@@ -54080,6 +54166,7 @@ diff --git a/file.txt b/file.txt
                 priority: RepositoryRefreshPriority::Foreground,
                 probe_before_full_refresh: false,
                 result_sender: result_sender.clone(),
+                additional_result_senders: Vec::new(),
             },
         );
         enqueue_repository_refresh(
@@ -54090,6 +54177,7 @@ diff --git a/file.txt b/file.txt
                 priority: RepositoryRefreshPriority::Foreground,
                 probe_before_full_refresh: false,
                 result_sender,
+                additional_result_senders: Vec::new(),
             },
         );
 
@@ -54103,6 +54191,88 @@ diff --git a/file.txt b/file.txt
             RepositoryRefreshPriority::Foreground
         );
         assert_eq!(pending[0].priority, RepositoryRefreshPriority::Foreground);
+    }
+
+    #[test]
+    fn refresh_workers_isolate_repositories_and_release_mutation_gate() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-refresh-isolation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let first = git::init_repository(root.join("first"))?;
+        let second = git::init_repository(root.join("second"))?;
+        let gate = git::repository_snapshot_gate(&first);
+        let guard = gate.lock().unwrap();
+        let (scheduler, _) = RepositoryRefreshScheduler::new(egui::Context::default());
+        let (first_sender, first_receiver) = mpsc::channel();
+        scheduler.request(RepositoryRefreshRequest {
+            key: repo_state_key(&first),
+            path: first.clone(),
+            priority: RepositoryRefreshPriority::Background,
+            probe_before_full_refresh: false,
+            result_sender: first_sender,
+            additional_result_senders: Vec::new(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::sync::Arc::strong_count(&gate) < 3 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(std::sync::Arc::strong_count(&gate) >= 3);
+        let exclusive = scheduler.acquire_exclusive(repo_state_key(&first));
+        let (second_sender, second_receiver) = mpsc::channel();
+        scheduler.request(RepositoryRefreshRequest {
+            key: repo_state_key(&second),
+            path: second.clone(),
+            priority: RepositoryRefreshPriority::Foreground,
+            probe_before_full_refresh: false,
+            result_sender: second_sender,
+            additional_result_senders: Vec::new(),
+        });
+        second_receiver.recv_timeout(Duration::from_secs(10))?.1?;
+        assert!(matches!(
+            exclusive.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(guard);
+        first_receiver.recv_timeout(Duration::from_secs(10))?.1?;
+        exclusive.recv_timeout(Duration::from_secs(5))?;
+        scheduler.release_exclusive(repo_state_key(&first));
+        scheduler
+            .acquire_exclusive(repo_state_key(&first))
+            .recv_timeout(Duration::from_secs(5))?;
+        scheduler.release_exclusive(repo_state_key(&first));
+        drop(scheduler);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn merged_refresh_delivers_all_receivers_and_failure_does_not_advance_probe() {
+        let (sender, receiver) = mpsc::channel();
+        let (other_sender, other_receiver) = mpsc::channel();
+        let mut pending = Vec::new();
+        for result_sender in [sender, other_sender] {
+            enqueue_repository_refresh(
+                &mut pending,
+                RepositoryRefreshRequest {
+                    path: PathBuf::from("missing-refresh-repository"),
+                    key: "missing".to_owned(),
+                    priority: RepositoryRefreshPriority::Foreground,
+                    probe_before_full_refresh: false,
+                    result_sender,
+                    additional_result_senders: Vec::new(),
+                },
+            );
+        }
+        assert_eq!(pending.len(), 1);
+        let (_, fingerprint) =
+            run_repository_refresh(pending.pop().unwrap(), Some(Default::default()));
+        assert!(fingerprint.is_none());
+        assert!(receiver.try_recv().unwrap().1.is_err());
+        assert!(other_receiver.try_recv().unwrap().1.is_err());
     }
 
     #[test]
@@ -54164,6 +54334,7 @@ diff --git a/file.txt b/file.txt
             priority: RepositoryRefreshPriority::Foreground,
             probe_before_full_refresh: false,
             result_sender: result_sender.clone(),
+            additional_result_senders: Vec::new(),
         }];
         let background_blocked = HashSet::from([repository_key.clone()]);
         let exclusive = HashSet::from([repository_key.clone()]);
@@ -54185,6 +54356,7 @@ diff --git a/file.txt b/file.txt
             priority: RepositoryRefreshPriority::Background,
             probe_before_full_refresh: true,
             result_sender,
+            additional_result_senders: Vec::new(),
         }];
         assert_eq!(
             next_repository_refresh_request_index(

@@ -134,7 +134,7 @@ fn empty_tree(root: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-fn allowed_path(path: &str) -> bool {
+pub(crate) fn allowed_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     !path.is_empty()
         && !path.starts_with('/')

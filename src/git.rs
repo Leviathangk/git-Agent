@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
-    sync::{Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,12 +33,13 @@ struct SshCommandConfig {
 }
 
 static SSH_COMMAND_CONFIG: OnceLock<RwLock<SshCommandConfig>> = OnceLock::new();
-// Core state invokes many short-lived Git commands. Serializing core loads prevents
-// background tab refreshes from stampeding `git.exe` on Windows.
-static REPOSITORY_SNAPSHOT_GATE: OnceLock<Mutex<()>> = OnceLock::new();
-// History can be expensive, but it must never block a newly selected repository from
-// showing branch/status state. Keep one history read at a time on its own lane.
-static REPOSITORY_HISTORY_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+// Core reads are serialized per repository; the scheduler bounds cross-repository concurrency.
+static REPOSITORY_SNAPSHOT_GATE: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+// History has a separate lane and a per-repository gate, so inactive tabs cannot
+// serialize the foreground repository's history or core state behind their reads.
+static REPOSITORY_HISTORY_GATE: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> =
+    OnceLock::new();
 
 pub fn configure_ssh_command(executable: Option<PathBuf>, variant: Option<String>) {
     let lock = SSH_COMMAND_CONFIG.get_or_init(|| RwLock::new(SshCommandConfig::default()));
@@ -167,8 +168,9 @@ pub struct RepositoryRefreshFingerprint {
     pub ahead: usize,
     pub behind: usize,
     pub unstaged_count: usize,
-    /// Filesystem state for paths that are already staged, modified, or untracked.
-    /// `git status` alone is unchanged when an already-modified file is edited again.
+    /// Refresh signatures for changed worktree paths, index, HEAD, refs, config,
+    /// and in-progress Git operations. The config/path entries also let a full
+    /// snapshot reuse the probe's batched queries instead of reading them again.
     pub worktree_signature: Vec<String>,
 }
 
@@ -351,8 +353,11 @@ pub fn restore_repository_undo_position(
     git_output(root, &["reset", "--hard", &position.head]).map(|_| ())
 }
 
-pub fn cached_binary_diff(root: impl AsRef<Path>) -> Result<String> {
-    git_output(root.as_ref(), &["diff", "--cached", "--binary"])
+/// Identify the complete staged tree without rendering file contents as a patch.
+pub fn staged_tree_id(root: impl AsRef<Path>) -> Result<String> {
+    Ok(git_output(root.as_ref(), &["write-tree"])?
+        .trim()
+        .to_owned())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -399,6 +404,13 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
 }
 
 pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
+    open_repository_core_with_probe(path, None)
+}
+
+pub fn open_repository_core_with_probe(
+    path: impl AsRef<Path>,
+    probe: Option<RepositoryRefreshFingerprint>,
+) -> Result<RepositorySnapshot> {
     let requested_path = path.as_ref().to_path_buf();
     let _total_span = diagnostics::span(
         "snapshot.core",
@@ -408,20 +420,25 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
         "snapshot.gate.wait",
         format!("requested={}", requested_path.display()),
     );
-    let _snapshot_load_guard = REPOSITORY_SNAPSHOT_GATE
-        .get_or_init(|| Mutex::new(()))
+    let root = discover_root(&requested_path)?;
+    let repository_gate = repository_snapshot_gate(&root);
+    let _snapshot_load_guard = repository_gate
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     drop(gate_span);
-    let root = {
-        let _span = diagnostics::span(
-            "snapshot.discover",
-            format!("requested={}", requested_path.display()),
-        );
-        discover_root(&requested_path)?
-    };
     let status_span = diagnostics::span("snapshot.status", format!("root={}", root.display()));
-    let refresh_fingerprint = repository_refresh_fingerprint(&root).unwrap_or_default();
+    let refresh_fingerprint = match probe {
+        Some(probe) => probe,
+        None => repository_refresh_fingerprint(&root)?,
+    };
+    let effective_config = fingerprint_config(&refresh_fingerprint, "config:");
+    let local_config = fingerprint_config(&refresh_fingerprint, "local-config:");
+    let git_dir = refresh_fingerprint
+        .worktree_signature
+        .iter()
+        .find_map(|entry| entry.strip_prefix("git-dir:"))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("Missing Git directory in refresh probe"))?;
     let branch = if refresh_fingerprint.branch.is_empty() {
         "HEAD".to_owned()
     } else {
@@ -448,12 +465,32 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
         });
     }
     let remotes = load_remotes(&root).unwrap_or_default();
-    let config = load_repository_config(&root);
-    let git_flow_config = read_git_flow_config(&root).unwrap_or_default();
-    let rebase_in_progress = rebase_in_progress(&root);
-    let rebase_editing = rebase_edit_in_progress(&root);
-    let merge_message = load_merge_message(&root, &branch);
-    let upstream = load_upstream_status(&root).ok().flatten();
+    let config_path = refresh_worktree_signature
+        .iter()
+        .find_map(|entry| entry.strip_prefix("config-path:"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| git_dir.join("config"));
+    let config =
+        repository_config_from_values(&root, config_path, &effective_config, &local_config);
+    let git_flow_config = git_flow_config_from_values(&effective_config);
+    let rebase_in_progress = ["rebase-merge", "rebase-apply"]
+        .iter()
+        .any(|name| git_dir.join(name).exists());
+    let rebase_editing = ["rebase-merge/stopped-sha", "rebase-apply/stopped-sha"]
+        .iter()
+        .any(|name| git_dir.join(name).exists());
+    let merge_message = git_dir
+        .join("MERGE_HEAD")
+        .exists()
+        .then(|| fs::read_to_string(git_dir.join("MERGE_MSG")).ok())
+        .flatten()
+        .map(|message| message.trim_end().to_owned())
+        .filter(|message| !message.trim().is_empty())
+        .map(|message| format_merge_message_for_branch(&message, &branch));
+    let upstream = branches
+        .iter()
+        .find(|branch| branch.current)
+        .and_then(|branch| branch.upstream.clone());
     let stashes = load_stashes(&root).unwrap_or_default();
     let tags = load_tags(&root).unwrap_or_default();
     drop(metadata_span);
@@ -486,6 +523,16 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
     })
 }
 
+pub(crate) fn repository_snapshot_gate(root: &Path) -> Arc<Mutex<()>> {
+    REPOSITORY_SNAPSHOT_GATE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(root.to_path_buf())
+        .or_default()
+        .clone()
+}
+
 pub fn repository_refresh_fingerprint(
     root: impl AsRef<Path>,
 ) -> Result<RepositoryRefreshFingerprint> {
@@ -502,6 +549,82 @@ pub fn repository_refresh_fingerprint(
     )?;
     let mut fingerprint = parse_repository_refresh_fingerprint_z(&output);
     fingerprint.worktree_signature = repository_worktree_signature(root, &fingerprint.status);
+    fingerprint.worktree_signature.push(format!(
+        "refs:{}",
+        git_output(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)%09%(objectname)%09%(symref)"
+            ]
+        )?
+    ));
+    // HEAD can move while the worktree remains clean, including detached HEAD.
+    fingerprint.worktree_signature.push(format!(
+        "head:{}",
+        git_output(root, &["rev-parse", "--verify", "HEAD"]).unwrap_or_default()
+    ));
+    fingerprint.worktree_signature.push(format!(
+        "config:{}",
+        git_output(root, &["config", "--null", "--list"])?
+    ));
+    fingerprint.worktree_signature.push(format!(
+        "local-config:{}",
+        git_output(root, &["config", "--local", "--null", "--list"])?
+    ));
+    let paths = git_output(
+        root,
+        &[
+            "rev-parse",
+            "--absolute-git-dir",
+            "--path-format=absolute",
+            "--git-path",
+            "config",
+            "--git-path",
+            "logs/refs/stash",
+        ],
+    )?;
+    let mut paths = paths.lines();
+    let git_dir = PathBuf::from(
+        paths
+            .next()
+            .ok_or_else(|| anyhow!("Missing Git directory"))?,
+    );
+    fingerprint.worktree_signature.push(format!(
+        "config-path:{}",
+        paths
+            .next()
+            .ok_or_else(|| anyhow!("Missing Git config path"))?
+    ));
+    let stash_log = paths
+        .next()
+        .ok_or_else(|| anyhow!("Missing Git stash log path"))?;
+    fingerprint.worktree_signature.push(format!(
+        "stash-log:{}",
+        filesystem_state(Path::new(stash_log))
+    ));
+    fingerprint.worktree_signature.push(format!(
+        "index:{}",
+        filesystem_state(&git_dir.join("index"))
+    ));
+    fingerprint
+        .worktree_signature
+        .push(format!("git-dir:{}", git_dir.display()));
+    for name in [
+        "MERGE_HEAD",
+        "MERGE_MSG",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "rebase-merge/stopped-sha",
+        "rebase-apply/stopped-sha",
+    ] {
+        fingerprint.worktree_signature.push(format!(
+            "operation:{name}:{}",
+            filesystem_state(&git_dir.join(name))
+        ));
+    }
     Ok(fingerprint)
 }
 
@@ -683,11 +806,15 @@ pub fn load_repository_history(
     order: CommitOrder,
     all_branches: bool,
 ) -> Result<RepositoryHistory> {
-    let _history_load_guard = REPOSITORY_HISTORY_GATE
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = discover_root(path.as_ref())?;
+    let gate = REPOSITORY_HISTORY_GATE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(root.clone())
+        .or_default()
+        .clone();
+    let _history_load_guard = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     Ok(RepositoryHistory {
         commits: load_commits(
             &root,
@@ -4038,29 +4165,11 @@ fn load_branches(root: &Path) -> Result<Vec<Branch>> {
         &[
             "branch",
             "--all",
-            "--format=%(HEAD)%09%(refname:short)%09%(refname)%09%(upstream:short)",
+            "--format=%(HEAD)%09%(refname:short)%09%(refname)%09%(upstream:short)%09%(upstream:track,nobracket)",
         ],
     )?;
 
-    let mut branches = parse_branches(&output);
-    for branch in branches.iter_mut().filter(|branch| !branch.remote) {
-        let Some(upstream_name) = branch
-            .upstream
-            .as_ref()
-            .map(|upstream| upstream.name.clone())
-        else {
-            continue;
-        };
-        if let Ok((ahead, behind)) = load_branch_upstream_counts(root, &branch.name, &upstream_name)
-        {
-            branch.upstream = Some(UpstreamStatus {
-                name: upstream_name,
-                ahead,
-                behind,
-            });
-        }
-    }
-    Ok(branches)
+    Ok(parse_branches(&output))
 }
 
 fn parse_branches(output: &str) -> Vec<Branch> {
@@ -4083,10 +4192,17 @@ fn parse_branches(output: &str) -> Vec<Branch> {
             if !local && !remote {
                 return None;
             }
+            let tracking = parts.get(4).copied().unwrap_or_default();
+            let tracking_count = |label: &str| {
+                tracking
+                    .split(',')
+                    .find_map(|part| part.trim().strip_prefix(label)?.parse().ok())
+                    .unwrap_or(0)
+            };
             let upstream = (!remote && !upstream_name.is_empty()).then(|| UpstreamStatus {
                 name: upstream_name.to_owned(),
-                ahead: 0,
-                behind: 0,
+                ahead: tracking_count("ahead "),
+                behind: tracking_count("behind "),
             });
             (!name.is_empty()).then(|| Branch {
                 remote,
@@ -4096,19 +4212,6 @@ fn parse_branches(output: &str) -> Vec<Branch> {
             })
         })
         .collect()
-}
-
-fn load_branch_upstream_counts(
-    root: &Path,
-    branch: &str,
-    upstream: &str,
-) -> Result<(usize, usize)> {
-    let range = format!("{branch}...{upstream}");
-    let counts = git_output(root, &["rev-list", "--left-right", "--count", &range])?;
-    let mut parts = counts.split_whitespace();
-    let ahead = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    let behind = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    Ok((ahead, behind))
 }
 
 fn load_remotes(root: &Path) -> Result<Vec<Remote>> {
@@ -4212,6 +4315,67 @@ pub fn repository_rebase_edit_in_progress(root: impl AsRef<Path>) -> bool {
     rebase_edit_in_progress(root.as_ref())
 }
 
+fn fingerprint_config(
+    fingerprint: &RepositoryRefreshFingerprint,
+    prefix: &str,
+) -> BTreeMap<String, String> {
+    fingerprint
+        .worktree_signature
+        .iter()
+        .find_map(|entry| entry.strip_prefix(prefix))
+        .unwrap_or_default()
+        .split('\0')
+        .filter_map(|entry| {
+            let (key, value) = entry.split_once('\n').unwrap_or((entry, "true"));
+            (!key.is_empty()).then(|| (key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn git_flow_config_from_values(values: &BTreeMap<String, String>) -> Option<GitFlowConfig> {
+    let value = |key: &str| values.get(key).filter(|value| !value.is_empty()).cloned();
+    Some(GitFlowConfig {
+        production_branch: value("gitflow.branch.master")?,
+        development_branch: value("gitflow.branch.develop")?,
+        feature_prefix: value("gitflow.prefix.feature").unwrap_or_else(|| "feature/".to_owned()),
+        release_prefix: value("gitflow.prefix.release").unwrap_or_else(|| "release/".to_owned()),
+        hotfix_prefix: value("gitflow.prefix.hotfix").unwrap_or_else(|| "hotfix/".to_owned()),
+        version_tag_prefix: value("gitflow.prefix.versiontag").unwrap_or_default(),
+    })
+}
+
+fn repository_config_from_values(
+    root: &Path,
+    config_path: PathBuf,
+    effective: &BTreeMap<String, String>,
+    local: &BTreeMap<String, String>,
+) -> RepositoryConfig {
+    let value =
+        |values: &BTreeMap<String, String>, key: &str| values.get(key).cloned().unwrap_or_default();
+    let boolean = |key: &str| {
+        local
+            .get(key)
+            .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" => Some(true),
+                "" | "false" | "no" | "off" => Some(false),
+                value => value.parse::<i64>().ok().map(|value| value != 0),
+            })
+    };
+    RepositoryConfig {
+        config_path,
+        gitignore_path: root.join(".gitignore"),
+        user_name: value(effective, "user.name"),
+        user_email: value(effective, "user.email"),
+        uses_global_user: value(local, "user.name").is_empty()
+            && value(local, "user.email").is_empty(),
+        identity_warning_suppressed: boolean("git-agent.identitywarningsuppressed")
+            .unwrap_or(false),
+        auto_refresh: boolean("git-agent.autorefresh").unwrap_or(true),
+        background_remote_refresh: boolean("git-agent.backgroundremoterefresh").unwrap_or(true),
+    }
+}
+
+#[cfg(test)]
 fn load_repository_config(root: &Path) -> RepositoryConfig {
     let config_path = git_path(root, "config").unwrap_or_else(|| root.join(".git").join("config"));
     let gitignore_path = root.join(".gitignore");
@@ -4296,34 +4460,6 @@ fn git_path(root: &Path, name: &str) -> Option<PathBuf> {
     } else {
         Some(root.join(path))
     }
-}
-
-fn load_upstream_status(root: &Path) -> Result<Option<UpstreamStatus>> {
-    let upstream = git_output(
-        root,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    );
-    let Ok(upstream) = upstream else {
-        return Ok(None);
-    };
-    let upstream = upstream.trim().to_owned();
-    if upstream.is_empty() {
-        return Ok(None);
-    }
-
-    let counts = git_output(
-        root,
-        &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
-    )?;
-    let mut parts = counts.split_whitespace();
-    let ahead = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    let behind = parts.next().unwrap_or("0").parse().unwrap_or(0);
-
-    Ok(Some(UpstreamStatus {
-        name: upstream,
-        ahead,
-        behind,
-    }))
 }
 
 fn load_stashes(root: &Path) -> Result<Vec<StashEntry>> {
@@ -4631,6 +4767,81 @@ mod tests {
     }
 
     #[test]
+    fn refresh_detects_clean_head_refs_and_configuration_changes() -> Result<()> {
+        let root = init_patch_test_repo("refresh-full-scope")?;
+        let initial = repository_refresh_fingerprint(&root)?;
+        assert_eq!(initial, repository_refresh_fingerprint(&root)?);
+        git_output(&root, &["commit", "--allow-empty", "-m", "external commit"])?;
+        let committed = repository_refresh_fingerprint(&root)?;
+        assert_eq!(initial.status, committed.status);
+        assert_ne!(initial, committed);
+        git_output(&root, &["tag", "external-tag"])?;
+        let tagged = repository_refresh_fingerprint(&root)?;
+        assert_ne!(committed, tagged);
+        git_output(&root, &["config", "git-agent.autoRefresh", "false"])?;
+        let configured = repository_refresh_fingerprint(&root)?;
+        assert_ne!(tagged, configured);
+        let snapshot = open_repository_core_with_probe(&root, Some(configured.clone()))?;
+        assert!(!snapshot.config.auto_refresh);
+        assert_eq!(snapshot.config, load_repository_config(&snapshot.root));
+        assert_eq!(
+            configured,
+            repository_snapshot_refresh_fingerprint(&snapshot)
+        );
+        git_output(&root, &["checkout", "--detach", "HEAD~1"])?;
+        let detached = repository_refresh_fingerprint(&root)?;
+        git_output(&root, &["checkout", "--detach", "external-tag"])?;
+        assert_ne!(detached, repository_refresh_fingerprint(&root)?);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_reuses_probe_and_batches_branch_tracking() -> Result<()> {
+        let root = init_patch_test_repo("refresh-reuse")?;
+        git_output(&root, &["branch", "upstream"])?;
+        git_output(&root, &["branch", "--set-upstream-to=upstream"])?;
+        git_output(&root, &["commit", "--allow-empty", "-m", "ahead"])?;
+        let probe = repository_refresh_fingerprint(&root)?;
+        fs::write(root.join("external.txt"), "changed after probe")?;
+        let snapshot = open_repository_core_with_probe(&root, Some(probe.clone()))?;
+        assert_eq!(
+            snapshot.status, probe.status,
+            "core must reuse the single status scan"
+        );
+        assert_eq!(snapshot.upstream.as_ref().unwrap().ahead, 1);
+        assert_eq!(snapshot.upstream.as_ref().unwrap().behind, 0);
+        assert_ne!(probe, repository_refresh_fingerprint(&root)?);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_tracks_linked_worktree_operations_and_shared_config() -> Result<()> {
+        let root = init_patch_test_repo("refresh-worktree")?;
+        let linked = root.with_extension("linked");
+        git_output(
+            &root,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        )?;
+        let initial = repository_refresh_fingerprint(&linked)?;
+        let snapshot = open_repository_core_with_probe(&linked, Some(initial.clone()))?;
+        assert_eq!(snapshot.config, load_repository_config(&snapshot.root));
+        let git_dir =
+            PathBuf::from(git_output(&linked, &["rev-parse", "--absolute-git-dir"])?.trim());
+        fs::create_dir(git_dir.join("rebase-merge"))?;
+        fs::write(git_dir.join("rebase-merge/stopped-sha"), "editing")?;
+        let changed = repository_refresh_fingerprint(&linked)?;
+        assert_ne!(initial, changed);
+        let snapshot = open_repository_core_with_probe(&linked, Some(changed))?;
+        assert!(snapshot.rebase_in_progress);
+        assert!(snapshot.rebase_editing);
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn refresh_fingerprint_detects_edits_to_an_already_modified_file() -> Result<()> {
         let nonce = NEXT_COMMIT_PATCH_REPO.fetch_add(1, Ordering::Relaxed);
         let root = env::temp_dir().join(format!(
@@ -4683,14 +4894,15 @@ mod tests {
     }
 
     #[test]
-    fn repository_snapshot_loading_uses_a_process_gate() {
+    fn repository_snapshot_loading_uses_a_repository_gate() {
         let source = include_str!("git.rs");
         let start = source.find("pub fn open_repository_core(").unwrap();
         let end = source[start..].find("pub fn init_repository(").unwrap();
         let open_source = &source[start..start + end];
 
         assert!(open_source.contains("REPOSITORY_SNAPSHOT_GATE"));
-        assert!(open_source.contains("Mutex::new(())"));
+        assert!(open_source.contains("repository_snapshot_gate(&root)"));
+        assert!(open_source.contains(".entry(root.to_path_buf())"));
     }
 
     #[test]
@@ -6404,9 +6616,15 @@ mod tests {
     fn repository_commit_undo_keeps_staging_for_safe_redo() -> Result<()> {
         let root = init_patch_test_repo("undo-commit")?;
         fs::write(root.join("staged.txt"), "staged change\n")?;
-        git_output(&root, &["add", "staged.txt"])?;
+        fs::write(
+            root.join("image.png"),
+            b"\x89PNG\r\n\x1a\n\0binary image contents",
+        )?;
+        git_output(&root, &["add", "staged.txt", "image.png"])?;
         let before = repository_undo_position(&root)?;
-        let staged_diff = cached_binary_diff(&root)?;
+        let staged_tree = staged_tree_id(&root)?;
+        assert!(staged_tree.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(matches!(staged_tree.len(), 40 | 64));
 
         git_output(&root, &["commit", "-m", "undoable commit"])?;
         let after = repository_undo_position(&root)?;
@@ -6417,7 +6635,28 @@ mod tests {
         assert_eq!(undone.branch, before.branch);
         assert_eq!(undone.head, before.head);
         assert!(!repository_has_worktree_changes(&undone));
-        assert_eq!(cached_binary_diff(&root)?, staged_diff);
+        assert_eq!(staged_tree_id(&root)?, staged_tree);
+
+        // Redo must reject changed binary contents, even when the path is unchanged.
+        fs::write(
+            root.join("image.png"),
+            b"\x89PNG\r\n\x1a\n\0changed image contents",
+        )?;
+        git_output(&root, &["add", "image.png"])?;
+        assert_ne!(staged_tree_id(&root)?, staged_tree);
+        git_output(
+            &root,
+            &[
+                "restore",
+                "--source",
+                &after.head,
+                "--staged",
+                "--worktree",
+                "--",
+                "image.png",
+            ],
+        )?;
+        assert_eq!(staged_tree_id(&root)?, staged_tree);
 
         reset_to_commit(&root, &after.head, ResetMode::Hard)?;
         assert_eq!(repository_undo_position(&root)?, after);

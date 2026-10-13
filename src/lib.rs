@@ -8,6 +8,7 @@ mod git;
 mod gitignore;
 mod graph;
 pub mod i18n;
+mod merge_context_agent;
 pub mod merge_tool;
 mod patch;
 pub mod plugin_manager;

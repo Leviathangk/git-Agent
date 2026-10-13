@@ -524,7 +524,7 @@ fn body(
                 final_name,
                 "Submit final merge recommendations after investigation",
                 final_schema.clone(),
-                8192,
+                crate::ai_provider::merge_output_tokens(&config.model_id),
             );
             body["messages"] = json!(messages);
             if inspect {
@@ -605,6 +605,7 @@ pub(crate) fn investigate_with(
             final_schema,
             scope.is_some(),
         ))?;
+        crate::ai_provider::validate_complete_response(&response)?;
         let calls = calls(&response)?;
         let inspecting = calls.iter().any(|call| call.name == INSPECT_TOOL);
         let submitting = calls.iter().any(|call| call.name == final_name);
@@ -702,7 +703,7 @@ pub(crate) fn investigate(
 ) -> Result<Investigation, String> {
     let endpoint = super::merge_tool::merge_ai_endpoint(config)?;
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(300))
         .build();
     investigate_with(
         config,

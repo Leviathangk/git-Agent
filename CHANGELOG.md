@@ -5,6 +5,20 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.0.1 — 2026-10-13
+
+### Improved
+
+- Record staged Git tree IDs for commit undo and redo instead of generating and copying binary patches, reducing overhead for commits containing many images or other binary files.
+- Batch branch tracking and repository metadata reads. Refresh repositories concurrently with per-repository operation gates, reuse unchanged snapshots, and retain selections and history when only worktree status changes. Automatic refresh remains enabled and detects external HEAD, ref and configuration changes.
+- Let AI merge assistance inspect complete Base, Left, Right, merged-index and worktree source views through repository read, search, history and diff tools. Validate captured revisions and index state before accepting recommendations, and reject mechanically proven broken module references.
+
+### Fixed
+
+- Increase Deepseek merge output allowance from 8K to 384K to accommodate reasoning and final recommendations; increase other Claude-compatible merge requests to 32K. Allow five minutes per request and reject truncated answers with an explicit output-limit error instead of reporting a missing answer.
+
+AI recommendations still require review. Model reasoning and tool-format errors can still occur.
+
 ## 2.0.0 — 2026-10-10
 
 ### Added

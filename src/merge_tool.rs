@@ -3321,7 +3321,7 @@ fn send_merge_ai_tool_request(
         ),
     );
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(300))
         .build();
     let response = match config.api_format {
         crate::app::MergeAiApiFormat::OpenAiCompatible => agent
@@ -3359,7 +3359,7 @@ fn send_merge_ai_tool_request(
             .send_json(crate::ai_provider::claude_tool_body(
                 &config.model_id,merge_ai_system_prompt(),prompt,MERGE_AI_TOOL_NAME,
                 "Submit one validated recommendation for every merge conflict and deletion decision.",
-                merge_ai_suggestions_input_schema(),8192,
+                merge_ai_suggestions_input_schema(),crate::ai_provider::merge_output_tokens(&config.model_id),
             )),
     }
     .map_err(|error| match error {
@@ -3688,6 +3688,7 @@ fn merge_ai_response_payload(
     format: crate::app::MergeAiApiFormat,
     response: &serde_json::Value,
 ) -> Result<(String, &'static str), String> {
+    crate::ai_provider::validate_complete_response(response)?;
     let preferred = match format {
         crate::app::MergeAiApiFormat::OpenAiCompatible => {
             merge_ai_openai_tool_arguments(response).map(|payload| (payload, "openai_function"))

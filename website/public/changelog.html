@@ -26,6 +26,18 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
+<h2>2.0.1 — 2026-10-13</h2>
+<h3>改进</h3>
+<ul>
+<li>提交撤销和重做改为记录 Git 暂存树 ID，不再生成和复制二进制补丁，减少包含大量图片及其他二进制文件时的开销。</li>
+<li>批量读取分支跟踪信息和仓库元数据，按仓库独立控制操作并并发刷新。复用未变化的快照，仅工作区状态变化时保留选择和历史。继续保留自动刷新，并检测外部 HEAD、引用和配置变化。</li>
+<li>AI 合并建议可通过文件读取、搜索、历史及差异工具，主动查看完整的 Base、左边、右边、已合并索引和工作区代码。接受建议前验证分支提交及索引状态，并拒绝能够确定会引用缺失模块的结果。</li>
+</ul>
+<h3>修复</h3>
+<ul>
+<li>Deepseek 合并请求输出额度从 8K 提升到 384K，为思考和最终建议留足空间；其他 Claude 兼容合并请求提升至 32K。单次请求允许等待五分钟，响应截断时明确提示输出额度耗尽，不再误报为没有回答。</li>
+</ul>
+<p>AI 建议仍需人工审阅，模型推理和工具返回格式错误仍可能发生。</p>
 <h2>2.0.0 — 2026-10-10</h2>
 <h3>新增</h3>
 <ul>
@@ -173,6 +185,18 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
+<h2>2.0.1 — 2026-10-13</h2>
+<h3>Improved</h3>
+<ul>
+<li>Record staged Git tree IDs for commit undo and redo instead of generating and copying binary patches, reducing overhead for commits containing many images or other binary files.</li>
+<li>Batch branch tracking and repository metadata reads. Refresh repositories concurrently with per-repository operation gates, reuse unchanged snapshots, and retain selections and history when only worktree status changes. Automatic refresh remains enabled and detects external HEAD, ref and configuration changes.</li>
+<li>Let AI merge assistance inspect complete Base, Left, Right, merged-index and worktree source views through repository read, search, history and diff tools. Validate captured revisions and index state before accepting recommendations, and reject mechanically proven broken module references.</li>
+</ul>
+<h3>Fixed</h3>
+<ul>
+<li>Increase Deepseek merge output allowance from 8K to 384K to accommodate reasoning and final recommendations; increase other Claude-compatible merge requests to 32K. Allow five minutes per request and reject truncated answers with an explicit output-limit error instead of reporting a missing answer.</li>
+</ul>
+<p>AI recommendations still require review. Model reasoning and tool-format errors can still occur.</p>
 <h2>2.0.0 — 2026-10-10</h2>
 <h3>Added</h3>
 <ul>

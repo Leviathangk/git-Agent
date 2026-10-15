@@ -954,6 +954,14 @@ pub struct GitAgentApp {
     history_diff_display_mode: DiffDisplayMode,
     history_sort_order: HistorySortOrder,
     history_branch_scope: HistoryBranchScope,
+    history_reference: Option<String>,
+    history_reference_loaded: Option<String>,
+    side_by_side_popup: Option<git::FileDiff>,
+    changed_files_tree: bool,
+    changed_files_collapsed: HashSet<String>,
+    embedded_diff: crate::diff_tool::EmbeddedDiff,
+    repository_browser: crate::repository_browser::Browser,
+    file_history_cache: HistoryCommitBrowserCache,
     history_cherry_pick_mode: bool,
     selected_cherry_pick_hashes: HashSet<String>,
     selected_diff_rows: Vec<DiffLineKey>,
@@ -1604,10 +1612,11 @@ struct DeferredRepositorySnapshotReload {
     retry_at: Instant,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct HistoryLoadRequest {
     scope: HistoryBranchScope,
     order: HistorySortOrder,
+    reference: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1702,6 +1711,7 @@ struct RepoCommitStateStore {
 #[serde(default)]
 struct RepoCommitState {
     push_immediately: bool,
+    push_after_pull: bool,
     amend: bool,
     no_verify: bool,
     gpg_sign: bool,
@@ -1840,6 +1850,7 @@ impl Default for CloneUrlStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MainView {
     Workspace,
+    Files,
     History,
     Search,
     Branches,
@@ -4727,6 +4738,14 @@ impl GitAgentApp {
             history_diff_display_mode: DiffDisplayMode::Blocks,
             history_sort_order: HistorySortOrder::Date,
             history_branch_scope: HistoryBranchScope::Current,
+            history_reference: None,
+            history_reference_loaded: None,
+            side_by_side_popup: None,
+            changed_files_tree: false,
+            changed_files_collapsed: HashSet::new(),
+            embedded_diff: crate::diff_tool::EmbeddedDiff::default(),
+            repository_browser: crate::repository_browser::Browser::default(),
+            file_history_cache: HistoryCommitBrowserCache::default(),
             history_cherry_pick_mode: false,
             selected_cherry_pick_hashes: HashSet::new(),
             selected_diff_rows: Vec::new(),
@@ -4912,6 +4931,11 @@ impl GitAgentApp {
         if !self.active_repo_root_matches(&path) {
             self.save_commit_message_draft_for_active_repo();
         }
+        if repository_transition || !can_keep_current_snapshot {
+            self.history_reference = None;
+            self.history_reference_loaded = None;
+            self.repository_browser = crate::repository_browser::Browser::default();
+        }
         if repository_transition {
             self.reset_search_view_state();
         }
@@ -4982,14 +5006,18 @@ impl GitAgentApp {
                 HistorySortOrder::Date => git::CommitOrder::Date,
                 HistorySortOrder::Topology => git::CommitOrder::Topology,
             };
+            let result = if let Some(reference) = &request.reference {
+                git::load_branch_history(&path, reference, order)
+            } else {
+                git::load_repository_history(path, order, request.scope == HistoryBranchScope::All)
+            };
             let _ = sender.send((
                 requested_root,
                 request,
-                git::load_repository_history(path, order, request.scope == HistoryBranchScope::All)
-                    .map(|history| {
-                        let layout = graph::layout(&history.commits);
-                        (history, layout)
-                    }),
+                result.map(|history| {
+                    let layout = graph::layout(&history.commits);
+                    (history, layout)
+                }),
             ));
         });
     }
@@ -5002,6 +5030,7 @@ impl GitAgentApp {
         let request = HistoryLoadRequest {
             scope: self.history_branch_scope,
             order: self.history_sort_order,
+            reference: self.history_reference.clone(),
         };
         if self.repo_history_tasks.contains_key(&key) {
             self.queued_repo_history_loads.insert(key, request);
@@ -5607,6 +5636,14 @@ impl GitAgentApp {
     }
 
     fn apply_repository_snapshot(&mut self, mut snapshot: RepositorySnapshot) {
+        if self.repository_browser.root.as_ref() == Some(&snapshot.root)
+            && !self.repository_browser.busy()
+            && self.snapshot.as_ref().is_some_and(|current| {
+                current.refresh_worktree_signature != snapshot.refresh_worktree_signature
+            })
+        {
+            self.repository_browser.reload(snapshot.root.clone());
+        }
         let preserve_history = self.snapshot.as_ref().is_some_and(|current| {
             current.root == snapshot.root
                 && current.branch == snapshot.branch
@@ -5654,6 +5691,9 @@ impl GitAgentApp {
                 self.save_commit_message_draft_for_branch(branch);
             }
             self.commit_message.clear();
+            self.history_reference = None;
+            self.history_reference_loaded = None;
+            self.repository_browser = crate::repository_browser::Browser::default();
             self.invalidate_branch_sensitive_tasks(&snapshot.root);
         }
         if replaces_existing_snapshot {
@@ -5820,6 +5860,9 @@ impl GitAgentApp {
     }
 
     fn apply_history_sort_order_to_snapshot(&self, snapshot: &mut RepositorySnapshot) {
+        if self.history_reference.is_some() {
+            return;
+        }
         let requested_all_branches = self.history_branch_scope == HistoryBranchScope::All;
         let requested_topology = self.history_sort_order == HistorySortOrder::Topology;
         if snapshot.history_loaded
@@ -5845,7 +5888,15 @@ impl GitAgentApp {
     }
 
     fn set_history_branch_scope(&mut self, scope: HistoryBranchScope) {
+        if self.history_reference.take().is_some() {
+            if let Some(snapshot) = &mut self.snapshot {
+                snapshot.history_loaded = false;
+            }
+        }
         self.set_history_ordering(scope, self.history_sort_order);
+        if self.history_reference_loaded.is_some() {
+            self.request_active_repository_history();
+        }
     }
 
     fn set_history_ordering(&mut self, scope: HistoryBranchScope, order: HistorySortOrder) {
@@ -5858,6 +5909,7 @@ impl GitAgentApp {
         let mut needs_history_load = true;
         if let Some(mut snapshot) = self.snapshot.take() {
             let history_matches = snapshot.history_loaded
+                && self.history_reference == self.history_reference_loaded
                 && snapshot.history_is_all_branches == (scope == HistoryBranchScope::All)
                 && snapshot.history_is_topology == (order == HistorySortOrder::Topology);
             if history_matches {
@@ -7208,6 +7260,17 @@ impl GitAgentApp {
 
     fn branch_actions_busy(&self) -> bool {
         self.active_repo_has_pending_load()
+            || (self.history_reference.is_some()
+                && self.active_repo_root().is_some_and(|root| {
+                    self.foreground_repo_history_loads
+                        .contains(&repo_state_key(&root))
+                }))
+            || (self.repository_browser.busy()
+                && self
+                    .repository_browser
+                    .root
+                    .as_ref()
+                    .is_some_and(|root| self.active_repo_root_matches(root)))
             || self.active_commit_ai_busy()
             || self.active_repo_gitignore_save_busy()
             || self.active_branch_checkout_busy()
@@ -8423,7 +8486,7 @@ impl GitAgentApp {
             remote_branch,
             local_branch,
             commit_merge: true,
-            push_after_pull: false,
+            push_after_pull: self.commit_state.push_after_pull,
             include_tags: false,
             force_merge_commit: false,
             rebase: false,
@@ -8726,6 +8789,10 @@ impl GitAgentApp {
     }
 
     fn poll_tasks(&mut self, ctx: &egui::Context) {
+        self.repository_browser.poll();
+        if self.repository_browser.busy() {
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
         self.plugins.poll(ctx);
         self.poll_commit_ai_task(ctx);
         let mut repository_load_activity = false;
@@ -8966,12 +9033,22 @@ impl GitAgentApp {
                 match result {
                     Ok((history, layout)) => {
                         let request_is_current = request.scope == self.history_branch_scope
-                            && request.order == self.history_sort_order;
+                            && request.order == self.history_sort_order
+                            && request.reference == self.history_reference;
                         if request_is_current && self.active_repo_root_matches(&requested_root) {
+                            self.history_reference_loaded = request.reference.clone();
                             self.apply_repository_history(&requested_root, history, layout);
                         }
                     }
                     Err(error) => {
+                        if request.reference.is_some()
+                            && request.reference == self.history_reference
+                            && self.active_repo_root_matches(&requested_root)
+                        {
+                            self.history_reference = None;
+                            self.history_reference_loaded = None;
+                            self.queued_repo_history_loads.remove(&repo_task_key);
+                        }
                         if self
                             .pending_interactive_rebase_open_after_history
                             .as_ref()
@@ -11320,6 +11397,7 @@ impl App for GitAgentApp {
             )
             .show(ctx, |ui| self.main_layout(ui));
 
+        self.side_by_side_diff_modal(ctx);
         self.commit_action_modal(ctx);
         self.commit_identity_warning_modal(ctx);
         self.worktree_action_modal(ctx);
@@ -12096,6 +12174,7 @@ impl GitAgentApp {
             |ui| match self.active_view {
                 MainView::Workspace => self.workspace_view(ui),
                 MainView::History => self.history_view(ui),
+                MainView::Files => self.repository_files_view(ui),
                 MainView::Search => self.search_view(ui),
                 MainView::Branches => self.branches_view(ui),
                 MainView::Tags => self.tags_view(ui),
@@ -14223,6 +14302,10 @@ impl GitAgentApp {
     }
 
     fn sidebar(&mut self, ui: &mut Ui) {
+        if self.active_view == MainView::Files {
+            self.sidebar_content(ui);
+            return;
+        }
         ScrollArea::vertical()
             .id_salt("sidebar_scroll")
             .auto_shrink([false, false])
@@ -14384,7 +14467,7 @@ impl GitAgentApp {
         ui.horizontal(|ui| {
             ui.add_space(10.0);
             ui.spacing_mut().item_spacing.x = 6.0;
-            let card_width = sidebar_nav_card_width(ui.available_width() - 10.0, 3);
+            let card_width = sidebar_nav_card_width(ui.available_width() - 10.0, 4);
             if sidebar_nav_card(
                 ui,
                 card_width,
@@ -14410,6 +14493,24 @@ impl GitAgentApp {
             if sidebar_nav_card(
                 ui,
                 card_width,
+                self.active_view == MainView::Files,
+                UiIcon::Files,
+                if self.language == Language::Chinese {
+                    "文件"
+                } else {
+                    "Files"
+                },
+            )
+            .clicked()
+            {
+                self.active_view = MainView::Files;
+                if let Some(root) = self.active_repo_root() {
+                    self.repository_browser.reload(root);
+                }
+            }
+            if sidebar_nav_card(
+                ui,
+                card_width,
                 self.active_view == MainView::Search,
                 UiIcon::Search,
                 self.tr("commit.search"),
@@ -14421,6 +14522,11 @@ impl GitAgentApp {
         });
 
         ui.add_space(16.0);
+
+        if self.active_view == MainView::Files {
+            self.repository_files_sidebar(ui);
+            return;
+        }
 
         let branch_actions_enabled = !self.branch_actions_busy();
         let pending_branch_checkout = self.pending_branch_checkout.clone();
@@ -15141,17 +15247,290 @@ impl GitAgentApp {
         }
     }
 
+    fn repository_files_sidebar(&mut self, ui: &mut Ui) {
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
+        if self.repository_browser.root.as_ref() != Some(&root) {
+            self.repository_browser.reload(root.clone());
+        }
+        let chinese = self.language == Language::Chinese;
+        let (toolbar, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(toolbar)
+                .layout(Layout::right_to_left(Align::Center)),
+            |ui| {
+                if file_tree_action_icon(
+                    ui,
+                    UiIcon::Refresh,
+                    if chinese {
+                        "刷新文件和历史"
+                    } else {
+                        "Refresh files and history"
+                    },
+                    !self.branch_actions_busy(),
+                )
+                .clicked()
+                {
+                    self.repository_browser.reload(root);
+                }
+                let shown = self.repository_browser.show_hidden;
+                let tooltip = match (chinese, shown) {
+                    (true, true) => "关闭隐藏文件显示",
+                    (true, false) => "显示隐藏文件",
+                    (false, true) => "Hide hidden files",
+                    (false, false) => "Show hidden files",
+                };
+                if file_tree_action_icon(
+                    ui,
+                    if shown { UiIcon::Eye } else { UiIcon::EyeOff },
+                    tooltip,
+                    true,
+                )
+                .clicked()
+                {
+                    self.repository_browser.set_show_hidden(!shown);
+                }
+                let mut filter = self.repository_browser.filter.clone();
+                let response = ui.add(
+                    themed_singleline_text_edit(
+                        &mut filter,
+                        if chinese {
+                            "按名称过滤（支持通配符）"
+                        } else {
+                            "Filter by name (wildcards supported)"
+                        },
+                    )
+                    .desired_width(ui.available_width().max(32.0)),
+                );
+                let changed = response.changed();
+                response.on_hover_text(if chinese {
+                    "名称支持模糊匹配；路径支持 *、?、**，例如 components/*.vue"
+                } else {
+                    "Fuzzy name matching; path patterns support *, ?, **, e.g. components/*.vue"
+                });
+                if changed {
+                    self.repository_browser.set_filter(filter);
+                }
+            },
+        );
+        if let Some(error) = &self.repository_browser.error {
+            ui.label(error);
+        }
+        if !self.repository_browser.listing()
+            && self.repository_browser.visible_files.is_empty()
+            && !self.repository_browser.filter.trim().is_empty()
+        {
+            ui.label(if chinese {
+                "没有匹配的文件"
+            } else {
+                "No matching files"
+            });
+        }
+        let filtering = !self.repository_browser.filter.trim().is_empty();
+        let mut history = None;
+        let selected = readonly_file_list(
+            ui,
+            "repository_sidebar_files",
+            &self.repository_browser.visible_files,
+            self.repository_browser.selected.as_deref(),
+            true,
+            if filtering {
+                &mut self.repository_browser.filter_collapsed
+            } else {
+                &mut self.repository_browser.collapsed
+            },
+            self.language,
+            &mut history,
+        );
+        if let Some(path) = selected.or(history) {
+            self.repository_browser.open_history(path);
+        }
+    }
+
+    fn repository_files_view(&mut self, ui: &mut Ui) {
+        let chinese = self.language == Language::Chinese;
+        let (activate, close) = repository_file_tabs(ui, &mut self.repository_browser, chinese);
+        if let Some(index) = activate {
+            self.repository_browser.activate(index);
+        }
+        if let Some(index) = close {
+            self.repository_browser.close(index);
+        }
+        ui.separator();
+        let Some(active) = self.repository_browser.active_tab else {
+            ui.label(if chinese {
+                "在左侧文件树中选择文件，以打开它的提交历史"
+            } else {
+                "Select a file in the sidebar to open its commit history"
+            });
+            return;
+        };
+        let mut scope = HistoryBranchScope::Current;
+        let mut order = HistorySortOrder::Date;
+        let mut remote = false;
+        let Some(tab) = self.repository_browser.tabs.get_mut(active) else {
+            return;
+        };
+        if tab.loading() {
+            history_loading_panel(
+                ui,
+                if chinese {
+                    "正在加载文件提交历史…"
+                } else {
+                    "Loading file history…"
+                },
+            );
+            return;
+        }
+        if let Some(error) = &tab.error {
+            ui.label(error);
+            return;
+        }
+        if tab.commits.is_empty() {
+            ui.label(if chinese {
+                "该文件暂无提交历史（未跟踪或尚未提交）"
+            } else {
+                "No commits for this file (untracked or not committed yet)"
+            });
+            return;
+        }
+        let table_height = ui.available_height().max(120.0);
+        let outcome = ui
+            .push_id(&tab.path, |ui| {
+                history_commit_browser(
+                    ui,
+                    &tab.commits,
+                    &tab.selected_hash,
+                    &mut scope,
+                    &mut order,
+                    &mut tab.search,
+                    &mut remote,
+                    false,
+                    false,
+                    &mut self.layout_prefs,
+                    self.language,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    &mut self.file_history_cache,
+                    HistoryCommitBrowserConfig {
+                        show_graph: false,
+                        id_salt: "file_history_commits",
+                        show_view_controls: false,
+                        show_search: true,
+                        show_cherry_pick: false,
+                        show_jump: false,
+                        show_context_menu: false,
+                        max_height: Some(table_height),
+                        ..Default::default()
+                    },
+                    None,
+                )
+            })
+            .inner;
+        if let Some(commit) = outcome.picked_commit {
+            tab.selected_hash = commit.hash;
+        }
+    }
+
     fn history_view(&mut self, ui: &mut Ui) {
+        if self.snapshot.as_ref().is_some_and(|snapshot| {
+            !snapshot.history_loaded || self.history_reference != self.history_reference_loaded
+        }) && self
+            .active_repo_root()
+            .is_some_and(|root| !self.repo_history_tasks.contains_key(&repo_state_key(&root)))
+        {
+            self.request_active_repository_history();
+        }
+
+        if let Some(reference) = self.history_reference.clone() {
+            let label = format!(
+                "{}: {reference}",
+                if self.language == Language::Chinese {
+                    "浏览分支"
+                } else {
+                    "Browsing branch"
+                }
+            );
+            let button_label = if self.language == Language::Chinese {
+                "返回当前分支"
+            } else {
+                "Current branch"
+            };
+            let (row, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
+            let font = FontId::proportional(12.0);
+            let button_width = 112.0_f32.min(row.width());
+            let label_width = ui
+                .fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(label.clone(), font.clone(), theme::muted())
+                        .size()
+                        .x
+                })
+                .min((row.width() - button_width - 8.0).max(0.0));
+            let label_rect =
+                Rect::from_min_size(row.left_top(), Vec2::new(label_width, row.height()));
+            ui.painter().with_clip_rect(label_rect).text(
+                label_rect.left_center(),
+                Align2::LEFT_CENTER,
+                &label,
+                font.clone(),
+                theme::muted(),
+            );
+            ui.interact(
+                label_rect,
+                ui.id().with("browsed_branch_label"),
+                Sense::hover(),
+            )
+            .on_hover_text(&reference);
+            let button_rect = Rect::from_min_size(
+                Pos2::new(row.left() + label_width + 8.0, row.top() + 3.0),
+                Vec2::new(button_width, 22.0),
+            );
+            let response = pointing_hand_cursor(ui.interact(
+                button_rect,
+                ui.id().with("return_to_current_branch"),
+                Sense::click(),
+            ));
+            ui.painter().rect_filled(
+                button_rect,
+                CornerRadius::same(3),
+                if response.hovered() {
+                    theme::hover()
+                } else {
+                    theme::panel_soft()
+                },
+            );
+            draw_ui_icon(
+                ui,
+                Rect::from_center_size(
+                    Pos2::new(button_rect.left() + 15.0, row.center().y),
+                    Vec2::splat(14.0),
+                ),
+                UiIcon::ArrowLeft,
+                theme::text(),
+            );
+            ui.painter().text(
+                Pos2::new(button_rect.left() + 28.0, row.center().y),
+                Align2::LEFT_CENTER,
+                button_label,
+                font,
+                theme::text(),
+            );
+            if response.clicked() {
+                self.set_history_branch_scope(HistoryBranchScope::Current);
+            }
+        }
         if self.snapshot.is_none() {
             empty_state(ui, self.loading_repo, self.language);
             return;
         }
-        if !self
-            .snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.history_loaded)
-        {
-            self.request_active_repository_history();
+        if !self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.history_loaded && self.history_reference == self.history_reference_loaded
+        }) {
             history_loading_panel(ui, self.tr("history.loading"));
             return;
         }
@@ -15602,7 +15981,7 @@ impl GitAgentApp {
     fn history_file_table(&mut self, ui: &mut Ui, commit: &Commit) {
         let mut clicked_file = None;
         let mut history_request = None;
-        history_file_table_header(ui, self.language);
+        history_file_table_header(ui, self.language, Some(&mut self.changed_files_tree));
 
         if self.loading_details_hash.as_deref() == Some(commit.hash.as_str()) {
             ui.horizontal(|ui| {
@@ -15613,28 +15992,30 @@ impl GitAgentApp {
             if details.files.is_empty() {
                 ui.label(RichText::new(self.tr("commit.no_changes")).color(theme::muted()));
             } else {
-                ScrollArea::vertical()
-                    .id_salt("history_changed_files_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for file in &details.files {
-                            let selected =
-                                self.selected_file_path.as_deref() == Some(file.diff_path.as_str());
-                            if history_file_table_row(
-                                ui,
-                                &file.status,
-                                &file.path,
-                                &file.diff_path,
-                                selected,
-                                self.language,
-                                &mut history_request,
-                            )
-                            .clicked()
-                            {
-                                clicked_file = Some(file.diff_path.clone());
-                            }
-                        }
-                    });
+                let files = details
+                    .files
+                    .iter()
+                    .map(|file| WorktreeFile {
+                        path: file.diff_path.clone(),
+                        display_path: if self.changed_files_tree {
+                            file.diff_path.clone()
+                        } else {
+                            file.path.clone()
+                        },
+                        index_status: file.status.chars().next().unwrap_or_default(),
+                        worktree_status: char::default(),
+                    })
+                    .collect::<Vec<_>>();
+                clicked_file = readonly_file_list(
+                    ui,
+                    "history_changed_files_scroll",
+                    &files,
+                    self.selected_file_path.as_deref(),
+                    self.changed_files_tree,
+                    &mut self.changed_files_collapsed,
+                    self.language,
+                    &mut history_request,
+                );
             }
         } else {
             ui.label(RichText::new(self.tr("commit.select_to_load_files")).color(theme::muted()));
@@ -15651,7 +16032,7 @@ impl GitAgentApp {
     fn search_file_table(&mut self, ui: &mut Ui, commit: &Commit) {
         let mut clicked_file = None;
         let mut history_request = None;
-        history_file_table_header(ui, self.language);
+        history_file_table_header(ui, self.language, Some(&mut self.changed_files_tree));
 
         if self.loading_details_hash.as_deref() == Some(commit.hash.as_str()) {
             ui.horizontal(|ui| {
@@ -15662,28 +16043,30 @@ impl GitAgentApp {
             if details.files.is_empty() {
                 ui.label(RichText::new(self.tr("commit.no_changes")).color(theme::muted()));
             } else {
-                ScrollArea::vertical()
-                    .id_salt("search_changed_files_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for file in &details.files {
-                            let selected = self.search_selected_file_path.as_deref()
-                                == Some(file.diff_path.as_str());
-                            if history_file_table_row(
-                                ui,
-                                &file.status,
-                                &file.path,
-                                &file.diff_path,
-                                selected,
-                                self.language,
-                                &mut history_request,
-                            )
-                            .clicked()
-                            {
-                                clicked_file = Some(file.diff_path.clone());
-                            }
-                        }
-                    });
+                let files = details
+                    .files
+                    .iter()
+                    .map(|file| WorktreeFile {
+                        path: file.diff_path.clone(),
+                        display_path: if self.changed_files_tree {
+                            file.diff_path.clone()
+                        } else {
+                            file.path.clone()
+                        },
+                        index_status: file.status.chars().next().unwrap_or_default(),
+                        worktree_status: char::default(),
+                    })
+                    .collect::<Vec<_>>();
+                clicked_file = readonly_file_list(
+                    ui,
+                    "search_changed_files_scroll",
+                    &files,
+                    self.search_selected_file_path.as_deref(),
+                    self.changed_files_tree,
+                    &mut self.changed_files_collapsed,
+                    self.language,
+                    &mut history_request,
+                );
             }
         } else {
             ui.label(RichText::new(self.tr("commit.select_to_load_files")).color(theme::muted()));
@@ -15708,6 +16091,7 @@ impl GitAgentApp {
         ui.painter()
             .rect_filled(header_rect, CornerRadius::ZERO, theme::panel_soft());
         let mut rollback_clicked = false;
+        let mut open_comparison = false;
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_rect), |ui| {
             let rollback_label = self.tr("diff.revert_hunk");
             let blocks_label = self.tr("diff.blocks");
@@ -15717,7 +16101,7 @@ impl GitAgentApp {
             let gap = 6.0;
             let top = header_rect.center().y - 10.0;
             let rollback_rect = Rect::from_min_size(
-                Pos2::new(header_rect.right() - rollback_w - 6.0, top),
+                Pos2::new(header_rect.right() - rollback_w - 32.0, top),
                 Vec2::new(rollback_w, 20.0),
             );
             let switch_rect = Rect::from_min_size(
@@ -15725,6 +16109,20 @@ impl GitAgentApp {
                 Vec2::new(switch_w, 20.0),
             );
 
+            let comparison_rect = Rect::from_center_size(
+                Pos2::new(header_rect.right() - 15.0, header_rect.center().y),
+                Vec2::splat(22.0),
+            );
+            let comparison_ready = self.selected_file_path.as_ref().is_some_and(|path| {
+                let key = git::diff_key(&commit.hash, path);
+                self.loading_diff_key.as_deref() != Some(key.as_str())
+                    && self.diff_cache.contains_key(&key)
+            });
+            open_comparison = ui
+                .add_enabled_ui(comparison_ready, |ui| {
+                    diff_popup_button_at(ui, comparison_rect, self.language).clicked()
+                })
+                .inner;
             rollback_clicked = header_action_button_at(ui, rollback_rect, rollback_label).clicked();
             diff_display_mode_switch(
                 ui,
@@ -15759,6 +16157,17 @@ impl GitAgentApp {
         if rollback_clicked {
             self.revert_selected_history_hunk(&commit.hash, false);
         }
+        if open_comparison {
+            if let Some(diff) = self
+                .selected_file_path
+                .as_ref()
+                .and_then(|path| self.diff_cache.get(&git::diff_key(&commit.hash, path)))
+                .cloned()
+            {
+                self.embedded_diff = crate::diff_tool::EmbeddedDiff::default();
+                self.side_by_side_popup = Some(diff);
+            }
+        }
         self.diff_viewer(ui, &commit.hash, self.history_diff_display_mode);
     }
 
@@ -15773,6 +16182,7 @@ impl GitAgentApp {
         ui.painter()
             .rect_filled(header_rect, CornerRadius::ZERO, theme::panel_soft());
         let mut rollback_clicked = false;
+        let mut open_comparison = false;
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_rect), |ui| {
             let rollback_label = self.tr("diff.revert_hunk");
             let blocks_label = self.tr("diff.blocks");
@@ -15782,7 +16192,7 @@ impl GitAgentApp {
             let gap = 6.0;
             let top = header_rect.center().y - 10.0;
             let rollback_rect = Rect::from_min_size(
-                Pos2::new(header_rect.right() - rollback_w - 6.0, top),
+                Pos2::new(header_rect.right() - rollback_w - 32.0, top),
                 Vec2::new(rollback_w, 20.0),
             );
             let switch_rect = Rect::from_min_size(
@@ -15790,6 +16200,20 @@ impl GitAgentApp {
                 Vec2::new(switch_w, 20.0),
             );
 
+            let comparison_rect = Rect::from_center_size(
+                Pos2::new(header_rect.right() - 15.0, header_rect.center().y),
+                Vec2::splat(22.0),
+            );
+            let comparison_ready = self.search_selected_file_path.as_ref().is_some_and(|path| {
+                let key = git::diff_key(&commit.hash, path);
+                self.loading_diff_key.as_deref() != Some(key.as_str())
+                    && self.diff_cache.contains_key(&key)
+            });
+            open_comparison = ui
+                .add_enabled_ui(comparison_ready, |ui| {
+                    diff_popup_button_at(ui, comparison_rect, self.language).clicked()
+                })
+                .inner;
             rollback_clicked = header_action_button_at(ui, rollback_rect, rollback_label).clicked();
             diff_display_mode_switch(
                 ui,
@@ -15823,6 +16247,17 @@ impl GitAgentApp {
         });
         if rollback_clicked {
             self.revert_selected_history_hunk(&commit.hash, true);
+        }
+        if open_comparison {
+            if let Some(diff) = self
+                .search_selected_file_path
+                .as_ref()
+                .and_then(|path| self.diff_cache.get(&git::diff_key(&commit.hash, path)))
+                .cloned()
+            {
+                self.embedded_diff = crate::diff_tool::EmbeddedDiff::default();
+                self.side_by_side_popup = Some(diff);
+            }
         }
         self.search_diff_viewer(ui, &commit.hash, self.search_diff_display_mode);
     }
@@ -16342,6 +16777,19 @@ impl GitAgentApp {
 
     fn handle_branch_action(&mut self, action: BranchMenuAction) {
         match action {
+            BranchMenuAction::ViewHistory { name } => {
+                if self.branch_actions_busy() {
+                    return;
+                }
+                self.active_view = MainView::History;
+                self.history_reference = Some(name);
+                self.selected_file_path = None;
+                self.selected_diff_rows.clear();
+                if let Some(snapshot) = &mut self.snapshot {
+                    snapshot.history_loaded = false;
+                }
+                self.request_active_repository_history();
+            }
             BranchMenuAction::Create => {
                 self.pending_branch_action = Some(BranchActionDialog::Create {
                     name: String::new(),
@@ -17072,7 +17520,7 @@ impl GitAgentApp {
         );
     }
 
-    fn worktree_diff_viewer(&self, ui: &mut Ui) {
+    fn worktree_diff_viewer(&mut self, ui: &mut Ui) {
         let Some(selected) = &self.selected_worktree_file else {
             return;
         };
@@ -17096,6 +17544,24 @@ impl GitAgentApp {
             return;
         }
 
+        let (header_rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::hover());
+        let button_rect = Rect::from_center_size(
+            Pos2::new(header_rect.right() - 13.0, header_rect.center().y),
+            Vec2::splat(22.0),
+        );
+        draw_elided_path_label(
+            ui,
+            Rect::from_min_max(
+                header_rect.left_top(),
+                Pos2::new(button_rect.left() - 6.0, header_rect.bottom()),
+            ),
+            &selected.path,
+        );
+        if diff_popup_button_at(ui, button_rect, self.language).clicked() {
+            self.embedded_diff = crate::diff_tool::EmbeddedDiff::default();
+            self.side_by_side_popup = Some(diff.clone());
+        }
         let truncated_label = self.tr("diff.truncated");
         let mut selected_rows = Vec::new();
         let diff_response = worktree_diff_panel_frame().show(ui, |ui| {
@@ -17118,6 +17584,44 @@ impl GitAgentApp {
         paint_workspace_card_inset_shadow(ui, diff_rect);
     }
 
+    fn side_by_side_diff_modal(&mut self, ctx: &egui::Context) {
+        let Some(diff) = self.side_by_side_popup.take() else {
+            return;
+        };
+        let available = ctx.screen_rect().size();
+        let size = Vec2::new(
+            (available.x - 64.0).max(280.0),
+            (available.y - 100.0).max(240.0),
+        );
+        let title = if self.language == Language::Chinese {
+            "左右对比"
+        } else {
+            "Side by side comparison"
+        };
+        let mut close = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let mut title_closed = false;
+        fixed_action_dialog_with_close(ctx, title, size.x, size.y, Some(&mut title_closed), |ui| {
+            ui.add_sized(
+                [ui.available_width(), 24.0],
+                egui::Label::new(&diff.path).truncate(),
+            )
+            .on_hover_text(&diff.path);
+            let content_size = Vec2::new(
+                ui.available_width(),
+                (size.y - ACTION_DIALOG_TITLE_HEIGHT - 52.0).max(100.0),
+            );
+            ui.allocate_ui_with_layout(content_size, Layout::top_down(Align::Min), |ui| {
+                ui.set_max_size(content_size);
+                self.embedded_diff
+                    .show(ui, &diff, self.language == Language::Chinese);
+            });
+        });
+        close |= title_closed;
+        if !close {
+            self.side_by_side_popup = Some(diff);
+        }
+    }
+
     fn pull_action_modal(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.pending_pull_action.take() else {
             return;
@@ -17128,6 +17632,7 @@ impl GitAgentApp {
         let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
             None;
         let mut push_after_success = None;
+        let mut push_preference_changed = false;
         let actions_enabled = !self.branch_actions_busy();
         let remotes = self.remote_names();
         if !remotes.iter().any(|remote| remote == &dialog.remote) {
@@ -17256,13 +17761,16 @@ impl GitAgentApp {
                     push_after_pull_plan.is_some(),
                     &mut dialog.push_after_pull,
                 );
-                ui.add_enabled_ui(push_after_pull_enabled, |ui| {
-                    action_checkbox(
-                        ui,
-                        &mut dialog.push_after_pull,
-                        self.tr("pull.push_after_pull"),
-                    );
-                });
+                push_preference_changed = ui
+                    .add_enabled_ui(push_after_pull_enabled, |ui| {
+                        action_checkbox(
+                            ui,
+                            &mut dialog.push_after_pull,
+                            self.tr("pull.push_after_pull"),
+                        )
+                        .changed()
+                    })
+                    .inner;
                 action_checkbox(ui, &mut dialog.include_tags, self.tr("pull.include_tags"));
                 action_checkbox(
                     ui,
@@ -17304,6 +17812,12 @@ impl GitAgentApp {
             });
         });
 
+        // Persist explicit user choices only. A temporarily unavailable push
+        // target may clear the dialog checkbox without changing the preference.
+        if push_preference_changed {
+            self.commit_state.push_after_pull = dialog.push_after_pull;
+            self.save_commit_state_for_active_repo();
+        }
         if let Some(action) = execute {
             self.pending_push_after_pull = push_after_success;
             self.execute_git_action(action);
@@ -18838,6 +19352,7 @@ impl GitAgentApp {
             &HashSet::new(),
             &mut dialog.history_cache,
             HistoryCommitBrowserConfig {
+                show_graph: true,
                 id_salt: "create_patch_commit_browser_scroll",
                 show_view_controls: true,
                 show_search: true,
@@ -18924,7 +19439,7 @@ impl GitAgentApp {
                 source_tree_meta_line(ui, self.tr("commit.when"), &commit.date);
                 ui.label(RichText::new(&commit.subject).color(theme::text()));
                 ui.add_space(4.0);
-                history_file_table_header(ui, self.language);
+                history_file_table_header(ui, self.language, None);
                 if self.loading_details_hash.as_deref() == Some(commit.hash.as_str()) {
                     ui.spinner();
                 } else if let Some(details) = details.as_ref() {
@@ -19227,6 +19742,7 @@ impl GitAgentApp {
                     &table_disabled_hashes,
                     &mut dialog.history_cache,
                     HistoryCommitBrowserConfig {
+                        show_graph: true,
                         id_salt: "interactive_rebase_commit_browser_scroll",
                         show_view_controls: true,
                         show_search: true,
@@ -19633,7 +20149,7 @@ impl GitAgentApp {
                     source_tree_meta_line(ui, self.tr("interactive_rebase.preview_next"), next);
                 }
                 ui.add_space(4.0);
-                history_file_table_header(ui, self.language);
+                history_file_table_header(ui, self.language, None);
                 if self.loading_details_hash.as_deref() == Some(commit.hash.as_str()) {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -20909,6 +21425,7 @@ impl GitAgentApp {
                 &HashSet::new(),
                 &mut dialog.history_cache,
                 HistoryCommitBrowserConfig {
+                    show_graph: true,
                     id_salt: "merge_commit_browser_scroll",
                     show_view_controls: true,
                     show_search: true,
@@ -21591,6 +22108,7 @@ impl GitAgentApp {
                                     &HashSet::new(),
                                     history_cache,
                                     HistoryCommitBrowserConfig {
+                                        show_graph: true,
                                         id_salt: "checkout_existing_commit_browser",
                                         show_view_controls: true,
                                         show_search: true,
@@ -24444,6 +24962,9 @@ enum StashMenuAction {
 
 #[derive(Clone, Debug)]
 enum BranchMenuAction {
+    ViewHistory {
+        name: String,
+    },
     Create,
     Checkout {
         name: String,
@@ -25538,6 +26059,17 @@ fn fixed_action_dialog(
     height: f32,
     add_contents: impl FnOnce(&mut Ui),
 ) {
+    fixed_action_dialog_with_close(ctx, title, width, height, None, add_contents);
+}
+
+fn fixed_action_dialog_with_close(
+    ctx: &egui::Context,
+    title: &str,
+    width: f32,
+    height: f32,
+    mut closed: Option<&mut bool>,
+    add_contents: impl FnOnce(&mut Ui),
+) {
     let width = safe_ui_length(width).max(280.0);
     let height = safe_ui_length(height).max(ACTION_DIALOG_TITLE_HEIGHT + 80.0);
     egui::Window::new(title)
@@ -25554,7 +26086,36 @@ fn fixed_action_dialog(
                 .inner_margin(egui::Margin::same(0))
                 .show(ui, |ui| {
                     ui.set_width(width);
-                    compact_dialog_title_bar(ui, title, width);
+                    let title_rect = compact_dialog_title_bar(ui, title, width);
+                    if let Some(closed) = closed.as_deref_mut() {
+                        let close_rect = Rect::from_center_size(
+                            Pos2::new(title_rect.right() - 18.0, title_rect.center().y),
+                            Vec2::splat(28.0),
+                        );
+                        let response = pointing_hand_cursor(ui.interact(
+                            close_rect,
+                            ui.id().with("dialog_close"),
+                            Sense::click(),
+                        ));
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                close_rect,
+                                CornerRadius::same(3),
+                                theme::accent_soft(),
+                            );
+                        }
+                        let center = close_rect.center();
+                        let stroke = Stroke::new(1.5, theme::text());
+                        ui.painter().line_segment(
+                            [center + Vec2::new(-4.0, -4.0), center + Vec2::new(4.0, 4.0)],
+                            stroke,
+                        );
+                        ui.painter().line_segment(
+                            [center + Vec2::new(-4.0, 4.0), center + Vec2::new(4.0, -4.0)],
+                            stroke,
+                        );
+                        *closed |= response.clicked();
+                    }
                     egui::Frame::new()
                         .inner_margin(egui::Margin::symmetric(12, 10))
                         .show(ui, |ui| {
@@ -25565,7 +26126,7 @@ fn fixed_action_dialog(
         });
 }
 
-fn compact_dialog_title_bar(ui: &mut Ui, title: &str, width: f32) {
+fn compact_dialog_title_bar(ui: &mut Ui, title: &str, width: f32) -> Rect {
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(width, ACTION_DIALOG_TITLE_HEIGHT), Sense::hover());
     ui.painter().rect_filled(
@@ -25586,6 +26147,7 @@ fn compact_dialog_title_bar(ui: &mut Ui, title: &str, width: f32) {
         FontId::proportional(ACTION_DIALOG_TITLE_SIZE),
         theme::text(),
     );
+    rect
 }
 
 fn paint_dialog_title_pattern(ui: &Ui, rect: Rect) {
@@ -25867,6 +26429,11 @@ enum UiIcon {
     Tag,
     Stash,
     Folder,
+    Files,
+    Eye,
+    EyeOff,
+    ArrowLeft,
+    Compare,
     FolderClosed,
     FolderOpen,
     TreeView,
@@ -27251,6 +27818,11 @@ fn icon_source(icon: UiIcon) -> egui::ImageSource<'static> {
         UiIcon::Branch => egui::include_image!("../assets/icons/branch.svg"),
         UiIcon::Tag => egui::include_image!("../assets/icons/tag.svg"),
         UiIcon::Stash => egui::include_image!("../assets/icons/stash.svg"),
+        UiIcon::Files => egui::include_image!("../assets/icons/files.svg"),
+        UiIcon::Eye => egui::include_image!("../assets/icons/eye.svg"),
+        UiIcon::EyeOff => egui::include_image!("../assets/icons/eye-off.svg"),
+        UiIcon::Compare => egui::include_image!("../assets/icons/compare.svg"),
+        UiIcon::ArrowLeft => egui::include_image!("../assets/icons/arrow-left.svg"),
         UiIcon::Folder => egui::include_image!("../assets/icons/folder.svg"),
         UiIcon::FolderClosed => egui::include_image!("../assets/icons/folder-closed.svg"),
         UiIcon::FolderOpen => egui::include_image!("../assets/icons/folder-open.svg"),
@@ -27475,6 +28047,18 @@ fn borderless_context_menu(
 fn apply_menu_visuals(ui: &mut Ui) {
     ui.spacing_mut().button_padding = Vec2::new(6.0, 2.0);
     apply_menu_style(ui.style_mut());
+}
+
+// Menus stretch widgets to fill their width. Keep that hit area while laying
+// out informational text independently, so wrapped lines never justify glyphs.
+fn menu_info_label(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let galley = text.into().into_galley(
+        ui,
+        Some(egui::TextWrapMode::Wrap),
+        ui.available_width(),
+        egui::FontSelection::Default,
+    );
+    ui.label(galley)
 }
 
 fn menu_group_gap(ui: &mut Ui) {
@@ -28130,6 +28714,29 @@ fn worktree_diff_panel_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(0))
 }
 
+fn diff_popup_button_at(ui: &mut Ui, rect: Rect, language: Language) -> egui::Response {
+    let response = pointing_hand_cursor(ui.interact(
+        rect,
+        ui.id().with("open_diff_comparison"),
+        Sense::click(),
+    ));
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(3), theme::accent_soft());
+    }
+    paint_ui_icon(
+        ui,
+        Rect::from_center_size(rect.center(), Vec2::splat(16.0)),
+        UiIcon::Compare,
+        theme::text(),
+    );
+    response.on_hover_text(if language == Language::Chinese {
+        "在弹窗中左右对比"
+    } else {
+        "Open side by side comparison"
+    })
+}
+
 fn diff_display_mode_salt(mode: DiffDisplayMode) -> &'static str {
     match mode {
         DiffDisplayMode::Blocks => "blocks",
@@ -28681,13 +29288,15 @@ fn history_table_header(
         }
         x += selection_width;
     }
-    ui.painter().text(
-        Pos2::new(x, y),
-        Align2::LEFT_CENTER,
-        labels.0,
-        FontId::proportional(12.0),
-        theme::muted(),
-    );
+    if graph_width > 0.0 {
+        ui.painter().text(
+            Pos2::new(x, y),
+            Align2::LEFT_CENTER,
+            labels.0,
+            FontId::proportional(12.0),
+            theme::muted(),
+        );
+    }
     x += graph_width;
     if show_rebase_plan_controls {
         let action_label = if language == Language::Chinese {
@@ -28751,6 +29360,9 @@ fn history_table_header(
     ];
     let mut changed = false;
     for (x, id, boundary) in boundaries {
+        if boundary == 3 && graph_width <= 0.0 {
+            continue;
+        }
         let handle = Rect::from_min_max(
             Pos2::new(x - 3.0, rect.top()),
             Pos2::new(x + 3.0, rect.bottom()),
@@ -28847,6 +29459,7 @@ fn adjust_history_column_widths(
 #[derive(Clone, Copy, Debug)]
 struct HistoryCommitBrowserConfig {
     id_salt: &'static str,
+    show_graph: bool,
     show_view_controls: bool,
     show_search: bool,
     show_cherry_pick: bool,
@@ -28862,6 +29475,7 @@ impl Default for HistoryCommitBrowserConfig {
     fn default() -> Self {
         Self {
             id_salt: "history_commit_browser",
+            show_graph: true,
             show_view_controls: true,
             show_search: true,
             show_cherry_pick: true,
@@ -29024,7 +29638,11 @@ fn history_commit_browser(
     cache.refresh(commits, search);
     let layout = &cache.layout;
     let lane_count = layout.lanes.max(1);
-    let graph_width = history_graph_width(ui.available_width(), lane_count, prefs);
+    let graph_width = if config.show_graph {
+        history_graph_width(ui.available_width(), lane_count, prefs)
+    } else {
+        0.0
+    };
     let visible_indexes = &cache.visible_indexes;
     outcome.visible_hashes = visible_indexes
         .iter()
@@ -29270,7 +29888,9 @@ fn history_commit_table_row(
         Pos2::new(rect.left() + selection_width, rect.top()),
         rect.right_bottom(),
     );
-    draw_history_graph_cell(ui, content_rect, row, graph_width, lane_count);
+    if graph_width > 0.0 {
+        draw_history_graph_cell(ui, content_rect, row, graph_width, lane_count);
+    }
     let mut graph_rebase_drop = None;
     if enable_graph_rebase_drag && !disabled && rebase_plan.is_none() {
         if let Some(node_rect) = history_graph_node_rect(content_rect, row, graph_width, lane_count)
@@ -30383,7 +31003,253 @@ fn source_tree_meta_line(ui: &mut Ui, label: &str, value: &str) {
         );
 }
 
-fn history_file_table_header(ui: &mut Ui, language: Language) {
+fn file_tree_action_icon(
+    ui: &mut Ui,
+    icon: UiIcon,
+    tooltip: &str,
+    enabled: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::splat(24.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if enabled && response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(3), theme::hover());
+    }
+    draw_ui_icon(
+        ui,
+        rect.shrink(3.0),
+        icon,
+        if enabled {
+            theme::text()
+        } else {
+            theme::muted()
+        },
+    );
+    pointing_hand_cursor(response).on_hover_text(tooltip)
+}
+
+fn repository_file_tabs(
+    ui: &mut Ui,
+    browser: &mut crate::repository_browser::Browser,
+    chinese: bool,
+) -> (Option<usize>, Option<usize>) {
+    let mut activate = None;
+    let mut close = None;
+    let mut reorder = None;
+    let paths = browser
+        .tabs
+        .iter()
+        .map(|tab| tab.path.clone())
+        .collect::<Vec<_>>();
+    let names = paths
+        .iter()
+        .map(|path| worktree_path_basename(path).to_owned())
+        .collect::<Vec<_>>();
+    let widths = names
+        .iter()
+        .map(|name| repo_tab_width(ui, name))
+        .collect::<Vec<_>>();
+    // File tabs have no plus action: return that reserved width to the shared layout.
+    let visibility = repo_tab_visibility(
+        &widths,
+        None,
+        browser.active_tab,
+        false,
+        ui.available_width() + REPO_TAB_PLUS_WIDTH,
+    );
+    let more = if chinese { "更多" } else { "More" };
+    let close_label = if chinese {
+        "关闭文件历史"
+    } else {
+        "Close file history"
+    };
+    let (bar, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), REPO_TAB_HEIGHT),
+        Sense::hover(),
+    );
+    ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(bar)
+            .layout(Layout::left_to_right(Align::Center)),
+        |ui| {
+            ui.set_clip_rect(bar.intersect(ui.clip_rect()));
+            ui.spacing_mut().item_spacing.x = REPO_TAB_ITEM_GAP;
+            ui.add_space(REPO_TAB_STRIP_LEFT_PADDING);
+            let mut unused_source = false;
+            if visibility.has_leading_overflow() {
+                repo_tab_overflow_menu(
+                    ui,
+                    "file_leading",
+                    more,
+                    &visibility.leading_overflow_items,
+                    &paths,
+                    browser.active_tab,
+                    false,
+                    "",
+                    &mut activate,
+                    &mut unused_source,
+                );
+            }
+            for index in visibility.visible_repo_indices.iter().copied() {
+                let interaction = repo_tab_with_close(
+                    ui,
+                    UiIcon::File,
+                    browser.active_tab == Some(index),
+                    &names[index],
+                    close_label,
+                    ui.id().with(("file_history_tab", &paths[index])),
+                    None,
+                );
+                let response = interaction.response.on_hover_text(&paths[index]);
+                if interaction.close_clicked {
+                    close = Some(index);
+                } else if response.drag_started() {
+                    browser.dragging_tab = Some(index);
+                } else if let Some(from) = browser.dragging_tab {
+                    if from != index && response.hovered() {
+                        reorder = Some((from, index));
+                    }
+                } else if interaction.tab_clicked {
+                    activate = Some(index);
+                }
+            }
+            if visibility.has_trailing_overflow() {
+                repo_tab_overflow_menu(
+                    ui,
+                    "file_trailing",
+                    more,
+                    &visibility.trailing_overflow_items,
+                    &paths,
+                    browser.active_tab,
+                    false,
+                    "",
+                    &mut activate,
+                    &mut unused_source,
+                );
+            }
+        },
+    );
+    if let Some((from, to)) = reorder {
+        browser.reorder(from, to);
+    }
+    if !ui.input(|input| input.pointer.primary_down()) {
+        browser.dragging_tab = None;
+    }
+    (activate, close)
+}
+
+fn readonly_file_list(
+    ui: &mut Ui,
+    salt: &str,
+    files: &[WorktreeFile],
+    selected: Option<&str>,
+    tree: bool,
+    collapsed: &mut HashSet<String>,
+    language: Language,
+    history: &mut Option<String>,
+) -> Option<String> {
+    let mut clicked = None;
+    let rows = tree.then(|| worktree_tree_rows(files, collapsed));
+    let count = rows.as_ref().map_or(files.len(), Vec::len);
+    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+        ScrollArea::vertical()
+            .id_salt(salt)
+            .auto_shrink([false, false])
+            .show_rows(ui, 24.0, count, |ui, range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for index in range {
+                    if let Some(rows) = &rows {
+                        match &rows[index] {
+                            WorktreeTreeRow::Directory { path, depth } => {
+                                ui.push_id(path, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(*depth as f32 * 14.0);
+                                        let (arrow, arrow_response) = ui
+                                            .allocate_exact_size(Vec2::splat(14.0), Sense::click());
+                                        draw_tree_arrow(ui, arrow, !collapsed.contains(path));
+                                        let icon = if collapsed.contains(path) {
+                                            UiIcon::FolderClosed
+                                        } else {
+                                            UiIcon::FolderOpen
+                                        };
+                                        let (icon_rect, _) = ui
+                                            .allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                                        draw_ui_icon(ui, icon_rect, icon, theme::muted());
+                                        if ui
+                                            .selectable_label(false, worktree_path_basename(path))
+                                            .clicked()
+                                            || arrow_response.clicked()
+                                        {
+                                            if !collapsed.insert(path.clone()) {
+                                                collapsed.remove(path);
+                                            }
+                                        }
+                                    });
+                                });
+                            }
+                            WorktreeTreeRow::File { file, depth } => {
+                                ui.push_id(&file.path, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(*depth as f32 * 14.0 + 14.0);
+                                        if file.index_status != char::default()
+                                            && file.index_status != char::from(32)
+                                        {
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                Vec2::splat(14.0),
+                                                Sense::hover(),
+                                            );
+                                            draw_file_status_icon(
+                                                ui,
+                                                rect,
+                                                &file.index_status.to_string(),
+                                                selected == Some(file.path.as_str()),
+                                            );
+                                        }
+                                        let response = ui
+                                            .selectable_label(
+                                                selected == Some(file.path.as_str()),
+                                                worktree_path_basename(&file.display_path),
+                                            )
+                                            .on_hover_text(&file.path);
+                                        if response.clicked() {
+                                            clicked = Some(file.path.clone());
+                                        }
+                                        file_history_context_menu(
+                                            &response, &file.path, language, history,
+                                        );
+                                    });
+                                });
+                            }
+                        }
+                    } else {
+                        let file = &files[index];
+                        if history_file_table_row(
+                            ui,
+                            &file.index_status.to_string(),
+                            &file.display_path,
+                            &file.path,
+                            selected == Some(file.path.as_str()),
+                            language,
+                            history,
+                        )
+                        .clicked()
+                        {
+                            clicked = Some(file.path.clone());
+                        }
+                    }
+                }
+            });
+    });
+    clicked
+}
+
+fn history_file_table_header(ui: &mut Ui, language: Language, tree_mode: Option<&mut bool>) {
     let labels = if language == Language::Chinese {
         ("?", "\u{6587}\u{4ef6}\u{540d}", "\u{8def}\u{5f84}")
     } else {
@@ -30404,6 +31270,42 @@ fn history_file_table_header(ui: &mut Ui, language: Language) {
             theme::muted(),
         );
         x += col_w;
+    }
+    if let Some(tree_mode) = tree_mode {
+        let button_rect = Rect::from_center_size(
+            Pos2::new(rect.right() - 13.0, rect.center().y),
+            Vec2::splat(20.0),
+        );
+        let response = pointing_hand_cursor(ui.interact(
+            button_rect,
+            ui.id().with("changed_files_display_mode"),
+            Sense::click(),
+        ));
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(button_rect, CornerRadius::same(3), theme::accent_soft());
+        }
+        paint_ui_icon(
+            ui,
+            Rect::from_center_size(button_rect.center(), Vec2::splat(14.0)),
+            if *tree_mode {
+                UiIcon::FullPath
+            } else {
+                UiIcon::TreeView
+            },
+            theme::text(),
+        );
+        let response = response.on_hover_text(i18n::t(
+            language,
+            if *tree_mode {
+                "worktree.view_flat"
+            } else {
+                "worktree.view_tree"
+            },
+        ));
+        if response.clicked() {
+            *tree_mode = !*tree_mode;
+        }
     }
 }
 
@@ -30480,7 +31382,7 @@ fn file_history_context_menu(
     borderless_context_menu(response, |ui| {
         apply_menu_visuals(ui);
         ui.set_min_width(210.0);
-        ui.label(RichText::new(path).monospace().color(theme::text()));
+        menu_info_label(ui, RichText::new(path).monospace().color(theme::text()));
         menu_group_gap(ui);
         if ui.button(i18n::t(language, "file.view_history")).clicked() {
             *history_request = Some(normalize_worktree_path(path));
@@ -33265,10 +34167,7 @@ fn worktree_table(
                 });
             });
             ui.add_space(8.0);
-            if files.is_empty() {
-                ui.add_space(20.0);
-                ui.label(RichText::new("-").color(theme::muted()));
-            } else {
+            if !files.is_empty() {
                 let tree_mode = matches!(display_mode, WorktreeDisplayMode::Tree)
                     && files.len() <= WORKTREE_TREE_MODE_FILE_LIMIT;
                 if tree_mode {
@@ -33474,8 +34373,24 @@ fn branch_context_menu(
         apply_menu_visuals(ui);
         ui.spacing_mut().item_spacing.y = 3.0;
         ui.set_min_width(if remote { 220.0 } else { 270.0 });
+        if ui
+            .add_enabled(
+                enabled,
+                egui::Button::new(if language == Language::Chinese {
+                    "查看分支提交历史"
+                } else {
+                    "View branch history"
+                }),
+            )
+            .clicked()
+        {
+            *action = Some(BranchMenuAction::ViewHistory {
+                name: name.to_owned(),
+            });
+            ui.close_menu();
+        }
         if remote {
-            ui.label(RichText::new(name).color(theme::text()));
+            menu_info_label(ui, RichText::new(name).color(theme::text()));
             menu_group_gap(ui);
             if ui
                 .add_enabled(
@@ -33764,7 +34679,7 @@ fn tag_context_menu(
     borderless_context_menu(&response, |ui| {
         apply_menu_visuals(ui);
         ui.set_min_width(180.0);
-        ui.label(RichText::new(&tag.name).color(theme::text()));
+        menu_info_label(ui, RichText::new(&tag.name).color(theme::text()));
         menu_group_gap(ui);
         if ui.button(i18n::t(language, "tag.checkout")).clicked() {
             *action = Some(TagMenuAction::Checkout {
@@ -33837,7 +34752,8 @@ fn stash_context_menu(
     borderless_context_menu(&response, |ui| {
         apply_menu_visuals(ui);
         ui.set_min_width(180.0);
-        ui.label(
+        menu_info_label(
+            ui,
             RichText::new(&stash.selector)
                 .monospace()
                 .color(theme::text()),
@@ -34460,7 +35376,7 @@ fn remote_branch_row(
     borderless_context_menu(&response, |ui| {
         apply_menu_visuals(ui);
         ui.set_min_width(220.0);
-        ui.label(RichText::new(full_name).color(theme::text()));
+        menu_info_label(ui, RichText::new(full_name).color(theme::text()));
         menu_group_gap(ui);
         if ui
             .add_enabled(
@@ -34563,7 +35479,8 @@ fn stash_row(
     borderless_context_menu(&response, |ui| {
         apply_menu_visuals(ui);
         ui.set_min_width(180.0);
-        ui.label(
+        menu_info_label(
+            ui,
             RichText::new(&stash.selector)
                 .monospace()
                 .color(theme::text()),
@@ -34655,7 +35572,7 @@ fn tag_row(
     borderless_context_menu(&response, |ui| {
         apply_menu_visuals(ui);
         ui.set_min_width(180.0);
-        ui.label(RichText::new(&tag.name).color(theme::text()));
+        menu_info_label(ui, RichText::new(&tag.name).color(theme::text()));
         menu_group_gap(ui);
         if ui.button(i18n::t(language, "tag.checkout")).clicked() {
             *action = Some(TagMenuAction::Checkout {
@@ -34724,16 +35641,24 @@ fn worktree_tree_rows<'a>(
         });
     }
 
-    rows.sort_by(|left, right| {
-        let left_key = match left {
-            WorktreeTreeRow::Directory { path, .. } => (path.as_str(), 0),
-            WorktreeTreeRow::File { file, .. } => (file.display_path.as_str(), 1),
+    rows.sort_by_cached_key(|row| {
+        let (path, directory) = match row {
+            WorktreeTreeRow::Directory { path, .. } => (path.as_str(), true),
+            WorktreeTreeRow::File { file, .. } => (file.display_path.as_str(), false),
         };
-        let right_key = match right {
-            WorktreeTreeRow::Directory { path, .. } => (path.as_str(), 0),
-            WorktreeTreeRow::File { file, .. } => (file.display_path.as_str(), 1),
-        };
-        left_key.cmp(&right_key)
+        let parts = path.split("/").collect::<Vec<_>>();
+        parts
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let folder = directory || index + 1 < parts.len();
+                (
+                    if folder { 0_u8 } else { 1 },
+                    name.to_lowercase(),
+                    (*name).to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
     });
     rows
 }
@@ -34840,7 +35765,7 @@ fn worktree_directory_row(
     borderless_context_menu(&response, |ui| {
         apply_menu_visuals(ui);
         ui.set_min_width(180.0);
-        ui.label(RichText::new(path).monospace().color(theme::text()));
+        menu_info_label(ui, RichText::new(path).monospace().color(theme::text()));
         menu_group_gap(ui);
         if ui
             .button(i18n::t(language, "worktree.add_gitignore"))
@@ -34909,7 +35834,8 @@ fn worktree_file_row(
     borderless_context_menu(&response, |ui| {
         apply_menu_visuals(ui);
         ui.set_min_width(180.0);
-        ui.label(
+        menu_info_label(
+            ui,
             RichText::new(&file.display_path)
                 .monospace()
                 .color(theme::text()),
@@ -35040,8 +35966,12 @@ fn commit_context_menu(
     apply_menu_visuals(ui);
     ui.spacing_mut().item_spacing.y = 3.0;
     ui.set_min_width(220.0);
-    ui.label(RichText::new(&commit.subject).strong().color(theme::text()));
-    ui.label(
+    menu_info_label(
+        ui,
+        RichText::new(&commit.subject).strong().color(theme::text()),
+    );
+    menu_info_label(
+        ui,
         RichText::new(format!("{}  {}", commit.short_hash, commit.author))
             .small()
             .color(theme::muted()),
@@ -42973,6 +43903,39 @@ mod ui_tests {
             validate_commit_text_link("BUG-1", "file:///tmp/issue"),
             Err(CommitTextLinkValidationError::UnsupportedUrlScheme)
         );
+    }
+
+    #[test]
+    fn pull_push_preference_persists_per_repository() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "git-agent-pull-preference-{}-{unique}",
+            std::process::id()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        let mut state = RepoCommitState {
+            push_after_pull: true,
+            ..Default::default()
+        };
+        RepoCommitStateStore::save_for(&first, &state);
+        assert!(RepoCommitStateStore::state_for(&first).push_after_pull);
+        assert!(!RepoCommitStateStore::state_for(&second).push_after_pull);
+        state.push_after_pull = false;
+        RepoCommitStateStore::save_for(&first, &state);
+        assert!(!RepoCommitStateStore::state_for(&first).push_after_pull);
+        let legacy: RepoCommitState = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.push_after_pull);
+        // Only remove the exact test state file, never a real repository store.
+        if let Some(path) = repo_commit_state_path_for(&first) {
+            let _ = fs::remove_file(&path);
+            if let Some(parent) = path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
     }
 
     #[test]
@@ -51732,6 +52695,264 @@ diff --git a/file.txt b/file.txt
         let mut other = "Manual draft on another branch".to_owned();
         state.update_merge_default("main", &mut other, Some(new));
         assert_eq!(other, "Manual draft on another branch");
+    }
+
+    #[test]
+    fn file_tree_and_embedded_split_diff_render_headlessly() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        egui_extras::install_image_loaders(&ctx);
+        let files = vec![
+            WorktreeFile {
+                path: "src/a.rs".into(),
+                display_path: "src/a.rs".into(),
+                index_status: 'M',
+                ..Default::default()
+            },
+            WorktreeFile {
+                path: "docs/readme.md".into(),
+                display_path: "docs/readme.md".into(),
+                index_status: 'A',
+                ..Default::default()
+            },
+        ];
+        let mut collapsed = HashSet::new();
+        let mut history = None;
+        let mut diff = crate::diff_tool::EmbeddedDiff::default();
+        let source = FileDiff { text: "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-let value = 1;\n+let value = 2;\n".into(), ..Default::default() };
+        for tree in [false, true] {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.allocate_ui(Vec2::new(400.0, 180.0), |ui| {
+                            assert_eq!(
+                                readonly_file_list(
+                                    ui,
+                                    "test_files",
+                                    &files,
+                                    Some("src/a.rs"),
+                                    tree,
+                                    &mut collapsed,
+                                    Language::Chinese,
+                                    &mut history
+                                ),
+                                None
+                            );
+                        });
+                        diff.show(ui, &source, true);
+                    });
+                },
+            );
+            assert!(!output.shapes.is_empty());
+        }
+        assert!(history.is_none());
+        collapsed.insert("src".into());
+        let visible = worktree_tree_rows(&files, &collapsed);
+        assert!(
+            !visible.iter().any(
+                |row| matches!(row, WorktreeTreeRow::File {file, ..} if file.path == "src/a.rs")
+            )
+        );
+        assert!(visible.iter().any(
+            |row| matches!(row, WorktreeTreeRow::File {file, ..} if file.path == "docs/readme.md")
+        ));
+    }
+
+    #[test]
+    fn file_tree_sorts_folders_first_at_every_level() {
+        let files = [
+            "AAA.md",
+            "z.md",
+            "src/main.rs",
+            "build/Zulu.txt",
+            "public/x.txt",
+            "build/alpha.txt",
+            "build/zDir/file.rs",
+        ]
+        .into_iter()
+        .map(|path| WorktreeFile {
+            path: path.into(),
+            display_path: path.into(),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+        let paths = |collapsed: &HashSet<String>| {
+            worktree_tree_rows(&files, collapsed)
+                .into_iter()
+                .map(|row| match row {
+                    WorktreeTreeRow::Directory { path, .. } => path,
+                    WorktreeTreeRow::File { file, .. } => file.path.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(&HashSet::new()),
+            [
+                "build",
+                "build/zDir",
+                "build/zDir/file.rs",
+                "build/alpha.txt",
+                "build/Zulu.txt",
+                "public",
+                "public/x.txt",
+                "src",
+                "src/main.rs",
+                "AAA.md",
+                "z.md"
+            ]
+        );
+        let collapsed = HashSet::from(["build".to_owned()]);
+        assert_eq!(
+            paths(&collapsed),
+            [
+                "build",
+                "public",
+                "public/x.txt",
+                "src",
+                "src/main.rs",
+                "AAA.md",
+                "z.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn file_tabs_reuse_repository_overflow_and_keep_active_tab_visible() {
+        let widths = vec![150.0; 12];
+        for active in [0, 5, 11] {
+            let visibility = repo_tab_visibility(
+                &widths,
+                None,
+                Some(active),
+                false,
+                500.0 + REPO_TAB_PLUS_WIDTH,
+            );
+            assert!(visibility.visible_repo_indices.contains(&active));
+            assert!(!visibility.overflow_repo_indices.is_empty());
+            let controls = visibility.has_leading_overflow() as usize
+                + visibility.has_trailing_overflow() as usize;
+            let used = REPO_TAB_STRIP_LEFT_PADDING
+                + repo_tab_items_width(
+                    visibility
+                        .visible_repo_indices
+                        .iter()
+                        .map(|index| widths[*index])
+                        .chain(std::iter::repeat_n(REPO_TAB_OVERFLOW_WIDTH, controls)),
+                );
+            assert!(
+                used <= 500.0,
+                "file tabs and More menus must stay inside their strip: {used}"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_info_text_wraps_without_stretching_glyphs() {
+        let ctx = egui::Context::default();
+        let path = "src/views/promotion/ad-admin/components/template-actions/config.ts";
+        for width in [160.0, 260.0, 400.0] {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(width, 300.0),
+                        egui::Layout::top_down_justified(egui::Align::Min),
+                        |ui| {
+                            ui.set_max_width(width);
+                            assert!(ui.layout().horizontal_justify());
+                            menu_info_label(ui, RichText::new(path).monospace());
+                        },
+                    );
+                });
+            });
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == path => Some(text),
+                    _ => None,
+                })
+                .expect("menu title is painted");
+            assert!(!text.galley.job.justify);
+            assert_eq!(text.galley.job.halign, egui::Align::Min);
+            assert!(text.galley.rows.len() > 1);
+            assert!(text.galley.rect.width() <= width + 1.0);
+        }
+    }
+
+    #[test]
+    fn file_history_layout_has_vertical_tree_and_horizontal_tabs() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        egui_extras::install_image_loaders(&ctx);
+        let files = vec![WorktreeFile {
+            path: ".claude/skills/ui-ux-pro-max/readme.md".into(),
+            display_path: ".claude/skills/ui-ux-pro-max/readme.md".into(),
+            ..Default::default()
+        }];
+        let mut browser = crate::repository_browser::Browser::default();
+        browser.root = Some(std::env::temp_dir());
+        browser.open_history("a.txt".into());
+        browser.open_history("b.txt".into());
+        let mut collapsed = HashSet::new();
+        let mut history = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui(Vec2::new(280.0, 500.0), |ui| {
+                            readonly_file_list(
+                                ui,
+                                "sidebar_axis_test",
+                                &files,
+                                None,
+                                true,
+                                &mut collapsed,
+                                Language::Chinese,
+                                &mut history,
+                            );
+                        });
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(600.0, 500.0),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                assert_eq!(
+                                    repository_file_tabs(ui, &mut browser, true),
+                                    (None, None)
+                                );
+                                ui.label("File history commits");
+                            },
+                        );
+                    });
+                });
+            },
+        );
+        fn text_position(shape: &Shape, text: &str) -> Option<Pos2> {
+            match shape {
+                Shape::Text(shape) if shape.galley.job.text == text => Some(shape.pos),
+                Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_position(shape, text)),
+                _ => None,
+            }
+        }
+        let position = |text: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| text_position(&shape.shape, text))
+                .unwrap_or_else(|| panic!("Missing text: {text}"))
+        };
+        assert!(position(".claude").y < position("skills").y);
+        assert!(position("skills").y < position("ui-ux-pro-max").y);
+        assert!((position("a.txt").y - position("b.txt").y).abs() < 1.0);
+        assert!(position("a.txt").x < position("b.txt").x);
+        assert!(position("File history commits").y > position("a.txt").y);
     }
 
     #[test]

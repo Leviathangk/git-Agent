@@ -832,6 +832,33 @@ pub fn load_repository_history(
     })
 }
 
+pub fn load_branch_history(
+    root: &Path,
+    reference: &str,
+    order: CommitOrder,
+) -> Result<RepositoryHistory> {
+    let revision = git_output(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{reference}^{{commit}}"),
+        ],
+    )?;
+    Ok(RepositoryHistory {
+        commits: load_commits_with_reference(
+            root,
+            HISTORY_COMMIT_LIMIT,
+            order,
+            CommitScope::CurrentBranch,
+            Some(revision.trim()),
+        )?,
+        all_branches: false,
+        topology: order == CommitOrder::Topology,
+    })
+}
+
 #[allow(dead_code)]
 pub fn benchmark_repository(path: impl AsRef<Path>) -> Result<RepositoryBenchmarkReport> {
     benchmark_repository_with_progress(path, |_| {})
@@ -1221,30 +1248,48 @@ pub fn search_commits_by_changed_file(
     Ok(hashes)
 }
 
+pub fn load_file_history(root: &Path, path: &str, cancelled: &AtomicBool) -> Result<Vec<Commit>> {
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        return Err(anyhow!("Search cancelled"));
+    }
+    if !has_head(root) {
+        return Ok(Vec::new());
+    }
+    let revision = git_output(root, &["rev-parse", "--verify", "HEAD"])?;
+    let limit = format!("--max-count={HISTORY_COMMIT_LIMIT}");
+    let pathspec = format!(":(literal){path}");
+    let output = search_git_output(
+        root,
+        &[
+            "log",
+            "--date-order",
+            &limit,
+            "--follow",
+            "--date=format-local:%Y-%m-%d %H:%M",
+            "--decorate=short",
+            "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%cd%x1f%ar%x1f%D%x1f%s",
+            revision.trim(),
+            "--",
+            &pathspec,
+        ],
+        cancelled,
+    )?;
+    Ok(parse_commit_log(&output))
+}
+
 pub fn commits_for_file_path(
     root: impl AsRef<Path>,
     path: &str,
     cancelled: &AtomicBool,
 ) -> Result<Vec<String>> {
-    let path = path.trim().replace('\\', "/");
+    let path = path.trim().replace(char::from(92), "/");
     if path.is_empty() {
         return Ok(Vec::new());
     }
-    let max_count = format!("--max-count={HISTORY_COMMIT_LIMIT}");
-    let output = search_git_output(
-        root.as_ref(),
-        &[
-            "log",
-            "--date-order",
-            &max_count,
-            "--follow",
-            "--format=%H",
-            "--",
-            &path,
-        ],
-        cancelled,
-    )?;
-    Ok(parse_hash_lines(&output))
+    Ok(load_file_history(root.as_ref(), &path, cancelled)?
+        .into_iter()
+        .map(|commit| commit.hash)
+        .collect())
 }
 
 fn search_git_output(root: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<String> {
@@ -4549,7 +4594,17 @@ fn load_commits(
     order: CommitOrder,
     scope: CommitScope,
 ) -> Result<Vec<Commit>> {
-    if !has_head(root) {
+    load_commits_with_reference(root, limit, order, scope, None)
+}
+
+fn load_commits_with_reference(
+    root: &Path,
+    limit: usize,
+    order: CommitOrder,
+    scope: CommitScope,
+    reference: Option<&str>,
+) -> Result<Vec<Commit>> {
+    if reference.is_none() && !has_head(root) {
         return Ok(Vec::new());
     }
 
@@ -4569,9 +4624,17 @@ fn load_commits(
         args.push("--all");
     }
     args.push("--format=%H%x1f%P%x1f%an%x1f%ae%x1f%cd%x1f%ar%x1f%D%x1f%s");
+    if let Some(reference) = reference {
+        args.push(reference);
+    }
+    args.push("--");
     let output = git_output(root, &args)?;
 
-    Ok(output
+    Ok(parse_commit_log(&output))
+}
+
+fn parse_commit_log(output: &str) -> Vec<Commit> {
+    output
         .lines()
         .filter_map(|line| {
             let mut parts = line.split('\x1f');
@@ -4610,7 +4673,7 @@ fn load_commits(
                 refs,
             })
         })
-        .collect())
+        .collect()
 }
 
 fn has_head(root: &Path) -> bool {
@@ -4765,6 +4828,36 @@ mod tests {
         let initial = parse_repository_refresh_fingerprint("## No commits yet on main\n");
         assert_eq!(initial.branch, "main");
         assert!(initial.status.is_empty());
+    }
+
+    #[test]
+    fn other_branch_history_preserves_head_index_and_worktree() -> Result<()> {
+        let root = init_patch_test_repo("browse-branch-history")?;
+        let original_branch = git_output(&root, &["symbolic-ref", "--short", "HEAD"])?;
+        let base = git_output(&root, &["rev-parse", "HEAD"])?;
+        git_output(&root, &["checkout", "-b", "feature/browse"])?;
+        fs::write(root.join("feature.txt"), "feature\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "feature-only commit"])?;
+        let feature = git_output(&root, &["rev-parse", "HEAD"])?;
+        git_output(&root, &["checkout", original_branch.trim()])?;
+        fs::write(root.join("selected.txt"), "local edit\n")?;
+        let index = git_output_bytes(&root, &["ls-files", "--stage", "-z"])?;
+        let history = load_branch_history(&root, "feature/browse", CommitOrder::Date)?;
+        assert_eq!(history.commits[0].hash, feature.trim());
+        assert_eq!(git_output(&root, &["rev-parse", "HEAD"])?, base);
+        assert_eq!(
+            git_output_bytes(&root, &["ls-files", "--stage", "-z"])?,
+            index
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("selected.txt"))?,
+            "local edit\n"
+        );
+        assert!(load_branch_history(&root, "--all", CommitOrder::Date).is_err());
+        assert!(load_branch_history(&root, "missing", CommitOrder::Topology).is_err());
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

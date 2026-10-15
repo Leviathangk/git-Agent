@@ -13,6 +13,7 @@ pub mod merge_tool;
 mod patch;
 pub mod plugin_manager;
 pub mod plugins;
+mod repository_browser;
 pub mod syntax;
 pub mod theme;
 mod tutorials;

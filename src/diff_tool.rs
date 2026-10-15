@@ -114,6 +114,57 @@ pub struct DiffFile {
     pub right_highlight: Option<HighlightedDocument>,
 }
 
+#[derive(Default)]
+pub(crate) struct EmbeddedDiff {
+    text: String,
+    files: Vec<DiffFile>,
+    scroll_x: f32,
+    scroll_y: f32,
+}
+
+impl EmbeddedDiff {
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui, diff: &crate::git::FileDiff, chinese: bool) {
+        if self.text != diff.text {
+            self.files = parse_side_by_side_diff(&diff.text);
+            for file in &mut self.files {
+                file.left_highlight = diff.old_highlight.clone();
+                file.right_highlight = diff.new_highlight.clone();
+            }
+            self.text.clone_from(&diff.text);
+            self.scroll_x = 0.0;
+            self.scroll_y = 0.0;
+        }
+        if self.files.is_empty() {
+            ui.label(if chinese {
+                "该文件没有可显示的文本差异（二进制或仅元数据变更）"
+            } else {
+                "No text diff (binary or metadata-only change)"
+            });
+            return;
+        }
+        let language = if chinese {
+            DiffLanguage::Chinese
+        } else {
+            DiffLanguage::English
+        };
+        let mode = if ui.visuals().dark_mode {
+            DiffTheme::Dark
+        } else {
+            DiffTheme::Light
+        };
+        show_side_by_side_diff(
+            ui,
+            &self.files,
+            if chinese { "修改前" } else { "Before" },
+            if chinese { "修改后" } else { "After" },
+            language,
+            &mut self.scroll_x,
+            &mut self.scroll_y,
+            diff_palette(mode),
+        );
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiffSyntaxSession {
     pub files: Vec<DiffSyntaxFile>,
@@ -1036,8 +1087,7 @@ fn show_side_by_side_diff(
         .unwrap_or(0);
     let narrow_column = ((code_rect.width() - DIFF_PANE_GAP) / 2.0).max(1.0);
     let code_column = (DIFF_GUTTER_WIDTH + 20.0 + longest_chars as f32 * 7.7).max(narrow_column);
-    let total_width = code_column * 2.0 + DIFF_PANE_GAP;
-    let max_scroll_x = (total_width - code_rect.width()).max(0.0);
+    let max_scroll_x = (code_column - narrow_column).max(0.0);
     *scroll_x = diff_horizontal_scroll_input(ui, code_rect, *scroll_x, max_scroll_x);
 
     let output = ui
@@ -1059,8 +1109,7 @@ fn show_side_by_side_diff(
                             left_label,
                             right_label,
                             language,
-                            total_width,
-                            code_column,
+                            narrow_column,
                             *scroll_x,
                             palette,
                         );
@@ -1087,8 +1136,8 @@ fn show_side_by_side_diff(
         ui,
         horizontal_rect,
         *scroll_x,
-        code_rect.width(),
-        total_width,
+        narrow_column,
+        code_column,
         palette,
     );
 }
@@ -1124,7 +1173,6 @@ fn draw_display_row(
     left_label: &str,
     right_label: &str,
     language: DiffLanguage,
-    total_width: f32,
     column_width: f32,
     scroll_x: f32,
     palette: DiffPalette,
@@ -1133,10 +1181,8 @@ fn draw_display_row(
         Vec2::new(ui.available_width(), DIFF_ROW_HEIGHT),
         Sense::hover(),
     );
-    let paint_rect = Rect::from_min_size(
-        Pos2::new(viewport_row.left() - scroll_x, viewport_row.top()),
-        Vec2::new(total_width, DIFF_ROW_HEIGHT),
-    );
+    // Columns stay in the viewport; horizontal scrolling applies only to code.
+    let paint_rect = viewport_row;
     match row {
         DiffDisplayRow::File(file) => draw_file_header(
             ui,
@@ -1166,6 +1212,7 @@ fn draw_display_row(
             right_highlight,
             column_width,
             DIFF_PANE_GAP,
+            scroll_x,
             palette,
         ),
     }
@@ -1414,6 +1461,7 @@ fn draw_line_row(
     right_highlight: Option<&HighlightedDocument>,
     column_width: f32,
     gap: f32,
+    scroll_x: f32,
     palette: DiffPalette,
 ) {
     let (left_rect, right_rect) = split_columns(rect, column_width, gap);
@@ -1426,6 +1474,7 @@ fn draw_line_row(
         line.left_line.and_then(|line_number| {
             left_highlight.and_then(|document| document.lines.get(line_number.saturating_sub(1)))
         }),
+        scroll_x,
         palette,
     );
     draw_cell(
@@ -1437,6 +1486,7 @@ fn draw_line_row(
         line.right_line.and_then(|line_number| {
             right_highlight.and_then(|document| document.lines.get(line_number.saturating_sub(1)))
         }),
+        scroll_x,
         palette,
     );
 }
@@ -1457,6 +1507,7 @@ fn draw_cell(
     text: &str,
     kind: DiffCellKind,
     highlighted_line: Option<&HighlightedLine>,
+    scroll_x: f32,
     palette: DiffPalette,
 ) {
     ui.painter().rect_filled(rect, 0.0, cell_bg(kind, palette));
@@ -1491,7 +1542,7 @@ fn draw_cell(
     ));
     painter.galley(
         Pos2::new(
-            text_rect.left(),
+            text_rect.left() - scroll_x,
             text_rect.center().y - galley.size().y * 0.5,
         ),
         galley,
@@ -1939,6 +1990,68 @@ fn dt(language: DiffLanguage, key: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn horizontal_scroll_keeps_both_columns_and_line_numbers_visible() {
+        let ctx = egui::Context::default();
+        let line = DiffLine {
+            left_line: Some(1),
+            right_line: Some(2),
+            left_text: "old code".repeat(100),
+            right_text: "new code".repeat(100),
+            left_kind: DiffCellKind::Removed,
+            right_kind: DiffCellKind::Added,
+        };
+        let mut starts = Vec::new();
+        for scroll in [0.0, 200.0] {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect = Rect::from_min_size(Pos2::new(10.0, 30.0), Vec2::new(808.0, 21.0));
+                    draw_line_row(
+                        ui,
+                        rect,
+                        &line,
+                        None,
+                        None,
+                        400.0,
+                        8.0,
+                        scroll,
+                        diff_palette(DiffTheme::Light),
+                    );
+                });
+            });
+            let texts = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some((shape.clip_rect, text)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let left_number = texts
+                .iter()
+                .find(|(_, text)| text.galley.text() == "1")
+                .unwrap()
+                .1
+                .pos;
+            let right_number = texts
+                .iter()
+                .find(|(_, text)| text.galley.text() == "2")
+                .unwrap()
+                .1
+                .pos;
+            let (clip, right_code) = texts
+                .iter()
+                .find(|(_, text)| text.galley.text() == line.right_text)
+                .unwrap();
+            assert!(clip.left() >= 418.0);
+            assert!(clip.right() <= 818.0);
+            starts.push((left_number, right_number, right_code.pos));
+        }
+        assert_eq!(starts[0].0, starts[1].0);
+        assert_eq!(starts[0].1, starts[1].1);
+        assert_eq!(starts[0].2.x - starts[1].2.x, 200.0);
+    }
 
     #[test]
     fn hunk_header_becomes_readable_range_summary() {

@@ -5,6 +5,24 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.1.0 — 2026-10-15
+
+### Added
+
+- Browse repository files in an IDE-style tree with progressive folder expansion, folders-first name sorting, a hidden-file toggle, and fuzzy name or wildcard path filtering.
+- Open file histories in tabs with the same overflow, close and reorder behavior as repository tabs. Activating a tab reloads its history and follows file renames.
+- View another branch's history from its context menu without checking it out, and return directly to the current branch history.
+- Switch changed-file lists between flat and tree views from the Path column header.
+- Open side-by-side diffs from an icon in the diff header. The large comparison dialog keeps both columns and line numbers visible while scrolling code horizontally.
+
+### Fixed
+
+- Remember the pull dialog's “push current branch after a successful pull” choice separately for each repository, including after restarting.
+- Prevent wrapped context-menu titles and long paths from stretching character spacing.
+- Align the branch-history banner and return action, remove redundant file-history graph and filename rows, and remove the empty staged-list dash.
+
+Promoted after beta.1 passed all three platform builds and published its installers. Application code is unchanged from the validated prerelease.
+
 ## 2.1.0-beta.1 — 2026-10-15
 
 ### Added

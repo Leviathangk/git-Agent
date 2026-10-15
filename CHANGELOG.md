@@ -5,6 +5,15 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.0.3 — 2026-10-15
+
+### Fixed
+
+- Refresh automatically generated merge commit messages for the current merge instead of reusing a previous merge's branch and conflict-file list from a saved draft. Clear untouched generated defaults when a merge completes or is cancelled, while preserving manually edited drafts across refreshes and restarts.
+- Recognize legacy standard conflict templates and save generated defaults under the correct repository branch.
+
+Promoted after beta.2 passed all three platform builds and published its installers. Application code is unchanged from the validated prerelease.
+
 ## 2.0.3-beta.2 — 2026-10-15
 
 - Synchronize the application version in Cargo.lock. The beta.1 build was cancelled before publication because its lockfile version was stale. Includes the merge-message fixes below.

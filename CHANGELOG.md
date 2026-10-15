@@ -5,7 +5,15 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.0.3-beta.2 — 2026-10-15
+
+- Synchronize the application version in Cargo.lock. The beta.1 build was cancelled before publication because its lockfile version was stale. Includes the merge-message fixes below.
+
+This is a prerelease for release validation and is excluded from stable update prompts.
+
 ## 2.0.3-beta.1 — 2026-10-15
+
+Build cancelled before installer publication; use beta.2 or later.
 
 ### Fixed
 

@@ -1710,8 +1710,56 @@ struct RepoCommitState {
     draft_message: String,
     #[serde(default)]
     draft_messages_by_branch: BTreeMap<String, String>,
+    /// Exact generated templates, scoped to a branch; empty means tracking initialized.
+    merge_defaults_by_branch: BTreeMap<String, String>,
     #[serde(default)]
     commit_text_links: Vec<CommitTextLink>,
+}
+
+impl RepoCommitState {
+    fn update_merge_default(
+        &mut self,
+        branch: &str,
+        draft: &mut String,
+        message: Option<&str>,
+    ) -> bool {
+        let previous = self.merge_defaults_by_branch.get(branch).cloned();
+        let untouched = previous.as_deref() == Some(draft.as_str());
+        // Older versions persisted templates without provenance. Recognize only the
+        // complete standard conflict template, never a custom body or edited draft.
+        let legacy = previous.is_none() && legacy_merge_conflict_template(draft, branch);
+        let before = draft.clone();
+        if draft.trim().is_empty() || untouched || legacy {
+            *draft = message.unwrap_or_default().to_owned();
+            if let Some(message) = message {
+                self.merge_defaults_by_branch
+                    .insert(branch.to_owned(), message.to_owned());
+            } else {
+                self.merge_defaults_by_branch
+                    .insert(branch.to_owned(), String::new());
+            }
+        } else {
+            // Retain provenance after edits, including across refreshes and restarts.
+            self.merge_defaults_by_branch
+                .entry(branch.to_owned())
+                .or_default();
+        }
+        before != *draft || previous != self.merge_defaults_by_branch.get(branch).cloned()
+    }
+}
+
+fn legacy_merge_conflict_template(message: &str, branch: &str) -> bool {
+    let Some((subject, paths)) = message.trim_end().split_once("\n\n# Conflicts:\n") else {
+        return false;
+    };
+    !subject.contains('\n')
+        && (subject.starts_with("Merge branch '")
+            || subject.starts_with("Merge remote-tracking branch '"))
+        && subject.ends_with(&format!(" into {branch}"))
+        && !paths.is_empty()
+        && paths
+            .lines()
+            .all(|line| line.starts_with("#\t") && line.len() > 2)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -5754,11 +5802,12 @@ impl GitAgentApp {
         if !self.active_repo_root_matches(&snapshot.root) || snapshot.rebase_in_progress {
             return;
         }
-        if let Some(message) = snapshot.merge_message.as_deref()
-            && self.commit_message.trim().is_empty()
-        {
-            self.commit_message = message.to_owned();
-            self.save_commit_message_draft_for_active_repo();
+        if self.commit_state.update_merge_default(
+            &snapshot.branch,
+            &mut self.commit_message,
+            snapshot.merge_message.as_deref(),
+        ) {
+            self.save_commit_message_draft_for_branch(&snapshot.branch);
         }
     }
 
@@ -51646,6 +51695,43 @@ diff --git a/file.txt b/file.txt
             .unwrap();
         let apply_source = &implementation_source[apply_start..apply_start + apply_end];
         assert!(apply_source.contains("self.apply_merge_commit_message_default(&snapshot);"));
+    }
+
+    #[test]
+    fn merge_defaults_follow_current_operation_and_preserve_edited_drafts() {
+        let old = "Merge branch 'budget' into develop\n\n# Conflicts:\n#\tbudgetPool.vue";
+        let new = "Merge branch 'screen' into develop\n\n# Conflicts:\n#\ta.vue\n#\tb.vue\n#\tc.ts";
+        let mut state = RepoCommitState::default();
+        let mut draft = old.to_owned();
+        assert!(state.update_merge_default("develop", &mut draft, Some(new)));
+        assert_eq!(draft, new); // Migrate a stale template from the old application.
+        let encoded = serde_json::to_string(&state).unwrap();
+        state = serde_json::from_str(&encoded).unwrap();
+        assert!(!state.update_merge_default("develop", &mut draft, Some(new)));
+        assert!(state.update_merge_default("develop", &mut draft, None));
+        assert!(draft.is_empty()); // Aborted or completed merge does not leave its default.
+        state.update_merge_default("develop", &mut draft, Some(old));
+        draft.push_str("\n\nMy explanation");
+        let edited = draft.clone();
+        state.update_merge_default("develop", &mut draft, Some(new));
+        assert_eq!(draft, edited);
+        state.update_merge_default("develop", &mut draft, None);
+        assert_eq!(draft, edited);
+        let mut state = RepoCommitState::default();
+        let mut draft = String::new();
+        state.update_merge_default("develop", &mut draft, Some(old));
+        draft = old.replace("budgetPool.vue", "manually-chosen.vue");
+        let edited = draft.clone();
+        state.update_merge_default("develop", &mut draft, Some(new));
+        let encoded = serde_json::to_string(&state).unwrap();
+        state = serde_json::from_str(&encoded).unwrap();
+        state.update_merge_default("develop", &mut draft, Some(new));
+        state.update_merge_default("develop", &mut draft, None);
+        state.update_merge_default("develop", &mut draft, None);
+        assert_eq!(draft, edited);
+        let mut other = "Manual draft on another branch".to_owned();
+        state.update_merge_default("main", &mut other, Some(new));
+        assert_eq!(other, "Manual draft on another branch");
     }
 
     #[test]

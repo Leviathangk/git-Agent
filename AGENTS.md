@@ -2,6 +2,10 @@
 
 ## Release Completion
 
+Before creating release tags, read and follow
+[release promotion specification](.agents/notes/active/release-promotion.md) and
+[prohibited unverified stable tags](.agents/notes/prohibited/unverified-stable-release-tag.md).
+
 When the user asks to release a version, update the package version and bilingual
 changelogs with an explicit version and date. Do not add Unreleased sections or
 unreleased-placeholder descriptions. Push the release tag, verify the release workflow

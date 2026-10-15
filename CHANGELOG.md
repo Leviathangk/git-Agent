@@ -5,6 +5,15 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.0.3-beta.1 — 2026-10-15
+
+### Fixed
+
+- Refresh automatically generated merge commit messages for the current merge instead of reusing a previous merge's branch and conflict-file list from a saved draft. Clear untouched generated defaults when a merge completes or is cancelled, while preserving manually edited drafts across refreshes and restarts.
+- Recognize legacy standard conflict templates and save generated defaults under the correct repository branch.
+
+This is a prerelease for release validation and is excluded from stable update prompts.
+
 ## 2.0.2 — 2026-10-13
 
 ### Fixed

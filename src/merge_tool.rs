@@ -1660,7 +1660,7 @@ impl MergeToolApp {
             options,
             Box::new(move |cc| {
                 prefer_rounded_merge_window_corners(cc);
-                crate::theme::install(&cc.egui_ctx);
+                crate::tool_ui::install(&cc.egui_ctx, merge_theme_mode(args.theme));
                 // The standalone merge binary has its own egui context. Register SVG loaders here
                 // as well, otherwise toolbar icons render as the missing-image warning glyph.
                 egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -4951,6 +4951,12 @@ fn normalize_merge_ai_code(value: &str) -> String {
 }
 
 impl App for MergeToolApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Unpainted rounded corners belong to the transparent native window,
+        // rather than eframe's default opaque canvas background.
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_started = Instant::now();
         self.poll_load_task(ctx);
@@ -4958,14 +4964,15 @@ impl App for MergeToolApp {
         self.poll_write_task(ctx);
         self.poll_ai_task(ctx);
         self.handle_close_request(ctx);
-        let palette = merge_palette(self.theme);
         apply_merge_theme(ctx, self.theme);
+        let palette = merge_palette(self.theme);
 
         egui::TopBottomPanel::top("merge_window_titlebar")
             .exact_height(MERGE_WINDOW_TITLEBAR_HEIGHT)
+            .show_separator_line(false)
             .frame(
                 egui::Frame::new()
-                    .fill(palette.panel)
+                    .fill(crate::theme::palette(merge_theme_mode(self.theme)).chrome_bg)
                     .stroke(egui::Stroke::NONE),
             )
             .show(ctx, |ui| merge_custom_title_bar(ui, ctx, self, palette));
@@ -4981,6 +4988,7 @@ impl App for MergeToolApp {
         self.handle_keyboard_shortcuts(ctx);
         egui::TopBottomPanel::top("merge_toolbar")
             .exact_height(38.0)
+            .show_separator_line(false)
             .frame(
                 egui::Frame::new()
                     .fill(palette.panel)
@@ -4990,6 +4998,7 @@ impl App for MergeToolApp {
 
         egui::TopBottomPanel::bottom("merge_footer")
             .exact_height(56.0)
+            .show_separator_line(false)
             .frame(egui::Frame::new().fill(palette.panel))
             .show(ctx, |ui| merge_footer(ui, self, palette));
 
@@ -5240,8 +5249,11 @@ fn merge_custom_title_bar(
     palette: MergePalette,
 ) {
     let rect = ui.max_rect();
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(8), palette.panel);
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(8),
+        crate::theme::palette(merge_theme_mode(app.theme)).chrome_bg,
+    );
 
     let controls_width = 112.0;
     let drag_rect = Rect::from_min_max(
@@ -5270,7 +5282,11 @@ fn merge_custom_title_bar(
         Pos2::new(controls_rect.left() - 8.0, rect.bottom()),
     );
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(title_rect), |ui| {
-        ui.horizontal(|ui| {
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.add(
+                egui::Image::new(egui::include_image!("../assets/icons/logo-ga.svg"))
+                    .fit_to_exact_size(Vec2::splat(16.0)),
+            );
             ui.label(
                 RichText::new("Git Agent Merge")
                     .strong()
@@ -5283,6 +5299,7 @@ fn merge_custom_title_bar(
     });
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
             if merge_window_control_button(ui, "×", true, palette).clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -5553,32 +5570,8 @@ fn merge_window_control_button(
     close: bool,
     palette: MergePalette,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(34.0, 22.0), Sense::click());
-    let fill = if close {
-        if response.hovered() {
-            Color32::from_rgb(192, 55, 43)
-        } else {
-            Color32::TRANSPARENT
-        }
-    } else if response.hovered() {
-        palette.panel_soft
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(4), fill);
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(16.0),
-        if close && response.hovered() {
-            Color32::WHITE
-        } else {
-            palette.text
-        },
-    );
-    response
+    let _ = palette;
+    crate::tool_ui::window_control_button(ui, label, close)
 }
 
 #[cfg(target_os = "windows")]
@@ -5794,26 +5787,8 @@ fn merge_toolbar_toggle_button(
     active: bool,
     palette: MergePalette,
 ) -> egui::Response {
-    let icon_color = if active {
-        Color32::WHITE
-    } else {
-        palette.muted
-    };
-    let image = egui::Image::new(merge_toolbar_icon_source(icon))
-        .fit_to_exact_size(Vec2::splat(15.0))
-        .tint(icon_color);
-    let response = ui.add(
-        egui::Button::image(image)
-            .min_size(Vec2::splat(28.0))
-            .fill(if active {
-                palette.accent
-            } else {
-                Color32::TRANSPARENT
-            })
-            .stroke(egui::Stroke::NONE)
-            .corner_radius(egui::CornerRadius::same(4)),
-    );
-    response.on_hover_text(tooltip)
+    let _ = palette;
+    crate::tool_ui::icon_button(ui, merge_toolbar_icon_source(icon), tooltip, active)
 }
 
 fn merge_toolbar_icon_source(icon: MergeToolbarToggleIcon) -> egui::ImageSource<'static> {
@@ -5941,14 +5916,34 @@ fn merge_cancel_confirm_dialog(ctx: &egui::Context, app: &mut MergeToolApp, pale
     let mut open = true;
     let mut discard = false;
     let mut continue_merge = false;
+    let mut close_confirm = false;
     egui::Window::new(mt(app.language, "cancel_merge_title"))
+        .title_bar(false)
         .collapsible(false)
         .resizable(false)
+        .frame(
+            egui::Frame::new()
+                .fill(palette.panel)
+                .corner_radius(egui::CornerRadius::same(8))
+                .shadow(palette.shadow)
+                .inner_margin(egui::Margin::same(12)),
+        )
         .anchor(Align2::CENTER_TOP, dialog::top_anchor_offset())
         .open(&mut open)
         .show(ctx, |ui| {
             ui.set_min_width(420.0);
-            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [ui.available_width() - 44.0, 26.0],
+                    egui::Label::new(
+                        RichText::new(mt(app.language, "cancel_merge_title"))
+                            .strong()
+                            .color(palette.text),
+                    ),
+                );
+                close_confirm = crate::tool_ui::window_control_button(ui, "×", true).clicked();
+            });
+            ui.add_space(8.0);
             ui.label(RichText::new(mt(app.language, "cancel_merge_message")).color(palette.text));
             ui.add_space(16.0);
             ui.horizontal(|ui| {
@@ -5979,7 +5974,7 @@ fn merge_cancel_confirm_dialog(ctx: &egui::Context, app: &mut MergeToolApp, pale
     if discard {
         std::process::exit(MERGE_TOOL_CANCEL_EXIT_CODE);
     }
-    app.show_cancel_confirm = open && !continue_merge;
+    app.show_cancel_confirm = open && !continue_merge && !close_confirm;
 }
 
 fn merge_pane_ui<R>(ui: &mut Ui, pane: Rect, body: impl FnOnce(&mut Ui) -> R) -> R {
@@ -6025,6 +6020,9 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
         Pos2::new(right.right() + MERGE_OVERVIEW_GAP, rect.top()),
         Vec2::new(MERGE_OVERVIEW_WIDTH, rect.height()),
     );
+    for pane in [left, result, right] {
+        crate::tool_ui::paint_code_panel(ui, pane);
+    }
     app.hovered_search_pane = ui.ctx().pointer_hover_pos().and_then(|pointer| {
         if left.contains(pointer) {
             Some(MergeSearchPane::Left)
@@ -7200,6 +7198,7 @@ fn merge_side_panel(
             });
         // Use the stable code viewport edge for connector x anchors. It matches the row fill edge
         // and spans the complete inter-column gap, while remaining independent of scroll_x.
+        crate::tool_ui::paint_scroll_viewport_inset_shadow(ui, output.inner_rect);
         geometry.set_horizontal_bounds(output.inner_rect);
         // Missing-side markers use the same visible-row geometry as the virtual list. Keeping
         // them enabled is required for large files; off-screen groups naturally return None.
@@ -7361,6 +7360,7 @@ fn merge_result_panel(
         // TextEdit can be wider than the pane, but the connector starts where the visible result
         // row ends. Using the fixed inner viewport prevents both horizontal-scroll drift and the
         // panel-padding seam that appears when anchoring at the outer column shell.
+        crate::tool_ui::paint_scroll_viewport_inset_shadow(ui, output.inner_rect);
         geometry.set_horizontal_bounds(output.inner_rect);
         if !changed_lines.is_empty() {
             let mut before = app.snapshot();
@@ -7746,6 +7746,8 @@ fn merge_result_nav_spacer(ui: &mut Ui) {
 
 fn side_header(ui: &mut Ui, title: &str, path: &Path, palette: MergePalette) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(4), palette.panel_soft);
     let title_w = 118.0;
     ui.painter().text(
         Pos2::new(rect.left() + 4.0, rect.center().y),
@@ -10635,80 +10637,49 @@ fn merge_panel_frame(ui: &mut Ui, palette: MergePalette, body: impl FnOnce(&mut 
         .show(ui, body);
 }
 
+fn merge_theme_mode(theme: MergeTheme) -> crate::theme::ThemeMode {
+    match theme {
+        MergeTheme::Dark => crate::theme::ThemeMode::Dark,
+        MergeTheme::Light => crate::theme::ThemeMode::Light,
+    }
+}
+
 fn apply_merge_theme(ctx: &egui::Context, theme: MergeTheme) {
-    let palette = merge_palette(theme);
-    let mut visuals = match theme {
-        MergeTheme::Dark => egui::Visuals::dark(),
-        MergeTheme::Light => egui::Visuals::light(),
-    };
-    visuals.panel_fill = palette.bg;
-    visuals.window_fill = palette.panel;
-    visuals.window_stroke = egui::Stroke::NONE;
-    visuals.window_shadow = palette.shadow;
-    visuals.popup_shadow = palette.shadow;
-    visuals.extreme_bg_color = palette.panel_soft;
-    visuals.faint_bg_color = palette.panel_soft;
-    visuals.override_text_color = Some(palette.text);
-    visuals.selection.bg_fill = palette.accent;
-    visuals.selection.stroke = egui::Stroke::NONE;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-    visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-    visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-    ctx.set_visuals(visuals);
+    crate::tool_ui::apply_theme(ctx, merge_theme_mode(theme));
 }
 
 fn merge_palette(theme: MergeTheme) -> MergePalette {
-    match theme {
-        MergeTheme::Dark => MergePalette {
-            bg: Color32::from_rgb(24, 27, 31),
-            panel: Color32::from_rgb(29, 32, 36),
-            panel_soft: Color32::from_rgb(49, 43, 43),
-            text: Color32::from_rgb(222, 229, 238),
-            muted: Color32::from_rgb(130, 143, 160),
-            accent: Color32::from_rgb(57, 120, 220),
-            conflict_fill: Color32::from_rgb(70, 47, 43),
-            active_conflict_fill: Color32::from_rgb(104, 57, 48),
-            conflict_text: Color32::from_rgb(255, 190, 170),
-            added_fill: Color32::from_rgb(42, 68, 52),
-            added_text: Color32::from_rgb(150, 226, 170),
-            base_only_fill: Color32::from_rgb(81, 85, 92),
-            base_only_connector_fill: Color32::from_rgb(81, 85, 92),
-            base_only_text: Color32::from_rgb(192, 200, 210),
-            connector: Color32::from_rgb(92, 145, 98),
-            result_fill: Color32::from_rgb(31, 34, 38),
-            shadow: eframe::epaint::Shadow {
-                offset: [3, 4],
-                blur: 12,
-                spread: 0,
-                color: Color32::from_rgba_unmultiplied(0, 0, 0, 90),
-            },
-        },
-        MergeTheme::Light => MergePalette {
-            bg: Color32::from_rgb(239, 242, 246),
-            panel: Color32::from_rgb(253, 254, 255),
-            panel_soft: Color32::from_rgb(248, 225, 219),
-            text: Color32::from_rgb(32, 39, 50),
-            muted: Color32::from_rgb(105, 116, 132),
-            accent: Color32::from_rgb(57, 120, 220),
-            conflict_fill: Color32::from_rgb(255, 224, 216),
-            active_conflict_fill: Color32::from_rgb(255, 194, 178),
-            conflict_text: Color32::from_rgb(154, 52, 42),
-            added_fill: Color32::from_rgb(215, 246, 224),
-            added_text: Color32::from_rgb(32, 128, 72),
-            base_only_fill: Color32::from_rgb(214, 221, 230),
-            base_only_connector_fill: Color32::from_rgb(214, 221, 230),
-            base_only_text: Color32::from_rgb(92, 102, 116),
-            connector: Color32::from_rgb(92, 145, 98),
-            result_fill: Color32::from_rgb(255, 255, 255),
-            shadow: eframe::epaint::Shadow {
-                offset: [3, 4],
-                blur: 12,
-                spread: 0,
-                color: Color32::from_rgba_unmultiplied(44, 56, 72, 44),
-            },
-        },
+    merge_palette_from_shared(crate::theme::palette(merge_theme_mode(theme)))
+}
+
+fn merge_palette_from_shared(p: crate::theme::Palette) -> MergePalette {
+    let base_only_fill = Color32::from_rgb(
+        ((p.panel_soft.r() as u16 * 3 + p.muted.r() as u16) / 4) as u8,
+        ((p.panel_soft.g() as u16 * 3 + p.muted.g() as u16) / 4) as u8,
+        ((p.panel_soft.b() as u16 * 3 + p.muted.b() as u16) / 4) as u8,
+    );
+    MergePalette {
+        bg: p.bg,
+        panel: p.panel,
+        panel_soft: p.panel_soft,
+        text: p.text,
+        muted: p.muted,
+        accent: p.accent_deep,
+        conflict_fill: p.diff_removed_bg,
+        active_conflict_fill: Color32::from_rgb(
+            ((p.diff_removed_bg.r() as u16 * 3 + p.warning.r() as u16) / 4) as u8,
+            ((p.diff_removed_bg.g() as u16 * 3 + p.warning.g() as u16) / 4) as u8,
+            ((p.diff_removed_bg.b() as u16 * 3 + p.warning.b() as u16) / 4) as u8,
+        ),
+        conflict_text: p.warning,
+        added_fill: p.diff_added_bg,
+        added_text: p.diff_added_text,
+        base_only_fill,
+        base_only_connector_fill: base_only_fill,
+        base_only_text: p.text,
+        connector: p.diff_added_text,
+        result_fill: p.panel,
+        shadow: crate::tool_ui::surface_shadow(p),
     }
 }
 
@@ -10969,6 +10940,101 @@ mod tests {
     /// Manual live regression for the configured model. It reads Git's unmerged index stages and
     /// calls the same context collector, tool schema, HTTP request, parser, and safety guard as the
     /// Merge window, without opening or controlling any UI. API keys are never printed.
+    #[test]
+    fn rounded_merge_corners_have_no_opaque_canvas_underlay() {
+        let app = MergeToolApp::new(
+            test_merge_args(),
+            three_way_merge("same\n", "same\n", "same\n"),
+        );
+        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            assert_eq!(App::clear_color(&app, &visuals)[3], 0.0);
+        }
+    }
+
+    #[test]
+    fn merge_surfaces_share_main_theme_tokens_for_every_accent() {
+        for mode in [
+            crate::theme::ThemeMode::Light,
+            crate::theme::ThemeMode::Dark,
+        ] {
+            for accent in [
+                crate::theme::ThemeAccent::Green,
+                crate::theme::ThemeAccent::Blue,
+                crate::theme::ThemeAccent::Purple,
+                crate::theme::ThemeAccent::Rose,
+                crate::theme::ThemeAccent::Orange,
+                crate::theme::ThemeAccent::SunRed,
+                crate::theme::ThemeAccent::DeepSeaBlue,
+                crate::theme::ThemeAccent::ForestGreen,
+            ] {
+                let main = crate::theme::palette_for(mode, accent);
+                let tool = merge_palette_from_shared(main);
+                assert_eq!(tool.bg, main.bg);
+                assert_eq!(tool.panel, main.panel);
+                assert_eq!(tool.text, main.text);
+                assert_eq!(tool.accent, main.accent_deep);
+                assert_eq!(tool.added_fill, main.diff_added_bg);
+                assert_ne!(tool.conflict_fill, tool.active_conflict_fill);
+                assert_ne!(tool.base_only_fill, tool.panel);
+                assert_eq!(tool.base_only_connector_fill, tool.base_only_fill);
+            }
+        }
+    }
+
+    #[test]
+    fn restyled_merge_render_preserves_resolution_and_undo_behavior() {
+        let document = three_way_merge(
+            "keep\nbase\nend\n",
+            "keep\nlocal\nend\n",
+            "keep\nremote\nend\n",
+        );
+        let mut app = MergeToolApp::new(test_merge_args(), document);
+        let initial = app.result_text.clone();
+        assert!(!app.can_apply_result());
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        egui_extras::install_image_loaders(&ctx);
+        for theme in [MergeTheme::Light, MergeTheme::Dark] {
+            app.theme = theme;
+            apply_merge_theme(&ctx, theme);
+            let palette = merge_palette(theme);
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::TopBottomPanel::top("test_toolbar")
+                        .exact_height(38.0)
+                        .show(ctx, |ui| merge_toolbar(ui, &mut app, palette));
+                    egui::TopBottomPanel::bottom("test_footer")
+                        .exact_height(56.0)
+                        .show(ctx, |ui| merge_footer(ui, &mut app, palette));
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| merge_editor_columns(ui, &mut app, palette));
+                },
+            );
+            assert!(!output.shapes.is_empty());
+            assert_eq!(app.result_text, initial);
+            assert_eq!(app.unresolved_conflict_count(), 1);
+        }
+        app.apply_line_action(
+            MergeLineActionTarget::Conflict(0),
+            MergeSide::Local,
+            MergeLineAction::Drop,
+        );
+        assert!(!app.can_apply_result());
+        app.apply_line_action(
+            MergeLineActionTarget::Conflict(0),
+            MergeSide::Remote,
+            MergeLineAction::Take,
+        );
+        assert!(app.can_apply_result());
+        assert_eq!(app.document.result_text(), "keep\nremote\nend\n");
+        assert!(app.undo());
+        assert!(!app.can_apply_result());
+    }
+
     #[test]
     #[ignore = "requires a configured AI model and explicit GIT_AGENT_LIVE_AI_REPO"]
     fn live_merge_ai_self_test_current_index() {
@@ -14704,7 +14770,12 @@ export function quote(total: number): number {
 
         assert_eq!(
             merge_connector_fill(MergeSideLineTone::BaseOnly, palette),
-            Color32::from_rgba_unmultiplied(214, 221, 230, 230)
+            Color32::from_rgba_unmultiplied(
+                palette.base_only_fill.r(),
+                palette.base_only_fill.g(),
+                palette.base_only_fill.b(),
+                230,
+            )
         );
 
         assert_eq!(

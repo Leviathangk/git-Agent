@@ -2831,6 +2831,79 @@ pub fn delete_branch(root: impl AsRef<Path>, name: &str, force: bool) -> Result<
     }
 }
 
+#[derive(Debug)]
+pub struct LocalBranchDeletedRemoteDeleteFailed {
+    pub local_branch: String,
+    pub remote_branch: String,
+    pub diagnostic: String,
+}
+
+impl std::fmt::Display for LocalBranchDeletedRemoteDeleteFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Local branch {} was deleted, but deleting tracked remote branch {} failed. Retry deleting the remote branch separately.\n\n{}",
+            self.local_branch, self.remote_branch, self.diagnostic
+        )
+    }
+}
+impl std::error::Error for LocalBranchDeletedRemoteDeleteFailed {}
+
+pub fn delete_local_and_tracked_remote_branch(
+    root: impl AsRef<Path>,
+    name: &str,
+    expected_upstream: &str,
+    force: bool,
+) -> Result<()> {
+    let root = root.as_ref();
+    let local_ref = format!("refs/heads/{name}");
+    git_output(root, &["check-ref-format", &local_ref])?;
+    // Resolve before deleting the local ref, which also removes its branch config.
+    // The full remote ref supports custom fetch refspecs and differently named branches.
+    let refs = git_output(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)",
+            &local_ref,
+        ],
+    )?;
+    let target = refs
+        .lines()
+        .find_map(|line| {
+            let fields = line.split('\0').collect::<Vec<_>>();
+            (fields.len() == 4 && fields[0] == local_ref)
+                .then(|| fields.into_iter().map(str::to_owned).collect::<Vec<_>>())
+        })
+        .ok_or_else(|| anyhow!("Local branch {name} no longer exists"))?;
+    let remote = &target[2];
+    let remote_ref = &target[3];
+    if target[1] != expected_upstream || expected_upstream.is_empty() {
+        return Err(anyhow!(
+            "Tracking branch changed for {name}; reopen the delete dialog before retrying"
+        ));
+    }
+    if remote.is_empty() || remote == "." || !remote_ref.starts_with("refs/heads/") {
+        return Err(anyhow!("Branch {name} does not track a remote branch"));
+    }
+    git_output(root, &["check-ref-format", remote_ref])?;
+    let remotes = git_output(root, &["remote"])?;
+    if !remotes.lines().any(|name| name == remote) {
+        return Err(anyhow!("Tracked remote {remote} no longer exists"));
+    }
+    delete_branch(root, name, force)?;
+    git_output(root, &["push", "--delete", "--", remote, remote_ref])
+        .map(|_| ())
+        .map_err(|error| {
+            LocalBranchDeletedRemoteDeleteFailed {
+                local_branch: name.to_owned(),
+                remote_branch: expected_upstream.to_owned(),
+                diagnostic: error.to_string(),
+            }
+            .into()
+        })
+}
+
 pub fn delete_remote_branch(root: impl AsRef<Path>, remote_branch: &str) -> Result<()> {
     let (remote, branch) = split_remote_branch(remote_branch)?;
     git_output(root.as_ref(), &["push", remote, "--delete", branch]).map(|_| ())
@@ -4812,6 +4885,174 @@ mod tests {
 
     static NEXT_COMMIT_PATCH_REPO: AtomicU64 = AtomicU64::new(0);
     static NEXT_REMOTE_TAG_REPO: AtomicU64 = AtomicU64::new(0);
+
+    fn tracked_branch_deletion_fixture() -> Result<(PathBuf, PathBuf)> {
+        let base = env::var_os("GIT_AGENT_TEST_ARTIFACT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-artifacts")
+            });
+        let root = base.join(format!(
+            "branch-delete-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir_all(&root)?;
+        let remote = root.join("remote.git");
+        git_output(&root, &["init", "--bare", remote.to_str().unwrap()])?;
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo)?;
+        git_output(&repo, &["init", "-b", "main"])?;
+        git_output(&repo, &["config", "user.name", "Deletion Test"])?;
+        git_output(&repo, &["config", "user.email", "deletion@example.test"])?;
+        git_output(&repo, &["config", "commit.gpgsign", "false"])?;
+        git_output(&repo, &["commit", "--allow-empty", "-m", "initial"])?;
+        git_output(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )?;
+        git_output(&repo, &["checkout", "-b", "local-topic"])?;
+        git_output(
+            &repo,
+            &["push", "-u", "origin", "HEAD:refs/heads/remote-topic"],
+        )?;
+        git_output(&repo, &["checkout", "main"])?;
+        Ok((repo, remote))
+    }
+
+    #[test]
+    fn combined_branch_deletion_removes_local_then_differently_named_remote() -> Result<()> {
+        let (repo, remote) = tracked_branch_deletion_fixture()?;
+        delete_local_and_tracked_remote_branch(&repo, "local-topic", "origin/remote-topic", false)?;
+        assert!(git_output(&repo, &["show-ref", "--verify", "refs/heads/local-topic"]).is_err());
+        assert!(
+            git_output(
+                &remote,
+                &["show-ref", "--verify", "refs/heads/remote-topic"]
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn combined_branch_deletion_keeps_remote_if_local_delete_fails() -> Result<()> {
+        let (repo, remote) = tracked_branch_deletion_fixture()?;
+        git_output(&repo, &["checkout", "local-topic"])?;
+        assert!(
+            delete_local_and_tracked_remote_branch(
+                &repo,
+                "local-topic",
+                "origin/remote-topic",
+                true
+            )
+            .is_err()
+        );
+        git_output(&repo, &["show-ref", "--verify", "refs/heads/local-topic"])?;
+        git_output(
+            &remote,
+            &["show-ref", "--verify", "refs/heads/remote-topic"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn combined_branch_deletion_reports_partial_remote_failure() -> Result<()> {
+        let (repo, remote) = tracked_branch_deletion_fixture()?;
+        let unavailable = repo.join("missing-remote.git");
+        git_output(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                unavailable.to_str().unwrap(),
+            ],
+        )?;
+        let error = delete_local_and_tracked_remote_branch(
+            &repo,
+            "local-topic",
+            "origin/remote-topic",
+            false,
+        )
+        .unwrap_err();
+        let partial = error
+            .downcast_ref::<LocalBranchDeletedRemoteDeleteFailed>()
+            .expect("partial deletion must be distinguishable from local failure");
+        assert_eq!(partial.local_branch, "local-topic");
+        assert_eq!(partial.remote_branch, "origin/remote-topic");
+        assert!(git_output(&repo, &["show-ref", "--verify", "refs/heads/local-topic"]).is_err());
+        git_output(
+            &remote,
+            &["show-ref", "--verify", "refs/heads/remote-topic"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn combined_branch_deletion_rejects_changed_tracking_before_any_delete() -> Result<()> {
+        let (repo, remote) = tracked_branch_deletion_fixture()?;
+        git_output(
+            &repo,
+            &[
+                "config",
+                "branch.local-topic.merge",
+                "refs/heads/another-topic",
+            ],
+        )?;
+        assert!(
+            delete_local_and_tracked_remote_branch(
+                &repo,
+                "local-topic",
+                "origin/remote-topic",
+                false
+            )
+            .is_err()
+        );
+        git_output(&repo, &["show-ref", "--verify", "refs/heads/local-topic"])?;
+        git_output(
+            &remote,
+            &["show-ref", "--verify", "refs/heads/remote-topic"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn combined_branch_deletion_resolves_custom_fetch_refspec() -> Result<()> {
+        let (repo, remote) = tracked_branch_deletion_fixture()?;
+        git_output(
+            &repo,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/custom/*",
+            ],
+        )?;
+        git_output(&repo, &["fetch", "origin"])?;
+        git_output(
+            &repo,
+            &[
+                "branch",
+                "--set-upstream-to=origin/custom/remote-topic",
+                "local-topic",
+            ],
+        )?;
+        delete_local_and_tracked_remote_branch(
+            &repo,
+            "local-topic",
+            "origin/custom/remote-topic",
+            false,
+        )?;
+        assert!(
+            git_output(
+                &remote,
+                &["show-ref", "--verify", "refs/heads/remote-topic"]
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn refresh_fingerprint_uses_one_branch_status_payload() {

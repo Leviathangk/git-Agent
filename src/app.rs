@@ -2468,6 +2468,11 @@ enum BranchActionDialog {
         name: String,
         force: bool,
     },
+    ConfirmDeleteLocalAndRemote {
+        name: String,
+        remote_branch: String,
+        force: bool,
+    },
     ConfirmDeleteRemote {
         remote_branch: String,
     },
@@ -3359,6 +3364,36 @@ impl AppSettings {
 /// Loads the AI model selected by the main app for the standalone merge assistant. The API key
 /// is decrypted only in the process that will make the request and is never passed as a command
 /// line argument.
+// Deserialize appearance fields only: standalone viewers must not unlock AI credentials.
+fn parse_tool_appearance(raw: &str) -> crate::tool_ui::Appearance {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct AppearanceSettings {
+        theme_accent: SettingsThemeAccent,
+        text_contrast: SettingsTextContrast,
+        ui_font_family: Option<String>,
+        ui_font_weight: SettingsFontWeight,
+        code_font_family: Option<String>,
+        ui_scale: Option<f32>,
+    }
+    let settings: AppearanceSettings = serde_json::from_str(raw).unwrap_or_default();
+    crate::tool_ui::Appearance {
+        accent: settings.theme_accent.into(),
+        contrast: settings.text_contrast.into(),
+        fonts: theme::FontSelection {
+            ui_family: settings.ui_font_family,
+            ui_weight: settings.ui_font_weight.into(),
+            code_family: settings.code_font_family,
+        },
+        scale: sanitize_ui_scale(settings.ui_scale.unwrap_or(1.0)),
+    }
+}
+
+pub(crate) fn load_tool_appearance() -> crate::tool_ui::Appearance {
+    let raw = app_settings_path().and_then(|path| fs::read_to_string(path).ok());
+    parse_tool_appearance(raw.as_deref().unwrap_or("{}"))
+}
+
 pub fn load_merge_ai_model_config(
     requested_name: Option<&str>,
 ) -> Result<MergeAiModelConfig, String> {
@@ -9544,6 +9579,24 @@ impl GitAgentApp {
                 Ok((root, Err(error))) => {
                     self.remote_git_status_key = None;
                     self.remote_git_root = None;
+                    if let Some(partial) =
+                        error.downcast_ref::<git::LocalBranchDeletedRemoteDeleteFailed>()
+                    {
+                        let message = if self.language == Language::Chinese {
+                            format!(
+                                "本地分支 {} 已删除，但关联远端分支 {} 删除失败。请检查远端权限或连接后单独重试删除远端分支。\n\n{}",
+                                partial.local_branch, partial.remote_branch, partial.diagnostic
+                            )
+                        } else {
+                            partial.to_string()
+                        };
+                        self.loading_repo = false;
+                        self.load_repository_uncached(root);
+                        self.error = Some(message);
+                        self.last_notice = None;
+                        ctx.request_repaint();
+                        return;
+                    }
                     let failed_pull_request_root = self
                         .pending_pull_request_open_after_push
                         .as_ref()
@@ -9641,6 +9694,10 @@ impl GitAgentApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    let deletion_root = (self.remote_git_status_key
+                        == Some("status.deleting_branches"))
+                    .then(|| self.remote_git_root.clone())
+                    .flatten();
                     self.remote_git_status_key = None;
                     self.remote_git_root = None;
                     self.pending_rewritten_history_prompt_root = None;
@@ -9649,6 +9706,9 @@ impl GitAgentApp {
                     self.pending_push_after_pull = None;
                     self.pending_push_recovery_candidate = None;
                     self.loading_repo = false;
+                    if let Some(root) = deletion_root {
+                        self.load_repository_uncached(root);
+                    }
                     self.error = Some("Remote Git action stopped unexpectedly".to_owned());
                     self.last_notice = None;
                     ctx.request_repaint();
@@ -16867,6 +16927,17 @@ impl GitAgentApp {
                 self.pending_branch_action =
                     Some(BranchActionDialog::ConfirmDelete { name, force: false });
             }
+            BranchMenuAction::DeleteLocalAndRemote {
+                name,
+                remote_branch,
+            } => {
+                self.pending_branch_action =
+                    Some(BranchActionDialog::ConfirmDeleteLocalAndRemote {
+                        name,
+                        remote_branch,
+                        force: false,
+                    });
+            }
             BranchMenuAction::DeleteRemote { remote_branch } => {
                 self.pending_branch_action =
                     Some(BranchActionDialog::ConfirmDeleteRemote { remote_branch });
@@ -20287,6 +20358,7 @@ impl GitAgentApp {
             .backdrop_color(Color32::from_black_alpha(136))
             .frame(dialog_window_frame())
             .show(ctx, |ui| {
+                let _dialog_focus = DialogAutofocusScope::new(ui);
                 let width = ACTION_DIALOG_WIDTH + 96.0;
                 egui::Frame::new()
                     .fill(theme::panel())
@@ -20332,7 +20404,7 @@ impl GitAgentApp {
                                     .corner_radius(CornerRadius::same(4))
                                     .inner_margin(egui::Margin::symmetric(8, 6))
                                     .show(ui, |ui| {
-                                        ui.add_sized(
+                                        let message_response = ui.add_sized(
                                             Vec2::new(ui.available_width(), 76.0),
                                             TextEdit::multiline(message)
                                                 .frame(false)
@@ -20341,6 +20413,7 @@ impl GitAgentApp {
                                                 )
                                                 .text_color(theme::text()),
                                         );
+                                        focus_first_dialog_input(ui, &message_response);
                                     });
                                 ui.add_space(8.0);
                                 labeled_content_row(
@@ -21641,6 +21714,7 @@ impl GitAgentApp {
         let mut close_after = false;
         let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
             None;
+        let mut deleting_local_and_remote = false;
         let mut checkout_requested: Option<(String, BranchCheckoutStrategy)> = None;
         let branch_actions_enabled = !self.branch_actions_busy();
 
@@ -21929,6 +22003,54 @@ impl GitAgentApp {
                         },
                     );
                 }
+                BranchActionDialog::ConfirmDeleteLocalAndRemote {
+                    name,
+                    remote_branch,
+                    force,
+                } => {
+                    compact_action_dialog(
+                        ctx,
+                        self.tr("branch.delete_local_and_remote"),
+                        ACTION_DIALOG_WIDTH,
+                        |ui| {
+                            ui.label(self.tr("branch.confirm_delete_local_and_remote"));
+                            ui.label(
+                                RichText::new(format!("{name} → {remote_branch}"))
+                                    .color(theme::warning()),
+                            );
+                            action_checkbox(ui, force, self.tr("branch.force_delete"));
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let submit_requested = dialog_default_submit_requested(ui);
+                                if dialog_destructive_button(
+                                    ui,
+                                    self.tr("branch.delete_local_and_remote"),
+                                    branch_actions_enabled,
+                                )
+                                .clicked()
+                                    || (submit_requested && branch_actions_enabled)
+                                {
+                                    let name = name.clone();
+                                    let remote_branch = remote_branch.clone();
+                                    let force = *force;
+                                    execute = Some(Box::new(move |root| {
+                                        git::delete_local_and_tracked_remote_branch(
+                                            root,
+                                            &name,
+                                            &remote_branch,
+                                            force,
+                                        )
+                                    }));
+                                    deleting_local_and_remote = true;
+                                    close_after = true;
+                                }
+                                if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                                    close_after = true;
+                                }
+                            });
+                        },
+                    );
+                }
                 BranchActionDialog::ConfirmDeleteRemote { remote_branch } => {
                     compact_action_dialog(
                         ctx,
@@ -21973,7 +22095,11 @@ impl GitAgentApp {
             self.start_branch_checkout(name, strategy);
         }
         if let Some(action) = execute {
-            self.execute_git_action(action);
+            if deleting_local_and_remote {
+                self.start_remote_git_action_with_status("status.deleting_branches", action);
+            } else {
+                self.execute_git_action(action);
+            }
         }
         if close_after {
             keep_open = false;
@@ -22507,6 +22633,7 @@ impl GitAgentApp {
             .fixed_rect(rect)
             .frame(dialog_window_frame())
             .show(ctx, |ui| {
+                let _dialog_focus = DialogAutofocusScope::new(ui);
                 settings_dialog_panel_frame().show(ui, |ui| {
                     ui.set_width(size.x);
                     settings_dialog_title_row(ui, self.tr("options.title"), size.x, |ui| {
@@ -22568,6 +22695,7 @@ impl GitAgentApp {
             .fixed_rect(rect)
             .frame(dialog_window_frame())
             .show(ctx, |ui| {
+                let _dialog_focus = DialogAutofocusScope::new(ui);
                 settings_dialog_panel_frame().show(ui, |ui| {
                     ui.set_width(size.x);
                     settings_dialog_title_row(ui, self.tr("repo.settings.title"), size.x, |ui| {
@@ -23232,6 +23360,7 @@ impl GitAgentApp {
             .fixed_rect(rect)
             .frame(dialog_window_frame())
             .show(ctx, |ui| {
+                let _dialog_focus = DialogAutofocusScope::new(ui);
                 settings_dialog_panel_frame().show(ui, |ui| {
                     ui.set_width(size.x);
                     settings_dialog_title_row(
@@ -23432,6 +23561,7 @@ impl GitAgentApp {
             .fixed_rect(rect)
             .frame(dialog_window_frame())
             .show(ctx, |ui| {
+                let _dialog_focus = DialogAutofocusScope::new(ui);
                 settings_dialog_panel_frame().show(ui, |ui| {
                     ui.set_width(size.x);
                     settings_dialog_title_row(
@@ -24272,12 +24402,13 @@ impl GitAgentApp {
                         row.col(|ui| {
                             ui.add_enabled_ui(!saving, |ui| {
                                 themed_text_edit_selection(ui);
-                                ui.add_sized(
+                                let response = ui.add_sized(
                                     [ui.available_width().max(80.0), 26.0],
                                     TextEdit::singleline(&mut editor.document.lines[index])
                                         .font(egui::TextStyle::Monospace)
                                         .desired_width(f32::INFINITY),
                                 );
+                                focus_first_dialog_input(ui, &response);
                             });
                         });
                         row.col(|ui| {
@@ -25003,6 +25134,10 @@ enum BranchMenuAction {
     },
     Delete {
         name: String,
+    },
+    DeleteLocalAndRemote {
+        name: String,
+        remote_branch: String,
     },
     DeleteRemote {
         remote_branch: String,
@@ -26034,6 +26169,7 @@ fn compact_action_dialog(
         .anchor(Align2::CENTER_TOP, dialog::top_anchor_offset())
         .frame(dialog_window_frame())
         .show(ctx, |ui| {
+            let _dialog_focus = DialogAutofocusScope::new(ui);
             egui::Frame::new()
                 .fill(theme::panel())
                 .corner_radius(CornerRadius::same(6))
@@ -26079,6 +26215,7 @@ fn fixed_action_dialog_with_close(
         .anchor(Align2::CENTER_TOP, dialog::top_anchor_offset())
         .frame(dialog_window_frame())
         .show(ctx, |ui| {
+            let _dialog_focus = DialogAutofocusScope::new(ui);
             egui::Frame::new()
                 .fill(theme::panel())
                 .corner_radius(CornerRadius::same(6))
@@ -27379,6 +27516,83 @@ fn placeholder_for_label(language: Language, label: &str) -> String {
     }
 }
 
+#[derive(Clone)]
+struct DialogAutofocusState {
+    first_input_seen: bool,
+    opening: bool,
+    visit_id: egui::Id,
+}
+
+struct DialogAutofocusScope {
+    ctx: egui::Context,
+    previous: Option<DialogAutofocusState>,
+}
+
+impl DialogAutofocusScope {
+    fn new(ui: &Ui) -> Self {
+        let ctx = ui.ctx().clone();
+        let frame = ctx.cumulative_pass_nr();
+        let last_seen_id = ui.id().with("dialog_autofocus_last_pass");
+        let previous = ctx.data_mut(|data| {
+            let previous =
+                data.get_temp::<DialogAutofocusState>(egui::Id::new("dialog_autofocus_scope"));
+            let last = data.get_temp::<(u64, bool)>(last_seen_id);
+            let opening =
+                last.is_none_or(|(last, pending)| pending || frame.saturating_sub(last) > 1);
+            // Track sizing/discarded passes too, keeping initial focus pending until
+            // the first enabled editor is actually visible.
+            data.insert_temp(last_seen_id, (frame, opening));
+            data.insert_temp(
+                egui::Id::new("dialog_autofocus_scope"),
+                DialogAutofocusState {
+                    first_input_seen: false,
+                    opening,
+                    visit_id: last_seen_id,
+                },
+            );
+            previous
+        });
+        Self { ctx, previous }
+    }
+}
+
+impl Drop for DialogAutofocusScope {
+    fn drop(&mut self) {
+        self.ctx.data_mut(|data| {
+            let id = egui::Id::new("dialog_autofocus_scope");
+            if let Some(previous) = self.previous.take() {
+                data.insert_temp(id, previous);
+            } else {
+                data.remove::<DialogAutofocusState>(id);
+            }
+        });
+    }
+}
+
+fn focus_first_dialog_input(ui: &Ui, response: &egui::Response) {
+    if !ui.is_visible() || ui.is_sizing_pass() || !response.enabled() {
+        return;
+    }
+    let request = ui.ctx().data_mut(|data| {
+        let id = egui::Id::new("dialog_autofocus_scope");
+        let Some(mut state) = data.get_temp::<DialogAutofocusState>(id) else {
+            return false;
+        };
+        let request = state.opening && !state.first_input_seen;
+        state.first_input_seen = true;
+        if request {
+            if let Some((last, _)) = data.get_temp::<(u64, bool)>(state.visit_id) {
+                data.insert_temp(state.visit_id, (last, false));
+            }
+        }
+        data.insert_temp(id, state);
+        request
+    });
+    if request {
+        response.request_focus();
+    }
+}
+
 struct ThemedSinglelineTextEdit<'a> {
     inner: TextEdit<'a>,
     inset_shadow: bool,
@@ -27426,6 +27640,7 @@ impl<'a> ThemedSinglelineTextEdit<'a> {
 impl egui::Widget for ThemedSinglelineTextEdit<'_> {
     fn ui(self, ui: &mut Ui) -> egui::Response {
         let mut response = ui.add(self.inner);
+        focus_first_dialog_input(ui, &response);
         if self.full_control_rect {
             // egui 0.31 returns the inner text rect, despite allocating/hit-testing
             // the outer rect. Height-constrained controls paint their full frame.
@@ -34597,6 +34812,28 @@ fn branch_context_menu(
                     name: name.to_owned(),
                 });
                 ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    enabled
+                        && !current
+                        && upstream.is_some_and(|upstream| {
+                            !upstream.starts_with("refs/heads/")
+                                && upstream.split_once('/').is_some_and(|(remote, _)| {
+                                    remotes.iter().any(|name| name == remote)
+                                })
+                        }),
+                    egui::Button::new(i18n::t(language, "branch.delete_local_and_remote")),
+                )
+                .clicked()
+            {
+                if let Some(remote_branch) = upstream {
+                    *action = Some(BranchMenuAction::DeleteLocalAndRemote {
+                        name: name.to_owned(),
+                        remote_branch: remote_branch.to_owned(),
+                    });
+                    ui.close_menu();
+                }
             }
             menu_group_gap(ui);
             if ui
@@ -52848,6 +53085,91 @@ diff --git a/file.txt b/file.txt
                 "file tabs and More menus must stay inside their strip: {used}"
             );
         }
+    }
+
+    #[test]
+    fn dialog_autofocus_selects_first_enabled_input_once_and_on_reopen() {
+        let ctx = egui::Context::default();
+        let first = egui::Id::new("autofocus_first");
+        let second = egui::Id::new("autofocus_second");
+        let mut first_text = String::new();
+        let mut second_text = String::new();
+        for frame in 0..8 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                if frame == 4 {
+                    return;
+                } // A closed dialog must regain initial focus when reopened.
+                compact_action_dialog(ctx, "Autofocus test", 320.0, |ui| {
+                    ui.add_enabled(
+                        false,
+                        themed_singleline_text_edit(&mut String::new(), "disabled"),
+                    );
+                    ui.add(themed_singleline_text_edit(&mut first_text, "first").id(first));
+                    ui.add(themed_singleline_text_edit(&mut second_text, "second").id(second));
+                });
+            });
+            if frame == 1 {
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(first));
+                ctx.memory_mut(|memory| memory.request_focus(second));
+            }
+            if frame == 3 {
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(second));
+            }
+        }
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first));
+        // Ordinary page inputs must not be affected by the dialog scope.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ctx.memory_mut(|memory| memory.request_focus(second));
+                ui.add(themed_singleline_text_edit(&mut first_text, "first").id(first));
+                ui.add(themed_singleline_text_edit(&mut second_text, "second").id(second));
+            });
+        });
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(second));
+    }
+
+    #[test]
+    fn combined_branch_deletion_uses_async_busy_gate_and_uncached_partial_refresh() {
+        let source = include_str!("app.rs");
+        let start = source.find("    fn branch_action_modal(").unwrap();
+        let end = source[start..]
+            .find("    fn checkout_dialog_modal(")
+            .unwrap();
+        let modal = &source[start..start + end];
+        assert!(modal.contains("let branch_actions_enabled = !self.branch_actions_busy()"));
+        assert!(modal.contains("git::delete_local_and_tracked_remote_branch("));
+        assert!(modal.contains(
+            r#"self.start_remote_git_action_with_status("status.deleting_branches", action)"#
+        ));
+        let start = source
+            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .unwrap();
+        let end = source[start..]
+            .find("if let Some(receiver) = self.credential_login_task.take()")
+            .unwrap();
+        let poll = &source[start..start + end];
+        assert!(poll.contains("error.downcast_ref::<git::LocalBranchDeletedRemoteDeleteFailed>()"));
+        assert!(poll.contains("self.load_repository_uncached(root)"));
+        assert!(poll.contains("let deletion_root ="));
+    }
+
+    #[test]
+    fn standalone_tool_appearance_reads_preferences_without_unlocking_credentials() {
+        let appearance = parse_tool_appearance(
+            r#"{"theme_accent":"Orange","text_contrast":"Strong","ui_font_family":"Example UI","ui_font_weight":"Semibold","code_font_family":"Example Code","ui_scale":1.25,"ai_models":[{"api_key":"invalid-encrypted-value"}]}"#,
+        );
+        assert_eq!(appearance.accent, theme::ThemeAccent::Orange);
+        assert_eq!(appearance.contrast, theme::TextContrast::Strong);
+        assert_eq!(appearance.fonts.ui_family.as_deref(), Some("Example UI"));
+        assert_eq!(appearance.fonts.ui_weight, theme::FontWeight::Semibold);
+        assert_eq!(
+            appearance.fonts.code_family.as_deref(),
+            Some("Example Code")
+        );
+        assert_eq!(appearance.scale, 1.25);
+        let defaults = parse_tool_appearance("{}");
+        assert_eq!(defaults.accent, theme::ThemeAccent::Blue);
+        assert_eq!(defaults.scale, 1.0);
     }
 
     #[test]

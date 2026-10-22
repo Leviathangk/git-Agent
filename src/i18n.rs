@@ -2781,6 +2781,18 @@ const EN: &[(&str, &str)] = &[
     ("branch.sync_remote", "Sync remote branch"),
     ("branch.local_alias", "Local branch alias"),
     ("branch.delete", "Delete branch"),
+    (
+        "branch.delete_local_and_remote",
+        "Delete local and tracked remote branch",
+    ),
+    (
+        "branch.confirm_delete_local_and_remote",
+        "Delete the local branch first, then its tracked remote branch? If local deletion fails, the remote branch is kept.",
+    ),
+    (
+        "status.deleting_branches",
+        "Deleting local and tracked remote branches...",
+    ),
     ("branch.delete_remote", "Delete remote branch"),
     ("branch.force_delete", "Force delete"),
     ("branch.confirm_delete", "Delete this branch?"),
@@ -3450,6 +3462,12 @@ const ZH: &[(&str, &str)] = &[
     ("branch.checkout", "检出分支"),
     ("branch.checkout_remote", "检出远端分支"),
     ("branch.delete", "删除分支"),
+    ("branch.delete_local_and_remote", "删除本地及关联远端分支"),
+    (
+        "branch.confirm_delete_local_and_remote",
+        "先删除本地分支，再删除关联远端分支；本地删除失败时不会删除远端分支。",
+    ),
+    ("status.deleting_branches", "正在删除本地及关联远端分支…"),
     ("branch.force_delete", "强制删除"),
     ("branch.confirm_delete", "删除这个分支？"),
     ("remote.title", "远端仓库"),

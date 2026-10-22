@@ -251,7 +251,7 @@ impl DiffToolApp {
             options,
             Box::new(move |cc| {
                 prefer_shadowed_diff_window(cc);
-                crate::theme::install(&cc.egui_ctx);
+                crate::tool_ui::install(&cc.egui_ctx, diff_theme_mode(args.theme));
                 egui_extras::install_image_loaders(&cc.egui_ctx);
                 apply_diff_theme(&cc.egui_ctx, args.theme);
                 let app = Self::from_args(args).unwrap_or_else(|error| Self {
@@ -276,12 +276,19 @@ impl DiffToolApp {
 }
 
 impl App for DiffToolApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Unpainted rounded corners belong to the transparent native window,
+        // rather than eframe's default opaque canvas background.
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let resizing = request_diff_window_resize_on_pointer_down(ctx, frame);
         if !resizing {
             request_diff_window_drag_on_pointer_down(ctx, frame);
         }
         update_diff_window_resize_cursor(ctx);
+        apply_diff_theme(ctx, self.args.theme);
         let palette = diff_palette(self.args.theme);
 
         egui::TopBottomPanel::top("diff_window_titlebar")
@@ -289,7 +296,7 @@ impl App for DiffToolApp {
             .show_separator_line(false)
             .frame(
                 egui::Frame::new()
-                    .fill(palette.panel)
+                    .fill(crate::theme::palette(diff_theme_mode(self.args.theme)).chrome_bg)
                     .corner_radius(egui::CornerRadius {
                         nw: 8,
                         ne: 8,
@@ -319,14 +326,17 @@ impl App for DiffToolApp {
                     .stroke(Stroke::NONE),
             )
             .show(ctx, |ui| {
+                let code_rect = ui.available_rect_before_wrap();
+                crate::tool_ui::paint_code_panel(ui, code_rect);
                 if self.diff_text.trim().is_empty() {
                     ui.label(RichText::new(dt(self.args.language, "empty")).color(palette.muted));
                 } else if self.files.is_empty() {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    ScrollArea::both()
+                    let output = ScrollArea::both()
                         .id_salt("diff_tool_raw_scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| show_raw_diff(ui, &self.diff_text, palette));
+                    crate::tool_ui::paint_scroll_viewport_inset_shadow(ui, output.inner_rect);
                 } else {
                     show_side_by_side_diff(
                         ui,
@@ -359,6 +369,10 @@ fn diff_custom_title_bar(
     );
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(title_rect), |ui| {
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.add(
+                egui::Image::new(egui::include_image!("../assets/icons/logo-ga.svg"))
+                    .fit_to_exact_size(Vec2::splat(16.0)),
+            );
             ui.label(RichText::new("Git Agent Diff").strong().color(palette.text));
             ui.label(RichText::new(format!("- {}", app.args.title)).color(palette.muted));
         });
@@ -386,6 +400,7 @@ fn diff_custom_title_bar(
     );
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
             if diff_window_control_button(ui, "\u{00d7}", true, palette).clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -460,17 +475,8 @@ fn diff_toolbar_toggle_button(
     tooltip: &str,
     palette: DiffPalette,
 ) -> egui::Response {
-    let image = egui::Image::new(icon)
-        .fit_to_exact_size(Vec2::splat(15.0))
-        .tint(palette.muted);
-    ui.add(
-        egui::Button::image(image)
-            .min_size(Vec2::splat(28.0))
-            .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::NONE)
-            .corner_radius(egui::CornerRadius::same(4)),
-    )
-    .on_hover_text(tooltip)
+    let _ = palette;
+    crate::tool_ui::icon_button(ui, icon, tooltip, false)
 }
 
 fn diff_window_control_button(
@@ -479,28 +485,8 @@ fn diff_window_control_button(
     close: bool,
     palette: DiffPalette,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(34.0, 22.0), Sense::click());
-    let fill = if close && response.hovered() {
-        Color32::from_rgb(192, 55, 43)
-    } else if response.hovered() {
-        palette.panel_soft
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(4), fill);
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(16.0),
-        if close && response.hovered() {
-            Color32::WHITE
-        } else {
-            palette.text
-        },
-    );
-    response
+    let _ = palette;
+    crate::tool_ui::window_control_button(ui, label, close)
 }
 
 pub fn parse_diff_args<I, S>(args: I) -> anyhow::Result<DiffArgs>
@@ -956,7 +942,6 @@ fn format_hunk_range(range: DiffHunkRange) -> String {
 struct DiffPalette {
     bg: Color32,
     panel: Color32,
-    panel_soft: Color32,
     text: Color32,
     muted: Color32,
     added: Color32,
@@ -971,39 +956,24 @@ struct DiffPalette {
 }
 
 fn diff_palette(theme: DiffTheme) -> DiffPalette {
-    match theme {
-        DiffTheme::Dark => DiffPalette {
-            bg: Color32::from_rgb(24, 27, 31),
-            panel: Color32::from_rgb(29, 32, 36),
-            panel_soft: Color32::from_rgb(49, 43, 43),
-            text: Color32::from_rgb(222, 229, 238),
-            muted: Color32::from_rgb(130, 143, 160),
-            added: Color32::from_rgb(154, 220, 170),
-            removed: Color32::from_rgb(245, 155, 155),
-            meta: Color32::from_rgb(120, 170, 235),
-            file_bg: Color32::from_rgb(39, 45, 52),
-            hunk_bg: Color32::from_rgb(34, 46, 63),
-            gutter_bg: Color32::from_rgb(34, 38, 44),
-            added_bg: Color32::from_rgb(24, 58, 40),
-            removed_bg: Color32::from_rgb(70, 34, 34),
-            empty_bg: Color32::from_rgb(26, 29, 33),
-        },
-        DiffTheme::Light => DiffPalette {
-            bg: Color32::from_rgb(239, 242, 246),
-            panel: Color32::from_rgb(253, 254, 255),
-            panel_soft: Color32::from_rgb(248, 225, 219),
-            text: Color32::from_rgb(32, 39, 50),
-            muted: Color32::from_rgb(105, 116, 132),
-            added: Color32::from_rgb(32, 132, 72),
-            removed: Color32::from_rgb(180, 54, 48),
-            meta: Color32::from_rgb(49, 105, 190),
-            file_bg: Color32::from_rgb(226, 232, 240),
-            hunk_bg: Color32::from_rgb(229, 239, 255),
-            gutter_bg: Color32::from_rgb(241, 244, 248),
-            added_bg: Color32::from_rgb(226, 246, 234),
-            removed_bg: Color32::from_rgb(255, 235, 232),
-            empty_bg: Color32::from_rgb(248, 250, 252),
-        },
+    diff_palette_from_shared(crate::theme::palette(diff_theme_mode(theme)))
+}
+
+fn diff_palette_from_shared(p: crate::theme::Palette) -> DiffPalette {
+    DiffPalette {
+        bg: p.bg,
+        panel: p.panel,
+        text: p.text,
+        muted: p.muted,
+        added: p.diff_added_text,
+        removed: p.diff_removed_text,
+        meta: p.accent,
+        file_bg: p.panel_soft,
+        hunk_bg: p.accent_soft,
+        gutter_bg: p.diff_gutter,
+        added_bg: p.diff_added_bg,
+        removed_bg: p.diff_removed_bg,
+        empty_bg: p.panel_recessed,
     }
 }
 
@@ -1118,6 +1088,13 @@ fn show_side_by_side_diff(
         })
         .inner;
     *scroll_y = output.state.offset.y;
+    // Paint above the rendered rows, anchored to the actual scrolling viewport.
+    // Each column gets its own edge so the two code panes remain distinguishable.
+    let viewport = output.inner_rect.intersect(code_rect);
+    let (left_viewport, right_viewport) = split_columns(viewport, narrow_column, DIFF_PANE_GAP);
+    for pane in [left_viewport, right_viewport] {
+        crate::tool_ui::paint_scroll_viewport_inset_shadow(ui, pane.intersect(viewport));
+    }
 
     if let Some(map_rect) = map_rect {
         if let Some(target) = draw_diff_minimap(
@@ -1705,41 +1682,15 @@ fn paint_diff_icon_line(
     }
 }
 
+fn diff_theme_mode(theme: DiffTheme) -> crate::theme::ThemeMode {
+    match theme {
+        DiffTheme::Dark => crate::theme::ThemeMode::Dark,
+        DiffTheme::Light => crate::theme::ThemeMode::Light,
+    }
+}
+
 fn apply_diff_theme(ctx: &egui::Context, theme: DiffTheme) {
-    let palette = diff_palette(theme);
-    let mut visuals = match theme {
-        DiffTheme::Dark => egui::Visuals::dark(),
-        DiffTheme::Light => egui::Visuals::light(),
-    };
-    visuals.panel_fill = palette.bg;
-    visuals.window_fill = palette.panel;
-    visuals.window_stroke = Stroke::NONE;
-    let surface_shadow = match theme {
-        DiffTheme::Dark => eframe::epaint::Shadow {
-            offset: [3, 4],
-            blur: 12,
-            spread: 0,
-            color: Color32::from_rgba_unmultiplied(0, 0, 0, 90),
-        },
-        DiffTheme::Light => eframe::epaint::Shadow {
-            offset: [3, 4],
-            blur: 12,
-            spread: 0,
-            color: Color32::from_rgba_unmultiplied(44, 56, 72, 44),
-        },
-    };
-    visuals.window_shadow = surface_shadow;
-    visuals.popup_shadow = surface_shadow;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
-    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-    visuals.widgets.hovered.bg_stroke = Stroke::NONE;
-    visuals.widgets.active.bg_stroke = Stroke::NONE;
-    visuals.widgets.open.bg_stroke = Stroke::NONE;
-    visuals.extreme_bg_color = palette.panel_soft;
-    visuals.faint_bg_color = palette.panel_soft;
-    visuals.selection.stroke = Stroke::NONE;
-    visuals.override_text_color = Some(palette.text);
-    ctx.set_visuals(visuals);
+    crate::tool_ui::apply_theme(ctx, diff_theme_mode(theme));
 }
 
 fn diff_window_resize_direction(
@@ -1990,6 +1941,79 @@ fn dt(language: DiffLanguage, key: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rounded_diff_corners_have_no_opaque_canvas_underlay() {
+        let app = DiffToolApp {
+            args: DiffArgs {
+                title: String::new(),
+                left_label: String::new(),
+                right_label: String::new(),
+                diff: PathBuf::new(),
+                syntax_session: None,
+                theme: DiffTheme::Light,
+                language: DiffLanguage::English,
+            },
+            diff_text: String::new(),
+            files: Vec::new(),
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+        };
+        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            assert_eq!(App::clear_color(&app, &visuals)[3], 0.0);
+        }
+    }
+
+    #[test]
+    fn diff_surfaces_share_main_theme_and_preserve_patch_rows() {
+        let patch = "diff --git a/file.rs b/file.rs\n--- a/file.rs\n+++ b/file.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let files = parse_side_by_side_diff(patch);
+        let ctx = egui::Context::default();
+        for mode in [
+            crate::theme::ThemeMode::Light,
+            crate::theme::ThemeMode::Dark,
+        ] {
+            for accent in [
+                crate::theme::ThemeAccent::Blue,
+                crate::theme::ThemeAccent::Orange,
+                crate::theme::ThemeAccent::Purple,
+            ] {
+                let main = crate::theme::palette_for(mode, accent);
+                let palette = diff_palette_from_shared(main);
+                assert_eq!(palette.panel, main.panel);
+                assert_eq!(palette.added_bg, main.diff_added_bg);
+                assert_eq!(palette.removed_bg, main.diff_removed_bg);
+                assert_eq!(palette.gutter_bg, main.diff_gutter);
+                let mut scroll_x = 0.0;
+                let mut scroll_y = 0.0;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1120.0, 760.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            show_side_by_side_diff(
+                                ui,
+                                &files,
+                                "Before",
+                                "After",
+                                DiffLanguage::English,
+                                &mut scroll_x,
+                                &mut scroll_y,
+                                palette,
+                            )
+                        });
+                    },
+                );
+                assert!(!output.shapes.is_empty());
+                assert_eq!(parse_side_by_side_diff(patch), files);
+            }
+        }
+    }
 
     #[test]
     fn horizontal_scroll_keeps_both_columns_and_line_numbers_visible() {

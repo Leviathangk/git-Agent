@@ -16,5 +16,6 @@ pub mod plugins;
 mod repository_browser;
 pub mod syntax;
 pub mod theme;
+mod tool_ui;
 mod tutorials;
 mod updater;

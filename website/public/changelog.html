@@ -26,6 +26,23 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
+<h2>2.2.0 — 2026-10-22</h2>
+<h3>新增</h3>
+<ul>
+<li>本地分支右键新增“删除本地及关联远端分支”。按实际 upstream 核对目标，先删本地，再删远端；本地删除失败即停止，远端失败则提示部分完成并刷新仓库状态。</li>
+</ul>
+<h3>改进</h3>
+<ul>
+<li>操作和设置弹窗打开时自动聚焦首个可编辑输入框，覆盖分支/标签创建、重命名、贮藏、补丁、远端配置、作者/模型设置及 rebase 提交信息编辑；保留用户后续手动切换的焦点。</li>
+<li>Merge、Diff 独立工具对齐主程序保存的主题色、界面/代码字体、字重、文字对比度和界面缩放，统一面板阴影、工具栏图标及窗口控制按钮，并复用未变化的样式，避免逐帧重设。</li>
+<li>在实际代码滚动视口边缘增加固定的内阴影和淡高光，Diff 双栏及 Merge 三栏分别呈现清晰边界。</li>
+</ul>
+<h3>修复</h3>
+<ul>
+<li>Merge、Diff 透明窗口使用透明清屏色，修复圆角外露出暗色底的问题。</li>
+<li>切换主题时，删除区块的连线继续跟随对应行底色并保持原有透明度。</li>
+</ul>
+<p>beta.2 已通过三平台构建并发布安装包，本版在此基础上晋升正式版，应用代码与验证通过的预发布一致。</p>
 <h2>2.2.0-beta.2 — 2026-10-22</h2>
 <ul>
 <li>更新独立 Merge 集成测试，改为核对外观统一后的共享主题及阴影模块。beta.1 因旧的源码位置断言失败，没有发布安装包。</li>
@@ -282,6 +299,23 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
+<h2>2.2.0 — 2026-10-22</h2>
+<h3>Added</h3>
+<ul>
+<li>Add “Delete local and tracked remote branch” to local branch context menus. Resolve and verify the actual upstream, delete the local branch first, and stop before touching the remote if local deletion fails. Report partial completion and refresh repository state if remote deletion fails.</li>
+</ul>
+<h3>Improved</h3>
+<ul>
+<li>Focus the first enabled input when action or settings dialogs open, including branch/tag creation, renaming, stash, patches, remotes, author/model settings and rebase message editing. Keep the user&#x27;s subsequent focus changes intact.</li>
+<li>Align standalone Merge and Diff tools with the main application&#x27;s saved theme colors, UI/code fonts, font weight, text contrast and UI scale. Share panel shadows, toolbar icons and window-control styling, and reuse unchanged styles between frames.</li>
+<li>Add fixed inset shadows and subtle highlights to the actual scrolling code viewports: separate edges for both Diff columns and all three Merge panes.</li>
+</ul>
+<h3>Fixed</h3>
+<ul>
+<li>Clear transparent Merge and Diff windows transparently so rounded corners no longer expose an opaque dark canvas.</li>
+<li>Keep deletion connectors tied to their code-row color and existing opacity when changing themes.</li>
+</ul>
+<p>Promoted after beta.2 passed all three platform builds and published its installers. Application code is unchanged from the validated prerelease.</p>
 <h2>2.2.0-beta.2 — 2026-10-22</h2>
 <ul>
 <li>Update the standalone merge integration test to verify shared theme/shadow helpers after the appearance code was consolidated. Beta.1 stopped at this outdated source-location assertion and published no installers.</li>

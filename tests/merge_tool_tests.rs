@@ -155,8 +155,13 @@ fn merge_tool_layout_uses_fixed_regions_and_unique_scroll_ids() {
     assert!(source.contains("MergeSide::Remote => \"<<\""));
     assert!(source.contains("MERGE_COLUMN_GAP"));
     assert!(source.contains(".color(Color32::WHITE)"));
-    assert!(source.contains("offset: [3, 4]"));
-    assert!(source.contains("bg_stroke = egui::Stroke::NONE"));
+    let shared_ui = include_str!("../src/tool_ui.rs");
+    let shared_theme = include_str!("../src/theme.rs");
+    assert!(source.contains("crate::tool_ui::surface_shadow(p)"));
+    assert!(shared_ui.contains("offset: [3, 4]"));
+    assert!(source.contains("crate::tool_ui::apply_theme(ctx, merge_theme_mode(theme))"));
+    assert!(shared_ui.contains("theme::apply(ctx, mode, selection.1)"));
+    assert!(shared_theme.contains("visuals.widgets.inactive.bg_stroke = Stroke::NONE"));
     assert!(source.contains("shared_scroll_y"));
     assert!(source.contains("let frame_scroll_y = result_output.scroll_y;"));
     assert!(source.contains(".vertical_scroll_offset(scroll_y)"));

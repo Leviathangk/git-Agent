@@ -5,7 +5,30 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.2.0-beta.2 — 2026-10-22
+
+- Update the standalone merge integration test to verify shared theme/shadow helpers after the appearance code was consolidated. Beta.1 stopped at this outdated source-location assertion and published no installers.
+
+### Added
+
+- Add “Delete local and tracked remote branch” to local branch context menus. Resolve and verify the actual upstream, delete the local branch first, and stop before touching the remote if local deletion fails. Report partial completion and refresh repository state if remote deletion fails.
+
+### Improved
+
+- Focus the first enabled input when action or settings dialogs open, including branch/tag creation, renaming, stash, patches, remotes, author/model settings and rebase message editing. Keep the user's subsequent focus changes intact.
+- Align standalone Merge and Diff tools with the main application's saved theme colors, UI/code fonts, font weight, text contrast and UI scale. Share panel shadows, toolbar icons and window-control styling, and reuse unchanged styles between frames.
+- Add fixed inset shadows and subtle highlights to the actual scrolling code viewports: separate edges for both Diff columns and all three Merge panes.
+
+### Fixed
+
+- Clear transparent Merge and Diff windows transparently so rounded corners no longer expose an opaque dark canvas.
+- Keep deletion connectors tied to their code-row color and existing opacity when changing themes.
+
+This is a prerelease for release validation and is excluded from stable update prompts.
+
 ## 2.2.0-beta.1 — 2026-10-22
+
+Build stopped before installer publication because a standalone integration test still expected shadow code in its previous file. Use beta.2 or later.
 
 ### Added
 

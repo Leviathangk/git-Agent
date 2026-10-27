@@ -752,19 +752,71 @@ pub(crate) fn investigate(
 mod tests {
     use super::*;
     struct Fixture(PathBuf);
-    impl Fixture {
-        fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "git-agent-context-agent-{}-{}",
+    static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn allocate_fixture_root() -> PathBuf {
+        let base = std::env::var_os("GIT_AGENT_TEST_ARTIFACT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-artifacts")
+            });
+        std::fs::create_dir_all(&base).unwrap();
+        for _ in 0..100 {
+            let sequence = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = base.join(format!(
+                "git-agent-context-agent-{}-{}-{sequence}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos()
             ));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return root,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("cannot create isolated context fixture: {error}"),
+            }
+        }
+        panic!("cannot allocate a unique context fixture directory");
+    }
+
+    #[test]
+    fn fixture_directories_are_unique_under_parallel_allocation() {
+        let workers = (0..16)
+            .map(|_| std::thread::spawn(allocate_fixture_root))
+            .collect::<Vec<_>>();
+        let roots = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roots.iter().collect::<std::collections::HashSet<_>>().len(),
+            roots.len()
+        );
+        for root in roots {
+            std::fs::remove_dir(root).unwrap();
+        }
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = allocate_fixture_root();
             std::fs::create_dir_all(root.join("lib")).unwrap();
             std::fs::create_dir_all(root.join("src")).unwrap();
-            git(&root, &["init", "-b", "left"]).unwrap();
+            let init = crate::git::git_command()
+                .arg("-C")
+                .arg(&root)
+                .args(["init", "-b", "left"])
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .stdin(Stdio::null())
+                .output()
+                .expect("cannot spawn fixture git init");
+            assert!(
+                init.status.success(),
+                "fixture git init failed in {} ({}): {}",
+                root.display(),
+                init.status,
+                String::from_utf8_lossy(&init.stderr)
+            );
             git(&root, &["config", "core.autocrlf", "false"]).unwrap();
             git(&root, &["config", "user.name", "Context Test"]).unwrap();
             git(&root, &["config", "user.email", "context@example.test"]).unwrap();

@@ -5,7 +5,24 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.2.1-beta.2 — 2026-10-27
+
+- Update the checkout regression assertion for authoritative post-operation reloads. Beta.1 was stopped before installer publication after this outdated source-condition assertion failed.
+
+### Fixed
+
+- Finish branch-switch busy state after the matching fresh reload even when another repository tab is selected. Release the original repository on terminal reload errors or disconnection, while preserving the gate during retries and queued reloads.
+- Refresh a completed operation's original repository without switching the active tab or replacing another repository's draft, view or loading state. Discard buffered automatic snapshots while a newer explicit reload or mutation is pending.
+- Bind post-pull pushes, credential retries and push-recovery confirmations to their original repository. Verify the expected local branch before an automatic quick push.
+- Cancel delayed toolbar clicks and unsubmitted repository forms after navigation so they cannot act on a different repository.
+- Keep ongoing mutation tasks tracked during branch-sensitive read-cache invalidation. Release exclusive repository access automatically after worker failures and skip abandoned exclusive waiters.
+- Keep background Git errors and save/undo feedback associated with the correct repository.
+
+This is a prerelease for release validation and is excluded from stable update prompts.
+
 ## 2.2.1-beta.1 — 2026-10-27
+
+Build stopped before installer publication because a checkout source-condition assertion still expected the previous stale-snapshot rule. Use beta.2 or later.
 
 ### Fixed
 

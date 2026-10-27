@@ -14852,7 +14852,10 @@ impl GitAgentApp {
         }
 
         let branch_actions_enabled = !self.branch_actions_busy();
-        let pending_branch_checkout = self.pending_branch_checkout.clone();
+        let pending_branch_checkout = self
+            .pending_branch_checkout
+            .clone()
+            .filter(|_| self.active_branch_checkout_busy());
         if let Some(snapshot) = &self.snapshot {
             ui.add_space(8.0);
 
@@ -16613,7 +16616,10 @@ impl GitAgentApp {
             .map(|remote| remote.name.clone())
             .collect::<Vec<_>>();
         let branch_actions_enabled = !self.branch_actions_busy();
-        let pending_branch_checkout = self.pending_branch_checkout.clone();
+        let pending_branch_checkout = self
+            .pending_branch_checkout
+            .clone()
+            .filter(|_| self.active_branch_checkout_busy());
         let mut action = None;
 
         content_panel_frame(theme::bg()).show(ui, |ui| {
@@ -52787,10 +52793,7 @@ diff --git a/file.txt b/file.txt
         assert!(branch_task_source.contains("self.load_repository_uncached(root)"));
 
         assert!(implementation_source.contains("snapshot.skip_stale_branch"));
-        assert!(
-            implementation_source
-                .contains("belongs_to_pending_checkout && !matches_pending_checkout")
-        );
+        assert!(source_token(implementation_source).contains("belongs_to_pending_checkout&&!matches_pending_checkout&&!authoritative_checkout_snapshot"));
         assert!(implementation_source.contains("if !stale_checkout_snapshot"));
         assert!(implementation_source.contains("if active_repo && !stale_checkout_snapshot"));
     }

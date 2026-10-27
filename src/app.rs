@@ -1179,6 +1179,9 @@ enum RepositoryRefreshSchedulerCommand {
         blocked_keys: HashSet<String>,
     },
     Request(RepositoryRefreshRequest),
+    PromoteForeground {
+        key: String,
+    },
     AcquireExclusive {
         key: String,
         granted_sender: Sender<()>,
@@ -1236,6 +1239,12 @@ impl RepositoryRefreshScheduler {
                 granted_sender,
             });
         granted_receiver
+    }
+
+    fn promote_foreground(&self, key: String) {
+        let _ = self
+            .sender
+            .send(RepositoryRefreshSchedulerCommand::PromoteForeground { key });
     }
 
     fn release_exclusive(&self, key: String) {
@@ -1528,6 +1537,12 @@ fn apply_repository_refresh_scheduler_command(
         }
         RepositoryRefreshSchedulerCommand::Request(request) => {
             enqueue_repository_refresh(pending, request);
+        }
+        RepositoryRefreshSchedulerCommand::PromoteForeground { key } => {
+            for request in pending.iter_mut().filter(|request| request.key == key) {
+                request.priority = RepositoryRefreshPriority::Foreground;
+                request.probe_before_full_refresh = false;
+            }
         }
         RepositoryRefreshSchedulerCommand::AcquireExclusive {
             key,
@@ -5201,6 +5216,12 @@ impl GitAgentApp {
             self.foreground_repo_loads.insert(repo_task_key.clone());
         }
         if self.repo_tasks.contains_key(&repo_task_key) {
+            if restart || foreground {
+                // An owned background request may be pending behind this very
+                // operation's busy gate; waiting for it without promotion deadlocks.
+                self.repository_refresh_scheduler
+                    .promote_foreground(repo_task_key.clone());
+            }
             if restart {
                 diagnostics::trace(
                     "snapshot.queue",
@@ -49977,6 +49998,42 @@ mod ui_tests {
             implementation_source.contains("fn maybe_start_deferred_repository_snapshot_reload")
         );
         assert!(implementation_source.contains("repository_snapshot_error_is_retryable"));
+    }
+
+    #[test]
+    fn foreground_promotion_unblocks_a_background_read_behind_checkout_gate() {
+        let (scheduler, _automatic) = RepositoryRefreshScheduler::new(egui::Context::default());
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/nonexistent-promoted-refresh-repository");
+        let key = repo_state_key(&root);
+        scheduler.update_schedule(RepositoryRefreshSchedule {
+            repositories: Vec::new(),
+            active_interval: Duration::from_secs(60),
+            inactive_interval: Duration::from_secs(60),
+            blocked_keys: HashSet::from([key.clone()]),
+        });
+        let (sender, receiver) = mpsc::channel();
+        scheduler.request(RepositoryRefreshRequest {
+            path: root.clone(),
+            key: key.clone(),
+            priority: RepositoryRefreshPriority::Background,
+            probe_before_full_refresh: false,
+            result_sender: sender,
+            additional_result_senders: Vec::new(),
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(120)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        scheduler.promote_foreground(key);
+        let (finished_root, result) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the required foreground refresh must escape its checkout busy gate");
+        assert_eq!(finished_root, root);
+        assert!(
+            result.is_err(),
+            "the nonexistent fixture must produce a result, not remain queued"
+        );
     }
 
     #[test]

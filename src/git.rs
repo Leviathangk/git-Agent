@@ -3994,6 +3994,18 @@ pub fn push(root: impl AsRef<Path>) -> Result<()> {
     git_output(root.as_ref(), &["push"]).map(|_| ())
 }
 
+pub fn push_if_on_branch(root: impl AsRef<Path>, expected_branch: &str) -> Result<()> {
+    let root = root.as_ref();
+    let current = git_output(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    if current.trim() != expected_branch {
+        return Err(anyhow!(
+            "Branch changed before automatic push: expected {expected_branch}, found {}",
+            current.trim()
+        ));
+    }
+    push(root)
+}
+
 pub fn push_set_upstream(root: impl AsRef<Path>, remote: &str, branch: &str) -> Result<()> {
     git_output(root.as_ref(), &["push", "-u", remote, branch]).map(|_| ())
 }
@@ -4918,6 +4930,24 @@ mod tests {
         )?;
         git_output(&repo, &["checkout", "main"])?;
         Ok((repo, remote))
+    }
+
+    #[test]
+    fn automatic_push_rejects_a_branch_change_before_network_activity() -> Result<()> {
+        let (repo, remote) = tracked_branch_deletion_fixture()?;
+        let before = git_output(&remote, &["show-ref"])?;
+        let error = push_if_on_branch(&repo, "local-topic").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Branch changed before automatic push")
+        );
+        assert_eq!(before, git_output(&remote, &["show-ref"])?);
+        assert_eq!(
+            git_output(&repo, &["symbolic-ref", "--short", "HEAD"])?.trim(),
+            "main"
+        );
+        Ok(())
     }
 
     #[test]

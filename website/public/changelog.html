@@ -26,6 +26,17 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
+<h2>2.2.1-beta.1 — 2026-10-27</h2>
+<h3>修复</h3>
+<ul>
+<li>切分支后即使已切到其他仓库标签，也会在匹配的新快照返回后结束“正在切换分支”状态。刷新最终失败或任务中断时释放原仓库状态，重试及排队刷新期间继续保留保护。</li>
+<li>后台操作完成后只刷新原仓库，不再抢回当前标签或覆盖其他仓库的草稿、视图和加载状态；有更新的显式刷新或写入操作时忽略排队的旧自动刷新结果。</li>
+<li>拉取后自动推送、凭据重试及推送恢复确认绑定原仓库；自动快速推送前核对原本的本地分支，防止目标漂移。</li>
+<li>切换仓库时取消延迟工具栏单击及尚未提交的仓库操作表单，避免旧输入作用到另一个仓库。</li>
+<li>刷新分支相关读取缓存时保留正在执行的写入任务；工作线程异常后自动释放仓库独占权限，并跳过已放弃的独占等待者。</li>
+<li>后台 Git 错误、保存和撤销反馈保留正确的仓库上下文。</li>
+</ul>
+<p>此版本用于发布验证，不进入正式版更新提示。</p>
 <h2>2.2.0 — 2026-10-22</h2>
 <h3>新增</h3>
 <ul>
@@ -299,6 +310,17 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
+<h2>2.2.1-beta.1 — 2026-10-27</h2>
+<h3>Fixed</h3>
+<ul>
+<li>Finish branch-switch busy state after the matching fresh reload even when another repository tab is selected. Release the original repository on terminal reload errors or disconnection, while preserving the gate during retries and queued reloads.</li>
+<li>Refresh a completed operation&#x27;s original repository without switching the active tab or replacing another repository&#x27;s draft, view or loading state. Discard buffered automatic snapshots while a newer explicit reload or mutation is pending.</li>
+<li>Bind post-pull pushes, credential retries and push-recovery confirmations to their original repository. Verify the expected local branch before an automatic quick push.</li>
+<li>Cancel delayed toolbar clicks and unsubmitted repository forms after navigation so they cannot act on a different repository.</li>
+<li>Keep ongoing mutation tasks tracked during branch-sensitive read-cache invalidation. Release exclusive repository access automatically after worker failures and skip abandoned exclusive waiters.</li>
+<li>Keep background Git errors and save/undo feedback associated with the correct repository.</li>
+</ul>
+<p>This is a prerelease for release validation and is excluded from stable update prompts.</p>
 <h2>2.2.0 — 2026-10-22</h2>
 <h3>Added</h3>
 <ul>

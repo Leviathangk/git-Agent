@@ -994,6 +994,7 @@ pub struct GitAgentApp {
     pending_rewritten_history_prompt_root: Option<PathBuf>,
     pending_rewritten_history_prompt: Option<RewrittenHistoryPrompt>,
     pending_credential_retry: Option<PendingCredentialRetryAction>,
+    pending_credential_retry_root: Option<PathBuf>,
     pending_create_pull_request: Option<CreatePullRequestDialog>,
     pending_pull_request_open_after_push: Option<PullRequestOpenAfterPush>,
     pending_archive_action: Option<ArchiveActionDialog>,
@@ -1244,6 +1245,21 @@ impl RepositoryRefreshScheduler {
     }
 }
 
+struct RepositoryExclusiveGuard {
+    scheduler: RepositoryRefreshScheduler,
+    key: String,
+}
+impl RepositoryExclusiveGuard {
+    fn new(scheduler: RepositoryRefreshScheduler, key: String) -> Self {
+        Self { scheduler, key }
+    }
+}
+impl Drop for RepositoryExclusiveGuard {
+    fn drop(&mut self) {
+        self.scheduler.release_exclusive(self.key.clone());
+    }
+}
+
 #[derive(Clone)]
 struct RepositoryRefreshScheduleState {
     repository: ScheduledRepositoryRefresh,
@@ -1352,8 +1368,10 @@ fn repository_refresh_scheduler_loop(
             next_repository_exclusive_request_index(&pending_exclusive, &unavailable_keys)
         {
             let request = pending_exclusive.swap_remove(index);
-            exclusive_keys.insert(request.key);
-            let _ = request.granted_sender.send(());
+            exclusive_keys.insert(request.key.clone());
+            if request.granted_sender.send(()).is_err() {
+                exclusive_keys.remove(&request.key);
+            }
             ctx.request_repaint();
             continue;
         }
@@ -2109,8 +2127,9 @@ enum RepoToolbarAction {
     Fetch,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PendingToolbarClick {
+    root: PathBuf,
     action: RepoToolbarAction,
     due_at: f64,
 }
@@ -2146,6 +2165,7 @@ struct PushActionDialog {
 
 #[derive(Clone, Debug)]
 struct RewrittenHistoryPrompt {
+    root: PathBuf,
     branch: String,
     upstream: String,
     ahead: usize,
@@ -2172,6 +2192,7 @@ enum PushAfterPullRetry {
 #[derive(Clone, Debug)]
 struct PushAfterPullPlan {
     root: PathBuf,
+    local_branch: String,
     remote: String,
     remote_branch: String,
     retry: PushAfterPullRetry,
@@ -4130,6 +4151,27 @@ fn load_cached_repository_snapshot(path: &Path) -> Option<RepositorySnapshot> {
     Some(core_only_repository_snapshot(snapshot))
 }
 
+fn finish_pending_checkout_reload(
+    pending: &mut Option<String>,
+    owner: &mut Option<PathBuf>,
+    root: &Path,
+    branch: Option<&str>,
+    follow_up_pending: bool,
+) -> bool {
+    if follow_up_pending
+        || pending.is_none()
+        || !owner
+            .as_deref()
+            .is_some_and(|owner| paths_equal(owner, root))
+        || branch.is_some_and(|branch| pending.as_deref() != Some(branch))
+    {
+        return false;
+    }
+    *pending = None;
+    *owner = None;
+    true
+}
+
 fn repo_state_key(path: &Path) -> String {
     path.display().to_string()
 }
@@ -4813,6 +4855,7 @@ impl GitAgentApp {
             pending_rewritten_history_prompt_root: None,
             pending_rewritten_history_prompt: None,
             pending_credential_retry: None,
+            pending_credential_retry_root: None,
             pending_create_pull_request: None,
             pending_pull_request_open_after_push: None,
             pending_archive_action: None,
@@ -4950,12 +4993,56 @@ impl GitAgentApp {
         self.load_repository_with_cache_mode(path, true);
     }
 
+    fn repository_operation_error_message(&self, root: &Path, message: String) -> String {
+        if self.active_repo_root_matches(root) {
+            message
+        } else {
+            format!("{}\n\n{message}", root.display())
+        }
+    }
+
     fn load_repository_uncached(&mut self, path: PathBuf) {
-        self.load_repository_with_cache_mode(path, false);
+        // Completion reloads belong to their original repository, not navigation.
+        if self.active_repo_root_matches(&path) {
+            self.load_repository_with_cache_mode(path, false);
+        } else {
+            self.restart_repository_snapshot_load(path);
+        }
     }
 
     fn load_repository_with_cache_mode(&mut self, path: PathBuf, use_cache: bool) {
         let repository_transition = !self.active_repo_root_matches(&path);
+        if repository_transition {
+            self.pending_toolbar_single_click = None;
+            self.pending_commit_action = None;
+            self.pending_commit_identity_warning = None;
+            self.pending_worktree_action = None;
+            self.pending_blame_action = None;
+            self.pending_create_patch_action = None;
+            self.pending_fetch_action = None;
+            self.pending_pull_action = None;
+            self.pending_push_action = None;
+            self.pending_force_push_confirm = None;
+            self.pending_create_pull_request = None;
+            self.pending_archive_action = None;
+            self.pending_merge_action = None;
+            self.pending_interactive_rebase_action = None;
+            self.pending_rebase_control_action = None;
+            self.pending_submodule_action = None;
+            self.pending_subtree_action = None;
+            self.pending_lfs_action = None;
+            self.pending_git_flow_action = None;
+            self.pending_stash_action = None;
+            self.pending_branch_action = None;
+            self.pending_tag_action = None;
+            self.pending_repo_remote_action = None;
+            self.pending_commit_text_link = None;
+            self.repo_settings_open = false;
+
+            if let Some(previous_root) = self.active_repo_root() {
+                self.invalidate_branch_sensitive_tasks(&previous_root);
+            }
+        }
         let can_keep_current_snapshot = self
             .snapshot
             .as_ref()
@@ -5319,6 +5406,8 @@ impl GitAgentApp {
                     )
                 })
                 .and_then(|()| {
+                    let _exclusive_guard =
+                        RepositoryExclusiveGuard::new(scheduler.clone(), scheduler_key.clone());
                     git::fetch_with_options(
                         &root,
                         git::FetchOptions::background_remote_refresh(prune_tags),
@@ -5333,7 +5422,6 @@ impl GitAgentApp {
                         git::open_repository_core(&root).map(Some)
                     }
                 });
-            scheduler.release_exclusive(scheduler_key);
             let _ = sender.send((root, result));
         });
         ctx.request_repaint();
@@ -5654,12 +5742,8 @@ impl GitAgentApp {
         if !self.active_repo_root_matches(root) {
             return;
         }
-        if self.repository_undo_task.take().is_some() {
-            diagnostics::trace(
-                "undo.cancelled",
-                &format!("root={} reason=branch_transition", root.display()),
-            );
-        }
+        // Mutation receivers remain owned until their worker completes. Only
+        // branch-sensitive read tasks may be invalidated by navigation/refresh.
         self.details_task = None;
         self.diff_task = None;
         self.file_search_task = None;
@@ -5864,6 +5948,7 @@ impl GitAgentApp {
         if upstream.ahead > 0 && upstream.behind > 0 {
             if let Some(branch) = current_named_local_branch(snapshot) {
                 self.pending_rewritten_history_prompt = Some(RewrittenHistoryPrompt {
+                    root: snapshot.root.clone(),
                     branch: branch.name.clone(),
                     upstream: upstream.name.clone(),
                     ahead: upstream.ahead,
@@ -6516,8 +6601,11 @@ impl GitAgentApp {
                         "Repository refresh scheduler stopped before diff tool preparation began"
                     )
                 })
-                .and_then(|()| action(&root));
-            scheduler.release_exclusive(scheduler_key);
+                .and_then(|()| {
+                    let _exclusive_guard =
+                        RepositoryExclusiveGuard::new(scheduler.clone(), scheduler_key.clone());
+                    action(&root)
+                });
             let _ = sender.send((root, result));
         });
     }
@@ -7126,9 +7214,10 @@ impl GitAgentApp {
                     )
                 })
                 .and_then(|()| {
+                    let _exclusive_guard =
+                        RepositoryExclusiveGuard::new(scheduler.clone(), scheduler_key.clone());
                     gitignore::save_repository_gitignore(&root, &expected_original, &document)
                 });
-            scheduler.release_exclusive(scheduler_key);
             let _ = sender.send((root, result));
         });
     }
@@ -7144,6 +7233,19 @@ impl GitAgentApp {
 
     fn task_root_matches_active_repo(&self, root: Option<&Path>) -> bool {
         root.is_some_and(|root| self.active_repo_root_matches(root))
+    }
+
+    fn checkout_worker_in_flight_for(&self, root: &Path) -> bool {
+        (self.branch_checkout_task.is_some()
+            && self
+                .branch_checkout_root
+                .as_deref()
+                .is_some_and(|owner| paths_equal(owner, root)))
+            || (self.repository_undo_task.is_some()
+                && self
+                    .repository_undo_root
+                    .as_deref()
+                    .is_some_and(|owner| paths_equal(owner, root)))
     }
 
     fn active_branch_checkout_busy(&self) -> bool {
@@ -7294,7 +7396,10 @@ impl GitAgentApp {
     }
 
     fn branch_actions_busy(&self) -> bool {
-        self.active_repo_has_pending_load()
+        self.credential_login_task.is_some()
+            || self.repository_undo_busy()
+            || self.remote_git_busy()
+            || self.active_repo_has_pending_load()
             || (self.history_reference.is_some()
                 && self.active_repo_root().is_some_and(|root| {
                     self.foreground_repo_history_loads
@@ -7843,6 +7948,8 @@ impl GitAgentApp {
                 exclusive_access.recv().map_err(|_| {
                     anyhow::anyhow!("Repository refresh scheduler stopped before checkout began")
                 })?;
+                let _exclusive_guard =
+                    RepositoryExclusiveGuard::new(scheduler.clone(), scheduler_key.clone());
                 match strategy {
                     BranchCheckoutStrategy::PreserveLocalChanges => {
                         git::checkout_branch(&root, &name)
@@ -7867,7 +7974,6 @@ impl GitAgentApp {
                     }
                 }
             })();
-            scheduler.release_exclusive(scheduler_key);
             let _ = sender.send((root, name, strategy, result));
         });
     }
@@ -7951,6 +8057,8 @@ impl GitAgentApp {
                 exclusive_access.recv().map_err(|_| {
                     anyhow::anyhow!("Repository refresh scheduler stopped before Git action began")
                 })?;
+                let _exclusive_guard =
+                    RepositoryExclusiveGuard::new(scheduler.clone(), scheduler_key.clone());
                 let before = {
                     let _span =
                         diagnostics::span("undo.before", format!("root={}", root.display()));
@@ -8002,7 +8110,6 @@ impl GitAgentApp {
                     kind,
                 }))
             })();
-            scheduler.release_exclusive(scheduler_key);
             let _ = sender.send((root, result));
         });
     }
@@ -8038,6 +8145,8 @@ impl GitAgentApp {
                 exclusive_access.recv().map_err(|_| {
                     anyhow::anyhow!("Repository refresh scheduler stopped before Git action began")
                 })?;
+                let _exclusive_guard =
+                    RepositoryExclusiveGuard::new(scheduler.clone(), scheduler_key.clone());
                 let current = git::repository_undo_position(&root)?;
                 match (&entry.kind, direction) {
                     (RepositoryUndoKind::Position, RepositoryUndoDirection::Undo) => {
@@ -8071,7 +8180,6 @@ impl GitAgentApp {
                 }
                 Ok(RepositoryUndoTaskOutcome::Replayed { entry, direction })
             })();
-            scheduler.release_exclusive(scheduler_key);
             let _ = sender.send((root, result));
         });
     }
@@ -8089,11 +8197,20 @@ impl GitAgentApp {
     }
 
     fn start_github_credential_login(&mut self) {
-        if self.remote_git_busy() || self.loading_repo || self.active_commit_ai_busy() {
+        if self.credential_login_task.is_some()
+            || self.remote_git_busy()
+            || self.loading_repo
+            || self.active_commit_ai_busy()
+        {
             return;
         }
 
-        let Some(root) = self.active_repo_root() else {
+        let Some(root) = self
+            .pending_credential_retry
+            .as_ref()
+            .and(self.pending_credential_retry_root.clone())
+            .or_else(|| self.active_repo_root())
+        else {
             return;
         };
 
@@ -8113,6 +8230,22 @@ impl GitAgentApp {
         action: PendingCredentialRetryAction,
         after_login: bool,
     ) {
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
+        self.start_credential_retry_action_for_root(root, action, after_login);
+    }
+
+    fn start_credential_retry_action_for_root(
+        &mut self,
+        root: PathBuf,
+        action: PendingCredentialRetryAction,
+        after_login: bool,
+    ) {
+        if self.remote_git_busy() || self.credential_login_task.is_some() {
+            return;
+        }
+        self.pending_credential_retry_root = Some(root.clone());
         match action.clone() {
             PendingCredentialRetryAction::Push {
                 remote,
@@ -8122,9 +8255,11 @@ impl GitAgentApp {
                 self.pending_pull_request_open_after_push = None;
                 self.pending_credential_retry = Some(action);
                 self.credential_retry_in_progress = after_login;
-                self.start_remote_git_action_with_status("status.pushing", move |root| {
-                    git::push_selected(root, &remote, &branches, options)
-                });
+                self.start_remote_git_action_for_root_with_status(
+                    root,
+                    "status.pushing",
+                    move |root| git::push_selected(root, &remote, &branches, options),
+                );
             }
             PendingCredentialRetryAction::PullRequestPush {
                 remote,
@@ -8133,9 +8268,13 @@ impl GitAgentApp {
             } => {
                 self.pending_credential_retry = Some(action);
                 self.credential_retry_in_progress = after_login;
-                self.start_remote_git_action_with_status("status.pushing", move |root| {
-                    git::push_pull_request_branch(root, &remote, &local_branch, &remote_branch)
-                });
+                self.start_remote_git_action_for_root_with_status(
+                    root,
+                    "status.pushing",
+                    move |root| {
+                        git::push_pull_request_branch(root, &remote, &local_branch, &remote_branch)
+                    },
+                );
             }
         }
     }
@@ -8178,6 +8317,7 @@ impl GitAgentApp {
         }
         Some(PushAfterPullPlan {
             root: snapshot.root.clone(),
+            local_branch: current.name.clone(),
             remote: remote.to_owned(),
             remote_branch: branch.remote_branch.clone(),
             retry: PushAfterPullRetry::Selected {
@@ -8211,14 +8351,19 @@ impl GitAgentApp {
         self.pending_push_recovery_candidate = None;
         match plan.retry {
             PushAfterPullRetry::Quick => {
-                self.start_remote_git_action_with_status("status.pushing", |root| git::push(root));
+                self.start_remote_git_action_for_root_with_status(
+                    plan.root,
+                    "status.pushing",
+                    move |root| git::push_if_on_branch(root, &plan.local_branch),
+                );
             }
             PushAfterPullRetry::Selected {
                 remote,
                 branches,
                 options,
             } => {
-                self.start_credential_retry_action(
+                self.start_credential_retry_action_for_root(
+                    plan.root,
                     PendingCredentialRetryAction::Push {
                         remote,
                         branches,
@@ -8265,39 +8410,54 @@ impl GitAgentApp {
         {
             return;
         }
-        // Git actions reload the repository when complete. Persist the visible
-        // repository draft first so staging, fetching, and similar actions do
-        // not erase an in-progress commit message.
-        self.save_commit_message_draft_for_active_repo();
-        self.pending_toolbar_single_click = None;
         let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
             return;
         };
+        self.start_remote_git_action_for_root_with_status(root, status_key, action);
+    }
 
+    fn start_remote_git_action_for_root_with_status(
+        &mut self,
+        root: PathBuf,
+        status_key: &'static str,
+        action: impl FnOnce(&Path) -> anyhow::Result<()> + Send + 'static,
+    ) {
+        if self.remote_git_busy() {
+            return;
+        }
+        if self.active_repo_root_matches(&root) {
+            self.save_commit_message_draft_for_active_repo();
+            self.pending_toolbar_single_click = None;
+        }
         let (sender, receiver) = mpsc::channel();
         self.remote_git_task = Some(receiver);
         self.remote_git_status_key = Some(status_key);
         self.remote_git_root = Some(root.clone());
-        self.loading_repo = true;
-        self.error = None;
-        self.last_notice = None;
+        if self.active_repo_root_matches(&root) {
+            self.loading_repo = true;
+            self.error = None;
+            self.last_notice = None;
+        }
         if let Some(operation) = match status_key {
             "status.fetching" => Some("fetch"),
             "status.pulling" => Some("pull"),
             "status.pushing" => Some("push"),
             _ => None,
         } {
-            let plugin_context = self.plugin_context_for(
-                self.snapshot
-                    .as_ref()
-                    .expect("remote action has a snapshot"),
-            );
-            self.plugins.begin_remote_sync(
-                plugin_context,
-                operation,
-                "manual",
-                self.selected_ai_model.clone(),
-            );
+            let plugin_context = self
+                .snapshot
+                .as_ref()
+                .filter(|snapshot| paths_equal(&snapshot.root, &root))
+                .or_else(|| self.snapshot_cache.get(&repo_state_key(&root)))
+                .map(|snapshot| self.plugin_context_for(snapshot));
+            if let Some(plugin_context) = plugin_context {
+                self.plugins.begin_remote_sync(
+                    plugin_context,
+                    operation,
+                    "manual",
+                    self.selected_ai_model.clone(),
+                );
+            }
         }
         let scheduler = self.repository_refresh_scheduler.clone();
         let scheduler_key = repo_state_key(&root);
@@ -8311,8 +8471,11 @@ impl GitAgentApp {
                         "Repository refresh scheduler stopped before remote Git action began"
                     )
                 })
-                .and_then(|()| action(&root));
-            scheduler.release_exclusive(scheduler_key);
+                .and_then(|()| {
+                    let _exclusive_guard =
+                        RepositoryExclusiveGuard::new(scheduler.clone(), scheduler_key.clone());
+                    action(&root)
+                });
             let _ = sender.send((root, result));
         });
     }
@@ -8348,7 +8511,11 @@ impl GitAgentApp {
             self.run_quick_toolbar_action(action);
         } else if response.clicked() {
             let now = ctx.input(|input| input.time);
+            let Some(root) = self.active_repo_root() else {
+                return;
+            };
             self.pending_toolbar_single_click = Some(PendingToolbarClick {
+                root,
                 action,
                 due_at: now + TOOLBAR_DOUBLE_CLICK_DELAY,
             });
@@ -8357,9 +8524,13 @@ impl GitAgentApp {
     }
 
     fn flush_pending_toolbar_single_click(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending_toolbar_single_click else {
+        let Some(pending) = self.pending_toolbar_single_click.clone() else {
             return;
         };
+        if !self.active_repo_root_matches(&pending.root) || self.branch_actions_busy() {
+            self.pending_toolbar_single_click = None;
+            return;
+        }
         let now = ctx.input(|input| input.time);
         if now >= pending.due_at {
             self.pending_toolbar_single_click = None;
@@ -8848,6 +9019,19 @@ impl GitAgentApp {
         }
         let mut repo_results = Vec::new();
         while let Ok(result) = self.automatic_repository_refresh_results.try_recv() {
+            let key = repo_state_key(&result.0);
+            if self.foreground_repo_loads.contains(&key)
+                || [
+                    self.remote_git_root.as_deref(),
+                    self.repository_undo_root.as_deref(),
+                    self.branch_checkout_root.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|root| paths_equal(root, &result.0))
+            {
+                continue;
+            }
             repo_results.push(result);
         }
         if !self.repo_tasks.is_empty() || !repo_results.is_empty() {
@@ -8878,6 +9062,7 @@ impl GitAgentApp {
                 let was_foreground = queued_reload.is_none()
                     && !retry_queued
                     && self.foreground_repo_loads.remove(&repo_task_key);
+                let checkout_worker_running = self.checkout_worker_in_flight_for(&requested_root);
                 match result {
                     Ok(snapshot) => {
                         diagnostics::trace(
@@ -8901,8 +9086,15 @@ impl GitAgentApp {
                         let matches_pending_checkout = belongs_to_pending_checkout
                             && self.pending_branch_checkout.as_deref()
                                 == Some(snapshot.branch.as_str());
-                        let stale_checkout_snapshot =
-                            belongs_to_pending_checkout && !matches_pending_checkout;
+                        // A final explicit post-operation read is authoritative even
+                        // if another tool changed HEAD again after our checkout.
+                        let authoritative_checkout_snapshot = belongs_to_pending_checkout
+                            && was_foreground
+                            && queued_reload.is_none()
+                            && !checkout_worker_running;
+                        let stale_checkout_snapshot = belongs_to_pending_checkout
+                            && !matches_pending_checkout
+                            && !authoritative_checkout_snapshot;
                         let unchanged_background_snapshot = active_repo
                             && self.active_snapshot_matches_background_core_refresh(&snapshot);
                         let plugin_refresh_context = self
@@ -8927,6 +9119,7 @@ impl GitAgentApp {
                         if was_foreground {
                             self.finish_conflict_merge_reload_for(&requested_root);
                         }
+                        let reloaded_branch = snapshot.branch.clone();
                         if active_repo && !stale_checkout_snapshot {
                             let applied_branch = snapshot.branch.clone();
                             if !unchanged_background_snapshot {
@@ -8941,17 +9134,25 @@ impl GitAgentApp {
                                     unchanged_background_snapshot
                                 ),
                             );
-                            if matches_pending_checkout {
-                                diagnostics::finish_branch_switch(
-                                    "success",
-                                    &format!(
-                                        "root={} branch={applied_branch}",
-                                        requested_root.display()
-                                    ),
-                                );
-                                self.pending_branch_checkout = None;
-                                self.branch_checkout_root = None;
-                            }
+                        }
+                        if finish_pending_checkout_reload(
+                            &mut self.pending_branch_checkout,
+                            &mut self.branch_checkout_root,
+                            &requested_root,
+                            if authoritative_checkout_snapshot {
+                                None
+                            } else {
+                                Some(&reloaded_branch)
+                            },
+                            queued_reload.is_some() || checkout_worker_running,
+                        ) {
+                            diagnostics::finish_branch_switch(
+                                "success",
+                                &format!(
+                                    "root={} branch={reloaded_branch}",
+                                    requested_root.display()
+                                ),
+                            );
                         }
                         if let Some((event, context)) = plugin_refresh_context {
                             self.plugin_repository_events.remove(&requested_root);
@@ -8981,19 +9182,19 @@ impl GitAgentApp {
                         if was_foreground {
                             self.finish_conflict_merge_reload_for(&requested_root);
                         }
-                        if was_foreground && self.active_repo_root_matches(&requested_root) {
+                        if finish_pending_checkout_reload(
+                            &mut self.pending_branch_checkout,
+                            &mut self.branch_checkout_root,
+                            &requested_root,
+                            None,
+                            queued_reload.is_some() || retry_queued || checkout_worker_running,
+                        ) {
                             diagnostics::finish_branch_switch(
                                 "snapshot_error",
                                 &format!("root={} error={error:#}", requested_root.display()),
                             );
-                            if self
-                                .branch_checkout_root
-                                .as_deref()
-                                .is_some_and(|root| paths_equal(root, &requested_root))
-                            {
-                                self.pending_branch_checkout = None;
-                                self.branch_checkout_root = None;
-                            }
+                        }
+                        if was_foreground && self.active_repo_root_matches(&requested_root) {
                             self.clear_repository_snapshot_view();
                             self.error = Some(error.to_string());
                         }
@@ -9025,15 +9226,26 @@ impl GitAgentApp {
                 if was_foreground {
                     self.finish_conflict_merge_reload_for_key(&key);
                 }
-                if was_foreground && self.active_repo_key_matches(&key) {
-                    let checkout_matches = self
-                        .branch_checkout_root
-                        .as_ref()
-                        .is_some_and(|root| repo_state_key(root) == key);
-                    if checkout_matches {
-                        self.pending_branch_checkout = None;
-                        self.branch_checkout_root = None;
+                if let Some(root) = self
+                    .branch_checkout_root
+                    .clone()
+                    .filter(|root| repo_state_key(root) == key)
+                {
+                    let worker_running = self.checkout_worker_in_flight_for(&root);
+                    if finish_pending_checkout_reload(
+                        &mut self.pending_branch_checkout,
+                        &mut self.branch_checkout_root,
+                        &root,
+                        None,
+                        worker_running,
+                    ) {
+                        diagnostics::finish_branch_switch(
+                            "snapshot_disconnected",
+                            &format!("root={}", root.display()),
+                        );
                     }
+                }
+                if was_foreground && self.active_repo_key_matches(&key) {
                     self.clear_repository_snapshot_view();
                     self.error = Some("Repository loader stopped unexpectedly".to_owned());
                 }
@@ -9165,8 +9377,10 @@ impl GitAgentApp {
                     {
                         self.branch_checkout_root = None;
                     }
-                    self.loading_repo = false;
-                    if strategy == BranchCheckoutStrategy::PreserveLocalChanges
+                    self.load_repository_uncached(root.clone());
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    if self.active_repo_root_matches(&root)
+                        && strategy == BranchCheckoutStrategy::PreserveLocalChanges
                         && git::checkout_error_requires_local_change_recovery(&error.to_string())
                     {
                         self.pending_branch_action = Some(BranchActionDialog::CheckoutRecovery {
@@ -9176,7 +9390,8 @@ impl GitAgentApp {
                         });
                         self.error = None;
                     } else {
-                        self.error = Some(error.to_string());
+                        self.error =
+                            Some(self.repository_operation_error_message(&root, error.to_string()));
                     }
                     self.last_notice = None;
                     ctx.request_repaint();
@@ -9188,8 +9403,10 @@ impl GitAgentApp {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     diagnostics::finish_branch_switch("checkout_disconnected", "");
                     self.pending_branch_checkout = None;
-                    self.branch_checkout_root = None;
-                    self.loading_repo = false;
+                    if let Some(root) = self.branch_checkout_root.take() {
+                        self.load_repository_uncached(root);
+                    }
+                    self.loading_repo = self.active_repo_has_pending_load();
                     self.error = Some("Branch checkout stopped unexpectedly".to_owned());
                     ctx.request_repaint();
                 }
@@ -9204,14 +9421,18 @@ impl GitAgentApp {
                         "undo.result",
                         &format!("root={} outcome=recorded", root.display()),
                     );
-                    self.show_action_toast(
-                        self.undo_redo_toast_message("undo.toast.ready", &entry.label),
-                    );
+                    if self.active_repo_root_matches(&root) {
+                        self.show_action_toast(
+                            self.undo_redo_toast_message("undo.toast.ready", &entry.label),
+                        );
+                    }
                     let key = repo_state_key(&entry.root);
                     self.undo_entries.insert(key.clone(), entry);
                     self.redo_entries.remove(&key);
-                    self.error = None;
-                    self.last_notice = None;
+                    if self.active_repo_root_matches(&root) {
+                        self.error = None;
+                        self.last_notice = None;
+                    }
                     self.load_repository_uncached(root);
                     ctx.request_repaint();
                 }
@@ -9224,7 +9445,9 @@ impl GitAgentApp {
                             let key = repo_state_key(&entry.root);
                             self.undo_entries.remove(&key);
                             self.redo_entries.insert(key, entry);
-                            self.show_action_toast(message);
+                            if self.active_repo_root_matches(&root) {
+                                self.show_action_toast(message);
+                            }
                         }
                         RepositoryUndoDirection::Redo => {
                             let message =
@@ -9232,11 +9455,15 @@ impl GitAgentApp {
                             let key = repo_state_key(&entry.root);
                             self.undo_entries.insert(key.clone(), entry);
                             self.redo_entries.remove(&key);
-                            self.show_action_toast(message);
+                            if self.active_repo_root_matches(&root) {
+                                self.show_action_toast(message);
+                            }
                         }
                     }
-                    self.error = None;
-                    self.last_notice = None;
+                    if self.active_repo_root_matches(&root) {
+                        self.error = None;
+                        self.last_notice = None;
+                    }
                     self.load_repository_uncached(root);
                     ctx.request_repaint();
                 }
@@ -9246,13 +9473,23 @@ impl GitAgentApp {
                         "undo_error",
                         &format!("root={} error={error:#}", root.display()),
                     );
-                    self.pending_branch_checkout = None;
-                    if git::repository_rebase_in_progress(&root) {
+                    finish_pending_checkout_reload(
+                        &mut self.pending_branch_checkout,
+                        &mut self.branch_checkout_root,
+                        &root,
+                        None,
+                        false,
+                    );
+                    if self.active_repo_root_matches(&root)
+                        && git::repository_rebase_in_progress(&root)
+                    {
                         self.dismiss_rebase_blocked_dialogs();
                         self.pending_rebase_control_action = Some(RebaseControlDialog {
                             message: Some(error.to_string()),
                         });
-                        self.active_view = MainView::Workspace;
+                        if self.active_repo_root_matches(&root) {
+                            self.active_view = MainView::Workspace;
+                        }
                         self.error = None;
                         self.last_notice = None;
                         self.load_repository_uncached(root);
@@ -9265,8 +9502,10 @@ impl GitAgentApp {
                         {
                             self.pending_rewritten_history_prompt_root = None;
                         }
-                        self.loading_repo = false;
-                        self.error = Some(error.to_string());
+                        self.loading_repo = self.active_repo_has_pending_load();
+                        self.load_repository_uncached(root.clone());
+                        self.error =
+                            Some(self.repository_operation_error_message(&root, error.to_string()));
                         self.last_notice = None;
                         ctx.request_repaint();
                     }
@@ -9276,11 +9515,19 @@ impl GitAgentApp {
                     ctx.request_repaint_after(Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.repository_undo_root = None;
+                    if let Some(root) = self.repository_undo_root.take() {
+                        finish_pending_checkout_reload(
+                            &mut self.pending_branch_checkout,
+                            &mut self.branch_checkout_root,
+                            &root,
+                            None,
+                            false,
+                        );
+                        self.load_repository_uncached(root);
+                    }
                     diagnostics::finish_branch_switch("undo_disconnected", "");
                     self.pending_rewritten_history_prompt_root = None;
-                    self.pending_branch_checkout = None;
-                    self.loading_repo = false;
+                    self.loading_repo = self.active_repo_has_pending_load();
                     self.error = Some("Repository undo task stopped unexpectedly".to_owned());
                     self.last_notice = None;
                     ctx.request_repaint();
@@ -9550,9 +9797,11 @@ impl GitAgentApp {
                         self.pending_push_recovery_candidate = None;
                         self.pending_credential_retry = None;
                         self.credential_retry_in_progress = false;
-                        self.loading_repo = false;
-                        self.error = None;
-                        self.last_notice = None;
+                        self.loading_repo = self.active_repo_has_pending_load();
+                        if self.active_repo_root_matches(&root) {
+                            self.error = None;
+                            self.last_notice = None;
+                        }
                         self.resume_push_after_pull(plan);
                         ctx.request_repaint();
                         return;
@@ -9564,8 +9813,10 @@ impl GitAgentApp {
                         .filter(|pending| paths_equal(&pending.root, &root));
                     self.pending_credential_retry = None;
                     self.credential_retry_in_progress = false;
-                    self.error = None;
-                    self.last_notice = None;
+                    if self.active_repo_root_matches(&root) {
+                        self.error = None;
+                        self.last_notice = None;
+                    }
                     self.load_repository_uncached(root);
                     if let Some(pending) = pull_request_to_open {
                         let url = branch_pull_request_url(&pending.base_url, &pending.branch);
@@ -9590,9 +9841,9 @@ impl GitAgentApp {
                         } else {
                             partial.to_string()
                         };
-                        self.loading_repo = false;
-                        self.load_repository_uncached(root);
-                        self.error = Some(message);
+                        self.loading_repo = self.active_repo_has_pending_load();
+                        self.load_repository_uncached(root.clone());
+                        self.error = Some(self.repository_operation_error_message(&root, message));
                         self.last_notice = None;
                         ctx.request_repaint();
                         return;
@@ -9608,13 +9859,17 @@ impl GitAgentApp {
                     {
                         self.pending_rewritten_history_prompt_root = None;
                     }
-                    if git::repository_rebase_in_progress(&root) {
+                    if self.active_repo_root_matches(&root)
+                        && git::repository_rebase_in_progress(&root)
+                    {
                         self.dismiss_rebase_blocked_dialogs();
                         self.pending_rebase_control_action = Some(RebaseControlDialog {
                             message: Some(error.to_string()),
                         });
-                        self.active_view = MainView::Workspace;
-                        self.loading_repo = false;
+                        if self.active_repo_root_matches(&root) {
+                            self.active_view = MainView::Workspace;
+                        }
+                        self.loading_repo = self.active_repo_has_pending_load();
                         self.error = None;
                         self.last_notice = None;
                         self.load_repository_uncached(root);
@@ -9626,8 +9881,10 @@ impl GitAgentApp {
                         self.pending_push_recovery_candidate = None;
                         self.pending_credential_retry = None;
                         self.credential_retry_in_progress = false;
-                        self.active_view = MainView::Workspace;
-                        self.loading_repo = false;
+                        if self.active_repo_root_matches(&root) {
+                            self.active_view = MainView::Workspace;
+                        }
+                        self.loading_repo = self.active_repo_has_pending_load();
                         self.error = Some(pull_conflict_error_message(
                             self.language,
                             conflict.diagnostic(),
@@ -9637,12 +9894,14 @@ impl GitAgentApp {
                         ctx.request_repaint();
                         return;
                     }
-                    self.loading_repo = false;
-                    let mut message = error.to_string();
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    let mut message =
+                        self.repository_operation_error_message(&root, error.to_string());
                     let auth_error = github_authentication_error(&message);
                     if !auth_error && non_fast_forward_push_error(&message) {
                         if let Some(plan) = self.push_recovery_plan_for_error(&root) {
                             self.pending_non_fast_forward_push = Some(plan);
+                            self.load_repository_uncached(root.clone());
                             self.pending_credential_retry = None;
                             self.credential_retry_in_progress = false;
                             self.error = None;
@@ -9660,7 +9919,9 @@ impl GitAgentApp {
                         self.pending_push_after_pull = None;
                         self.pending_credential_retry = None;
                         self.credential_retry_in_progress = false;
-                        self.active_view = MainView::Workspace;
+                        if self.active_repo_root_matches(&root) {
+                            self.active_view = MainView::Workspace;
+                        }
                         self.error = None;
                         self.last_notice = None;
                         self.load_repository_uncached(root);
@@ -9685,6 +9946,7 @@ impl GitAgentApp {
                             self.pending_pull_request_open_after_push = None;
                         }
                     }
+                    self.load_repository_uncached(root);
                     self.error = Some(message);
                     self.last_notice = None;
                     ctx.request_repaint();
@@ -9694,10 +9956,7 @@ impl GitAgentApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    let deletion_root = (self.remote_git_status_key
-                        == Some("status.deleting_branches"))
-                    .then(|| self.remote_git_root.clone())
-                    .flatten();
+                    let interrupted_root = self.remote_git_root.clone();
                     self.remote_git_status_key = None;
                     self.remote_git_root = None;
                     self.pending_rewritten_history_prompt_root = None;
@@ -9705,8 +9964,8 @@ impl GitAgentApp {
                     self.pending_non_fast_forward_push = None;
                     self.pending_push_after_pull = None;
                     self.pending_push_recovery_candidate = None;
-                    self.loading_repo = false;
-                    if let Some(root) = deletion_root {
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    if let Some(root) = interrupted_root {
                         self.load_repository_uncached(root);
                     }
                     self.error = Some("Remote Git action stopped unexpectedly".to_owned());
@@ -9719,11 +9978,13 @@ impl GitAgentApp {
         if let Some(receiver) = self.credential_login_task.take() {
             match receiver.try_recv() {
                 Ok(Ok(())) => {
-                    self.credential_login_root = None;
+                    let login_root = self.credential_login_root.take();
                     self.last_notice = Some(self.tr("credentials.github_login_done").to_owned());
-                    self.loading_repo = false;
+                    self.loading_repo = self.active_repo_has_pending_load();
                     if let Some(retry) = self.pending_credential_retry.take() {
-                        self.start_credential_retry_action(retry, true);
+                        if let Some(root) = login_root {
+                            self.start_credential_retry_action_for_root(root, retry, true);
+                        }
                     } else {
                         self.error =
                             Some(self.tr("credentials.github_login_done_message").to_owned());
@@ -9732,7 +9993,7 @@ impl GitAgentApp {
                 }
                 Ok(Err(error)) => {
                     self.credential_login_root = None;
-                    self.loading_repo = false;
+                    self.loading_repo = self.active_repo_has_pending_load();
                     self.error = Some(error.to_string());
                     self.last_notice = None;
                     ctx.request_repaint();
@@ -9743,7 +10004,7 @@ impl GitAgentApp {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.credential_login_root = None;
-                    self.loading_repo = false;
+                    self.loading_repo = self.active_repo_has_pending_load();
                     self.error = Some("Credential login stopped unexpectedly".to_owned());
                     self.last_notice = None;
                     ctx.request_repaint();
@@ -9993,7 +10254,7 @@ impl GitAgentApp {
             match receiver.try_recv() {
                 Ok((root, Ok(()))) => {
                     self.repo_gitignore_save_root = None;
-                    self.loading_repo = false;
+                    self.loading_repo = self.active_repo_has_pending_load();
                     if let Some(editor) = self
                         .repo_gitignore_editor
                         .as_mut()
@@ -10004,8 +10265,10 @@ impl GitAgentApp {
                     }
                     let close_after_save = self.repo_gitignore_close_after_save;
                     self.repo_gitignore_close_after_save = false;
-                    self.show_toast(self.tr("repo.settings.ignore_saved"));
-                    if close_after_save {
+                    if self.active_repo_root_matches(&root) {
+                        self.show_toast(self.tr("repo.settings.ignore_saved"));
+                    }
+                    if close_after_save && self.active_repo_root_matches(&root) {
                         self.repo_settings_open = false;
                         self.repo_gitignore_editor = None;
                     }
@@ -10015,7 +10278,7 @@ impl GitAgentApp {
                 Ok((root, Err(error))) => {
                     self.repo_gitignore_save_root = None;
                     self.repo_gitignore_close_after_save = false;
-                    self.loading_repo = false;
+                    self.loading_repo = self.active_repo_has_pending_load();
                     if let Some(editor) = self
                         .repo_gitignore_editor
                         .as_mut()
@@ -10032,7 +10295,7 @@ impl GitAgentApp {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.repo_gitignore_save_root = None;
                     self.repo_gitignore_close_after_save = false;
-                    self.loading_repo = false;
+                    self.loading_repo = self.active_repo_has_pending_load();
                     let message = self.tr("repo.settings.ignore_save_disconnected").to_owned();
                     if let Some(editor) = self.repo_gitignore_editor.as_mut() {
                         editor.error = Some(message);
@@ -18130,6 +18393,11 @@ impl GitAgentApp {
             return;
         };
 
+        if !self.active_repo_root_matches(&plan.root) {
+            self.pending_non_fast_forward_push = Some(plan);
+            return;
+        }
+        let actions_enabled = !self.branch_actions_busy();
         let mut keep_open = true;
         let mut pull_after_close = None;
         compact_action_dialog(
@@ -18157,7 +18425,7 @@ impl GitAgentApp {
                         if dialog_primary_button(
                             ui,
                             self.tr("push.non_fast_forward.pull_and_push"),
-                            true,
+                            actions_enabled,
                         )
                         .clicked()
                         {
@@ -18172,10 +18440,20 @@ impl GitAgentApp {
         if let Some(plan) = pull_after_close {
             let remote = plan.remote.clone();
             let remote_branch = plan.remote_branch.clone();
+            let root = plan.root.clone();
             self.pending_push_after_pull = Some(plan);
-            self.start_remote_git_action_with_status("status.pulling", move |root| {
-                git::pull_from_remote(root, &remote, &remote_branch, git::PullOptions::default())
-            });
+            self.start_remote_git_action_for_root_with_status(
+                root,
+                "status.pulling",
+                move |root| {
+                    git::pull_from_remote(
+                        root,
+                        &remote,
+                        &remote_branch,
+                        git::PullOptions::default(),
+                    )
+                },
+            );
         }
         if keep_open {
             self.pending_non_fast_forward_push = Some(plan);
@@ -20648,6 +20926,11 @@ impl GitAgentApp {
             return;
         };
 
+        if !self.active_repo_root_matches(&prompt.root) {
+            self.pending_rewritten_history_prompt = Some(prompt);
+            return;
+        }
+        let actions_enabled = !self.branch_actions_busy();
         let mut keep_open = true;
         let mut open_push = false;
         compact_action_dialog(
@@ -20671,8 +20954,12 @@ impl GitAgentApp {
                         if dialog_cancel_button(ui, self.tr("rewrite_prompt.later")).clicked() {
                             keep_open = false;
                         }
-                        if dialog_primary_button(ui, self.tr("rewrite_prompt.open_push"), true)
-                            .clicked()
+                        if dialog_primary_button(
+                            ui,
+                            self.tr("rewrite_prompt.open_push"),
+                            actions_enabled,
+                        )
+                        .clicked()
                         {
                             open_push = true;
                             keep_open = false;
@@ -38209,6 +38496,7 @@ fn quick_push_after_pull_plan_for_snapshot(
     let (remote, remote_branch) = split_remote_branch_name(&upstream.name)?;
     Some(PushAfterPullPlan {
         root: snapshot.root.clone(),
+        local_branch: branch.name.clone(),
         remote,
         remote_branch,
         retry: PushAfterPullRetry::Quick,
@@ -38234,6 +38522,7 @@ fn pull_dialog_push_after_pull_plan(
     let branch = current.name.clone();
     Some(PushAfterPullPlan {
         root: snapshot.root.clone(),
+        local_branch: branch.clone(),
         remote: remote.to_owned(),
         remote_branch: branch.clone(),
         retry: PushAfterPullRetry::Selected {
@@ -49445,7 +49734,7 @@ mod ui_tests {
             .unwrap();
         let conflict_flow = &implementation[conflict_start..(conflict_start + 1_300)];
         assert!(conflict_flow.contains("self.active_view = MainView::Workspace"));
-        assert!(conflict_flow.contains("self.loading_repo = false"));
+        assert!(conflict_flow.contains("self.loading_repo = self.active_repo_has_pending_load()"));
         assert!(conflict_flow.contains("self.load_repository_uncached(root)"));
         assert!(conflict_flow.contains("self.pending_push_after_pull = None"));
     }
@@ -49465,7 +49754,12 @@ mod ui_tests {
             "git::repository_merge_in_progress(&root)",
             "push.non_fast_forward.pull_and_push",
         ] {
-            assert!(implementation_source.contains(required), "{required}");
+            assert!(
+                source_token(implementation_source)
+                    .replace(",)", ")")
+                    .contains(&source_token(required).replace(",)", ")")),
+                "{required}"
+            );
         }
 
         assert!(non_fast_forward_push_error(
@@ -49577,7 +49871,8 @@ mod ui_tests {
         assert!(credential_task_source.contains("credentials.github_login_done_message"));
         assert!(credential_task_source.contains("self.pending_credential_retry.take()"));
         assert!(
-            credential_task_source.contains("self.start_credential_retry_action(retry, true);")
+            credential_task_source
+                .contains("self.start_credential_retry_action_for_root(root, retry, true);")
         );
         assert!(!credential_task_source.contains("self.load_repository_uncached(root);"));
 
@@ -49679,6 +49974,198 @@ mod ui_tests {
     }
 
     #[test]
+    fn repository_exclusive_guard_releases_after_worker_panic() {
+        let (scheduler, _results) = RepositoryRefreshScheduler::new(egui::Context::default());
+        let key = "panic-test-owner".to_owned();
+        let ready = scheduler.acquire_exclusive(key.clone());
+        let worker_scheduler = scheduler.clone();
+        let worker_key = key.clone();
+        assert!(
+            thread::spawn(move || {
+                ready.recv_timeout(Duration::from_secs(3)).unwrap();
+                let _guard = RepositoryExclusiveGuard::new(worker_scheduler, worker_key);
+                panic!("simulated repository worker failure");
+            })
+            .join()
+            .is_err()
+        );
+        scheduler
+            .acquire_exclusive(key.clone())
+            .recv_timeout(Duration::from_secs(3))
+            .expect("panicking worker must release its repository lane");
+        scheduler.release_exclusive(key);
+    }
+
+    #[test]
+    fn abandoned_exclusive_waiter_does_not_block_later_operations() {
+        let (scheduler, _results) = RepositoryRefreshScheduler::new(egui::Context::default());
+        let key = "abandoned-test-owner".to_owned();
+        scheduler
+            .acquire_exclusive(key.clone())
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        let abandoned = scheduler.acquire_exclusive(key.clone());
+        drop(abandoned);
+        let next = scheduler.acquire_exclusive(key.clone());
+        scheduler.release_exclusive(key.clone());
+        next.recv_timeout(Duration::from_secs(3))
+            .expect("an abandoned grant must not strand the next operation");
+        scheduler.release_exclusive(key);
+    }
+
+    #[test]
+    fn checkout_reload_completion_survives_repository_navigation_and_queued_results() {
+        let a = PathBuf::from("/repos/a");
+        let b = PathBuf::from("/repos/b");
+        let mut owner = Some(a.clone());
+        let mut pending = Some("target".to_owned());
+        // Another tab's completion cannot affect the original operation.
+        assert!(!finish_pending_checkout_reload(
+            &mut pending,
+            &mut owner,
+            &b,
+            Some("target"),
+            false
+        ));
+        // A pre-checkout snapshot, and a snapshot with a required follow-up, cannot release it.
+        assert!(!finish_pending_checkout_reload(
+            &mut pending,
+            &mut owner,
+            &a,
+            Some("previous"),
+            false
+        ));
+        assert!(!finish_pending_checkout_reload(
+            &mut pending,
+            &mut owner,
+            &a,
+            Some("target"),
+            true
+        ));
+        assert_eq!(pending.as_deref(), Some("target"));
+        // Completion is owned by A even while the selected UI repository is B.
+        let selected_repo = b.clone();
+        assert!(finish_pending_checkout_reload(
+            &mut pending,
+            &mut owner,
+            &a,
+            Some("target"),
+            false
+        ));
+        assert!(pending.is_none() && owner.is_none());
+        assert_eq!(selected_repo, b);
+        assert!(!finish_pending_checkout_reload(
+            &mut pending,
+            &mut owner,
+            &a,
+            Some("target"),
+            false
+        ));
+    }
+
+    #[test]
+    fn authoritative_reload_can_reconcile_a_later_external_head_change() {
+        let root = PathBuf::from("/repos/owner");
+        let mut owner = Some(root.clone());
+        let mut pending = Some("requested-branch".to_owned());
+        // Ordinary old/background snapshots cannot end a checkout.
+        assert!(!finish_pending_checkout_reload(
+            &mut pending,
+            &mut owner,
+            &root,
+            Some("another-branch"),
+            false
+        ));
+        // Once the owned worker and the final explicit reload finish, actual HEAD wins.
+        assert!(finish_pending_checkout_reload(
+            &mut pending,
+            &mut owner,
+            &root,
+            None,
+            false
+        ));
+        assert!(pending.is_none() && owner.is_none());
+    }
+
+    #[test]
+    fn checkout_reload_error_and_disconnect_release_only_the_owner_after_retries() {
+        for _outcome in ["error", "disconnected"] {
+            let root = PathBuf::from("/repos/owner");
+            let mut owner = Some(root.clone());
+            let mut pending = Some("target".to_owned());
+            assert!(!finish_pending_checkout_reload(
+                &mut pending,
+                &mut owner,
+                &root,
+                None,
+                true
+            ));
+            assert!(finish_pending_checkout_reload(
+                &mut pending,
+                &mut owner,
+                &root,
+                None,
+                false
+            ));
+            assert!(pending.is_none() && owner.is_none());
+        }
+    }
+
+    #[test]
+    fn repository_completion_and_followups_do_not_retarget_the_selected_tab() {
+        let source = include_str!("app.rs");
+        let reload = source
+            .split("    fn load_repository_uncached(")
+            .nth(1)
+            .unwrap()
+            .split("    fn load_repository_with_cache_mode(")
+            .next()
+            .unwrap();
+        assert!(reload.contains("self.active_repo_root_matches(&path)"));
+        assert!(reload.contains("self.restart_repository_snapshot_load(path)"));
+        let resume = source
+            .split("    fn resume_push_after_pull(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(resume.contains("plan.root"));
+        assert!(resume.contains("start_remote_git_action_for_root_with_status"));
+        let invalidate = source
+            .split("    fn invalidate_branch_sensitive_tasks(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(!invalidate.contains("self.repository_undo_task.take()"));
+        let navigation = source
+            .split("    fn load_repository_with_cache_mode(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        for required in [
+            "self.pending_toolbar_single_click = None",
+            "self.pending_pull_action = None",
+            "self.pending_branch_action = None",
+            "self.invalidate_branch_sensitive_tasks(&previous_root)",
+        ] {
+            assert!(navigation.contains(required));
+        }
+        let flush = source
+            .split("    fn flush_pending_toolbar_single_click(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(flush.contains("self.active_repo_root_matches(&pending.root)"));
+    }
+
+    #[test]
     fn repository_refresh_success_does_not_clear_git_operation_error() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
@@ -49694,7 +50181,7 @@ mod ui_tests {
         let repo_ok_source = &poll_source[repo_ok_start..repo_ok_start + repo_ok_end];
 
         assert!(repo_ok_source.contains("self.apply_repository_snapshot(snapshot)"));
-        assert!(repo_ok_source.contains("self.pending_branch_checkout = None"));
+        assert!(repo_ok_source.contains("finish_pending_checkout_reload("));
         assert!(
             !repo_ok_source.contains("self.error = None"),
             "successful repository refresh must not erase an unrelated Git error dialog"
@@ -51102,7 +51589,9 @@ diff --git a/file.txt b/file.txt
             &implementation_source[remote_task_start..remote_task_start + remote_task_end];
         assert!(remote_task_source.contains("self.load_repository_uncached(root)"));
         assert!(remote_task_source.contains("self.remote_git_status_key = None;"));
-        assert!(remote_task_source.contains("self.loading_repo = false"));
+        assert!(
+            remote_task_source.contains("self.loading_repo = self.active_repo_has_pending_load()")
+        );
         assert!(
             !remote_task_source.contains("self.show_toast(self.tr(\"status.action_completed\"))")
         );
@@ -52726,10 +53215,10 @@ diff --git a/file.txt b/file.txt
                 "missing active gate {active_gate}"
             );
         }
+        assert!(busy.contains("self.remote_git_busy()"));
+        assert!(busy.contains("self.repository_undo_busy()"));
         for global_gate in [
             "self.branch_checkout_busy()",
-            "self.remote_git_busy()",
-            "self.repository_undo_busy()",
             "self.create_patch_busy()",
             "self.merge_tool_busy()",
             "self.repository_benchmark_task.is_some()",
@@ -53150,7 +53639,7 @@ diff --git a/file.txt b/file.txt
         let poll = &source[start..start + end];
         assert!(poll.contains("error.downcast_ref::<git::LocalBranchDeletedRemoteDeleteFailed>()"));
         assert!(poll.contains("self.load_repository_uncached(root)"));
-        assert!(poll.contains("let deletion_root ="));
+        assert!(poll.contains("let interrupted_root ="));
     }
 
     #[test]
@@ -53440,7 +53929,6 @@ diff --git a/file.txt b/file.txt
         for required in [
             "self.repo_history_tasks.remove(&key)",
             "self.queued_repo_history_loads.remove(&key)",
-            "self.repository_undo_task.take()",
             "self.details_task = None",
             "self.diff_task = None",
             "self.file_search_task = None",
@@ -53448,6 +53936,7 @@ diff --git a/file.txt b/file.txt
         ] {
             assert!(invalidation_source.contains(required), "{required}");
         }
+        assert!(!invalidation_source.contains("self.repository_undo_task.take()"));
 
         let checkout_start = implementation_source
             .find("fn start_branch_checkout(&mut self")
@@ -56030,7 +56519,8 @@ diff --git a/file.txt b/file.txt
             "next_repository_exclusive_request_index",
             "self.repository_refresh_scheduler.clone()",
             "scheduler.acquire_exclusive(scheduler_key.clone())",
-            "scheduler.release_exclusive(scheduler_key)",
+            "RepositoryExclusiveGuard::new(",
+            "impl Drop for RepositoryExclusiveGuard",
         ] {
             assert!(
                 implementation_source.contains(required),

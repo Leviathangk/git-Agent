@@ -5,6 +5,21 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.2.1 — 2026-10-27
+
+### Fixed
+
+- Promote queued background reads when an explicit reload is required, preventing a foreground checkout refresh from waiting on its own blocked background request.
+
+- Finish branch-switch busy state after the matching fresh reload even when another repository tab is selected. Release the original repository on terminal reload errors or disconnection, while preserving the gate during retries and queued reloads.
+- Refresh a completed operation's original repository without switching the active tab or replacing another repository's draft, view or loading state. Discard buffered automatic snapshots while a newer explicit reload or mutation is pending.
+- Bind post-pull pushes, credential retries and push-recovery confirmations to their original repository. Verify the expected local branch before an automatic quick push.
+- Cancel delayed toolbar clicks and unsubmitted repository forms after navigation so they cannot act on a different repository.
+- Keep ongoing mutation tasks tracked during branch-sensitive read-cache invalidation. Release exclusive repository access automatically after worker failures and skip abandoned exclusive waiters.
+- Include the originating repository path in background Git command errors, and show save/undo success feedback only for the active owner.
+
+Promoted after beta.4 passed all three platform builds and published its installers. Application code is unchanged from the validated prerelease.
+
 ## 2.2.1-beta.4 — 2026-10-27
 
 - Isolate parallel context-test repositories using exclusively allocated directories and retain Git initialization diagnostics. Beta.3 stopped at fixture initialization on macOS before installer publication; production merge/AI behavior is unchanged by this test adjustment.

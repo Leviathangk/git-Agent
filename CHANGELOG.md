@@ -5,7 +5,7 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
-## 2.2.2-beta.1 — 2026-10-27
+## 2.2.2 — 2026-10-27
 
 ### Fixed
 
@@ -20,7 +20,7 @@ Earlier versions are documented in [GitHub Releases](https://github.com/adoin/gi
 - Keep ongoing mutation tasks tracked during branch-sensitive read-cache invalidation. Release exclusive repository access automatically after worker failures and skip abandoned exclusive waiters.
 - Include the originating repository path in background Git command errors, and show save/undo success feedback only for the active owner.
 
-This is a prerelease for release validation and is excluded from stable update prompts.
+Promoted after 2.2.2-beta.1 passed Windows, macOS and Linux release validation.
 
 ## 2.2.1 — 2026-10-27
 

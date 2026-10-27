@@ -26,7 +26,7 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
-<h2>2.2.2-beta.1 — 2026-10-27</h2>
+<h2>2.2.2 — 2026-10-27</h2>
 <h3>修复</h3>
 <ul>
 <li>关闭当前仓库标签、调用方已提前选中下一标签时，仍按可见快照所属仓库取消旧操作表单并清理搜索状态，避免输入落到新仓库。</li>
@@ -42,7 +42,7 @@
 <li>刷新分支相关读取缓存时保留正在执行的写入任务；工作线程异常后自动释放仓库独占权限，并跳过已放弃的独占等待者。</li>
 <li>后台 Git 命令错误带原仓库路径；保存及撤销成功提示只在对应仓库展示。</li>
 </ul>
-<p>此版本用于发布验证，不进入正式版更新提示。</p>
+<p>经 2.2.2-beta.1 的 Windows、macOS、Linux 发布验证通过后晋升正式版。</p>
 <h2>2.2.1 — 2026-10-27</h2>
 <p>三平台构建已成功。收尾审计补充发现关闭当前标签时的表单归属边界，暂退出正式更新通道，请使用 2.2.2 或其验证通过的预发布版。</p>
 <h3>修复</h3>
@@ -390,7 +390,7 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
-<h2>2.2.2-beta.1 — 2026-10-27</h2>
+<h2>2.2.2 — 2026-10-27</h2>
 <h3>Fixed</h3>
 <ul>
 <li>Cancel repository-bound forms and reset search state when closing the active repository tab preselects another tab before its visible snapshot is replaced.</li>
@@ -406,7 +406,7 @@
 <li>Keep ongoing mutation tasks tracked during branch-sensitive read-cache invalidation. Release exclusive repository access automatically after worker failures and skip abandoned exclusive waiters.</li>
 <li>Include the originating repository path in background Git command errors, and show save/undo success feedback only for the active owner.</li>
 </ul>
-<p>This is a prerelease for release validation and is excluded from stable update prompts.</p>
+<p>Promoted after 2.2.2-beta.1 passed Windows, macOS and Linux release validation.</p>
 <h2>2.2.1 — 2026-10-27</h2>
 <p>Three-platform builds succeeded. Temporarily excluded from stable update prompts after final review found an additional active-tab-close dialog ownership case. Use 2.2.2 or its validated prerelease.</p>
 <h3>Fixed</h3>

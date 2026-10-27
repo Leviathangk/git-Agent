@@ -4166,6 +4166,15 @@ fn load_cached_repository_snapshot(path: &Path) -> Option<RepositorySnapshot> {
     Some(core_only_repository_snapshot(snapshot))
 }
 
+fn repository_view_transition_required(
+    active: Option<&Path>,
+    visible: Option<&Path>,
+    requested: &Path,
+) -> bool {
+    !active.is_some_and(|root| paths_equal(root, requested))
+        || !visible.is_some_and(|root| paths_equal(root, requested))
+}
+
 fn finish_pending_checkout_reload(
     pending: &mut Option<String>,
     owner: &mut Option<PathBuf>,
@@ -5027,7 +5036,14 @@ impl GitAgentApp {
 
     fn load_repository_with_cache_mode(&mut self, path: PathBuf, use_cache: bool) {
         let repository_transition = !self.active_repo_root_matches(&path);
-        if repository_transition {
+        let changing_repository_view = repository_view_transition_required(
+            self.active_repo_root().as_deref(),
+            self.snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.root.as_path()),
+            &path,
+        );
+        if changing_repository_view {
             self.pending_toolbar_single_click = None;
             self.pending_commit_action = None;
             self.pending_commit_identity_warning = None;
@@ -5073,7 +5089,7 @@ impl GitAgentApp {
             self.history_reference_loaded = None;
             self.repository_browser = crate::repository_browser::Browser::default();
         }
-        if repository_transition {
+        if changing_repository_view {
             self.reset_search_view_state();
         }
         self.ensure_repo_tab(path.clone());
@@ -49998,6 +50014,28 @@ mod ui_tests {
             implementation_source.contains("fn maybe_start_deferred_repository_snapshot_reload")
         );
         assert!(implementation_source.contains("repository_snapshot_error_is_retryable"));
+    }
+
+    #[test]
+    fn preselected_destination_after_tab_close_still_invalidates_old_forms() {
+        let a = Path::new("/repos/a");
+        let b = Path::new("/repos/b");
+        assert!(repository_view_transition_required(Some(a), Some(a), b));
+        // Tab-close already changed the active index, but the displayed editor is still A.
+        assert!(repository_view_transition_required(Some(b), Some(a), b));
+        assert!(repository_view_transition_required(Some(b), None, b));
+        assert!(!repository_view_transition_required(Some(b), Some(b), b));
+        let source = include_str!("app.rs");
+        let load = source
+            .split("    fn load_repository_with_cache_mode(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(load.contains("if changing_repository_view {"));
+        assert!(load.contains("self.pending_branch_action = None"));
+        assert!(load.contains("self.pending_force_push_confirm = None"));
     }
 
     #[test]
